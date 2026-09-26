@@ -80,6 +80,9 @@ impl KernelBuilder {
 
     /// Build the [kernel definition](KernelDefinition).
     pub fn build(self) -> KernelDefinition {
+        if let Some(debug) = self.scope.debug_state() {
+            debug.finish();
+        }
         let info = self.create_info();
         KernelIntegrator::new(KernelExpansion {
             scope: self.scope,
