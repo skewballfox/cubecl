@@ -27,6 +27,7 @@ mod tensor_layout;
 mod topology;
 pub mod trigonometry;
 mod validation;
+mod workspace;
 
 pub use asm::*;
 pub use base::*;
@@ -49,5 +50,6 @@ pub use tensor_layout::*;
 pub use topology::*;
 pub use trigonometry::*;
 pub use validation::*;
+pub use workspace::*;
 
 pub use crate::{__expand_debug_print, debug_print};

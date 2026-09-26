@@ -5,7 +5,7 @@ use crate::{
     kernel::CubeKernel,
     logging::ProfileLevel,
     memory_management::{MemoryAllocationMode, MemoryReport, MemoryScope},
-    persistent::{PersistentCount, split::SplitPhase},
+    persistent::{LaunchPlan, PersistentCount, split::SplitPhase},
     server::{
         BufferBinding, Collective, CommunicationId, CopyDescriptor, CubeCount, Handle,
         KernelArguments, KernelResource, MemoryLayout, MemoryLayoutDescriptor,
@@ -1277,10 +1277,12 @@ impl Client {
         bindings: KernelArguments,
     ) {
         let estimate = count.resolve(capacity, self.properties().hardware.max_cube_count.0);
-        let kernel = match SplitPhase::launch(self, kernel, estimate, bindings.clone()) {
-            Ok(()) => return,
-            Err(kernel) => kernel,
-        };
+        let plan = LaunchPlan::of(self, kernel.as_ref());
+        let mut bindings = bindings;
+        plan.bind_workspace(self, &mut bindings);
+        if let Some(split) = &plan.split {
+            return SplitPhase::launch(self, kernel, split, estimate, bindings);
+        }
         let shape = LaunchShape::Persistent { count, estimate };
         unsafe { self.launch_inner(kernel, shape, bindings, self.stream_id()) }
     }

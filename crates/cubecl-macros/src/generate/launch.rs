@@ -63,8 +63,8 @@ enum LaunchCount {
 impl Launch {
     fn launch(&self) -> TokenStream {
         let mut out = TokenStream::new();
-        // A plain launch of a cooperative kernel could exceed the capacity and hang.
-        let grid = !self.args.cooperative.is_present();
+        // A persistent kernel launches only through the runtime, which sets the count and binds
+        // the launch workspace.
         let persistent = self.args.is_persistent();
         for (flag, mode, suffix) in [
             (&self.args.launch, ExecutionMode::Checked, ""),
@@ -77,7 +77,7 @@ impl Launch {
             if !flag.is_present() {
                 continue;
             }
-            if grid {
+            if !persistent {
                 out.extend(self.launch_fn(
                     format_ident!("launch{suffix}"),
                     mode,

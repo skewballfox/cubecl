@@ -75,7 +75,7 @@ impl KernelLauncher {
         client.launch(kernel, cube_count, bindings)
     }
 
-    /// Launch a persistent kernel. `H` estimates the capacity on a runtime that cannot query it.
+    /// Launch a persistent kernel. `H` gives the capacity on a runtime that cannot query it.
     #[track_caller]
     pub fn launch_persistent<H: CapacityHint, K: CubeKernel>(
         self,
@@ -83,10 +83,8 @@ impl KernelLauncher {
         kernel: K,
         client: &Client,
     ) {
-        let capacity = H::capacity(client, &kernel);
         let bindings = self.into_bindings();
-
-        client.launch_persistent(Box::new(kernel), count, capacity, bindings)
+        H::launch(client, Box::new(kernel), count, bindings)
     }
 
     /// The capacity of `kernel` (see [`Client::capacity`]). Registers nothing to launch.

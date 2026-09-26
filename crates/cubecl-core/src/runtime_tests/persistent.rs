@@ -2,7 +2,7 @@ use crate as cubecl;
 use alloc::{string::String, vec, vec::Vec};
 
 use cubecl::prelude::*;
-use cubecl_ir::features::GridSync;
+use cubecl_ir::features::{GridSync, GridSyncEmulation};
 use cubecl_runtime::persistent::split::split;
 
 /// Adds each input item to the output one time per visit, so an output equal to the input
@@ -94,6 +94,35 @@ pub fn test_persistent_range_units_visits_each_item_once(client: Client) {
     assert_eq!(u32::from_bytes(&output), items());
 }
 
+/// Every tuning launch does the caller's work, and the launches after the tuning use one of the
+/// candidates.
+pub fn test_autotuned_capacity(client: Client) {
+    let input = client.create_from_slice(u32::as_bytes(&items()));
+    let output = client.create_from_slice(u32::as_bytes(&vec![0u32; ITEMS]));
+    let cube_count = client.create_from_slice(u32::as_bytes(&[0u32]));
+    let launches = AutotunedCapacity::CANDIDATES.len() as u32 + 1;
+    for _ in 0..launches {
+        kernel_persistent_range::launch_persistent_with::<AutotunedCapacity>(
+            &client,
+            PersistentCount::Fill,
+            CubeDim::new_1d(4),
+            unsafe { BufferArg::from_raw_parts(input.clone(), ITEMS) },
+            unsafe { BufferArg::from_raw_parts(output.clone(), ITEMS) },
+            unsafe { BufferArg::from_raw_parts(cube_count.clone(), 1) },
+        );
+    }
+
+    let expected: Vec<u32> = items().iter().map(|item| item * launches).collect();
+    assert_eq!(
+        u32::from_bytes(&client.read_one_unchecked(output)),
+        expected
+    );
+    let max = client.properties().hardware.max_cube_count.0;
+    let tuned = u32::from_bytes(&client.read_one_unchecked(cube_count))[0];
+    let candidates = AutotunedCapacity::CANDIDATES.map(|c| c.min(max));
+    assert!(candidates.contains(&tuned), "{tuned}");
+}
+
 pub fn test_persistent_capacity(client: Client) {
     let buffer = || unsafe { BufferArg::from_raw_parts(client.empty(4), 1) };
     let capacity = kernel_persistent_range::capacity(
@@ -169,6 +198,100 @@ pub fn test_sync_grid_orders_phases(client: Client) {
         .collect();
     let output = client.read_one_unchecked(output);
     assert_eq!(u32::from_bytes(&output), expected);
+}
+
+/// Takes items from the launch's work queue. Cube 0 exits early when `skip_cube_0` is set.
+#[cube(launch, persistent)]
+fn kernel_work_queue(input: &[u32], output: &mut [u32], #[comptime] skip_cube_0: bool) {
+    if skip_cube_0 && CUBE_POS == 0 {
+        terminate!();
+    }
+    let total = input.len() as u32;
+    let mut item = next_work_item();
+    while item < total {
+        if UNIT_POS == 0 {
+            output[item as usize] += input[item as usize];
+        }
+        item = next_work_item();
+    }
+}
+
+/// The runtime resets the queue before each launch, so every launch adds each item one time.
+pub fn test_work_queue_resets_every_launch(client: Client) {
+    let launches = 20;
+    for skip_cube_0 in [false, true] {
+        let input = client.create_from_slice(u32::as_bytes(&items()));
+        let output = client.create_from_slice(u32::as_bytes(&vec![0u32; ITEMS]));
+        for _ in 0..launches {
+            kernel_work_queue::launch_persistent(
+                &client,
+                PersistentCount::Exact(4),
+                CubeDim::new_1d(4),
+                unsafe { BufferArg::from_raw_parts(input.clone(), ITEMS) },
+                unsafe { BufferArg::from_raw_parts(output.clone(), ITEMS) },
+                skip_cube_0,
+            );
+        }
+
+        let expected: Vec<u32> = items().iter().map(|item| item * launches).collect();
+        let output = client.read_one_unchecked(output);
+        assert_eq!(
+            u32::from_bytes(&output),
+            expected,
+            "skip_cube_0 = {skip_cube_0}"
+        );
+    }
+}
+
+/// In each round, every cube increments its own value, then reads its neighbour's. A loop with
+/// `sync_grid` inside needs a spin barrier: a split cannot express it.
+#[cube(launch, cooperative, grid_sync_emulation = "spin")]
+fn kernel_spin_rounds(values: &mut [u32], seen: &mut [u32], rounds: u32) {
+    let cube = CUBE_POS;
+    for _ in 0..rounds {
+        if UNIT_POS == 0 {
+            values[cube] += 1;
+        }
+        sync_grid();
+        if UNIT_POS == 0 {
+            seen[cube] = values[(cube + 1) % CUBE_COUNT];
+        }
+        sync_grid();
+    }
+}
+
+pub fn test_spin_grid_sync_in_a_loop(client: Client) {
+    let spin = match client.properties().features.grid_sync {
+        GridSync::Emulated(emulations) => emulations.contains(GridSyncEmulation::Spin),
+        _ => false,
+    };
+    if !spin {
+        std::println!("spin grid sync not supported - skipped");
+        return;
+    }
+    let cubes = 2;
+    let rounds = 50;
+    let values = client.create_from_slice(u32::as_bytes(&vec![0u32; cubes]));
+    let seen = client.create_from_slice(u32::as_bytes(&vec![0u32; cubes]));
+
+    // Two cubes of four units run at the same time on any device this test runs on.
+    unsafe {
+        kernel_spin_rounds::launch_persistent(
+            &client,
+            PersistentCount::Exact(cubes as u32),
+            CubeDim::new_1d(4),
+            BufferArg::from_raw_parts(values.clone(), cubes),
+            BufferArg::from_raw_parts(seen.clone(), cubes),
+            rounds,
+        )
+    };
+
+    let expected = vec![rounds; cubes];
+    assert_eq!(
+        u32::from_bytes(&client.read_one_unchecked(values)),
+        expected
+    );
+    assert_eq!(u32::from_bytes(&client.read_one_unchecked(seen)), expected);
 }
 
 const SHARED_UNITS: usize = 8;
@@ -319,6 +442,9 @@ macro_rules! testgen_persistent {
                 test_persistent_count_reaches_the_kernel,
                 test_persistent_range_units_visits_each_item_once,
                 test_persistent_capacity,
+                test_autotuned_capacity,
+                test_work_queue_resets_every_launch,
+                test_spin_grid_sync_in_a_loop,
                 test_sync_grid_orders_phases,
                 test_shared_memory_survives_sync_grid,
                 test_discard_needs_no_spill_buffer,

@@ -3,7 +3,7 @@ use crate::{
     ir::{
         Scope,
         dialect::synchronization::{GridSyncOp, SyncAsyncProxyOp, SyncOp, SyncScope},
-        features::GridSync,
+        features::{GridSync, GridSyncEmulation},
         settings::Persistence,
     },
     prelude::{CubePrimitive, Numeric},
@@ -74,9 +74,13 @@ pub mod sync_storage {
 /// Barrier that every unit of every cube of the launch must reach: a [`sync_storage`] for the
 /// whole launch. After it, every unit sees every storage write that any cube made before it.
 ///
-/// Only a kernel marked `cooperative` may call it, because all cubes must run at the same time.
-/// Every unit must reach the same call, so a call inside a branch that some units skip is an
-/// error.
+/// Only a kernel marked `cooperative` may call it. Every unit must reach the same call, so a call
+/// inside a branch that some units skip is an error.
+///
+/// On a runtime without native grid sync, the kernel runs as one launch per part between two
+/// grid syncs. Then values in registers do not survive a grid sync, and a grid sync inside a
+/// branch or a loop is an error. `grid_sync_emulation = "spin"` removes both limits where the
+/// runtime supports it.
 pub fn sync_grid() {}
 
 pub mod sync_grid {
@@ -109,15 +113,28 @@ pub mod sync_grid_unchecked {
 }
 
 fn register_grid_sync(scope: &Scope, checked: bool) {
-    let supported = scope
+    let grid_sync = scope
         .state()
         .device_properties
         .as_ref()
-        .is_none_or(|props| props.features.grid_sync != GridSync::None);
-    if !supported {
+        .map(|props| props.features.grid_sync);
+    if grid_sync == Some(GridSync::None) {
         scope.push_error("`sync_grid` is not supported on this runtime");
     }
-    scope.register(&GridSyncOp::new(scope.ctx_mut(), checked));
+    let spin_requested = matches!(
+        scope.state().persistence,
+        Persistence::Cooperative(options) if options.emulation == GridSyncEmulation::Spin
+    );
+    let spin_supported = matches!(
+        grid_sync,
+        Some(GridSync::Emulated(emulations)) if emulations.contains(GridSyncEmulation::Spin)
+    );
+    if !(spin_requested && spin_supported) {
+        scope.register(&GridSyncOp::new(scope.ctx_mut(), checked));
+        return;
+    }
+
+    super::workspace::spin_grid_barrier(scope);
 }
 
 /// `sync_async_proxy_shared` is a synchronization fence for the experimental SM 9.0+ copy

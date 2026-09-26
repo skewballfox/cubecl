@@ -1337,6 +1337,13 @@ impl core::fmt::Display for KernelArguments {
 }
 
 impl KernelArguments {
+    /// Appends a buffer that the runtime binds after the kernel's own buffers, without
+    /// metadata, such as the launch workspace or a spill buffer.
+    pub fn push_hidden_buffer(&mut self, buffer: BufferBinding) {
+        self.resources.push(KernelResource::Buffer(buffer));
+        self.declared_io.push(BufferIOAttr::ReadWrite);
+    }
+
     /// Create a new bindings struct
     pub fn new() -> Self {
         Self::default()

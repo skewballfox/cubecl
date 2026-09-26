@@ -3,9 +3,18 @@
 use crate::{
     client::Client,
     config::{CubeClRuntimeConfig, RuntimeConfig},
+    id::KernelId,
     kernel::CubeKernel,
+    server::KernelArguments,
 };
-use cubecl_environment::sync::LazyLock;
+use alloc::{boxed::Box, vec::Vec};
+use core::time::Duration;
+use cubecl_environment::{
+    collections::HashMap,
+    sync::{LazyLock, Mutex},
+};
+use cubecl_ir::LAUNCH_WORKSPACE_WORDS;
+use split::SplitPlan;
 
 pub mod split;
 
@@ -36,12 +45,66 @@ impl PersistentCount {
     }
 }
 
+/// What a persistent launch binds after the kernel's own buffers. Found by expanding the kernel
+/// the first time it launches, then cached.
+#[derive(Clone, Debug)]
+pub(crate) struct LaunchPlan {
+    /// Whether the kernel uses the launch workspace.
+    pub workspace: bool,
+    /// How the kernel splits, if the client emulates its grid syncs by splitting.
+    pub split: Option<SplitPlan>,
+}
+
+impl LaunchPlan {
+    pub fn of(client: &Client, kernel: &dyn CubeKernel) -> Self {
+        static PLANS: LazyLock<Mutex<HashMap<KernelId, LaunchPlan>>> =
+            LazyLock::new(Default::default);
+
+        let id = kernel.id();
+        let splits = split::splits(client, &id);
+        let mut plans = PLANS.lock();
+        let plan = plans.entry(id).or_insert_with(|| {
+            let mut definition = kernel.define();
+            let workspace = definition.body.state().workspace.is_some();
+            // A kernel that does not split is still launched, as one phase that fails to compile.
+            let split = splits.then(|| {
+                split::split(&mut definition, 0).unwrap_or(SplitPlan {
+                    phases: 1,
+                    spill_bytes_per_cube: Vec::new(),
+                })
+            });
+            LaunchPlan { workspace, split }
+        });
+        plan.clone()
+    }
+
+    /// Binds a zeroed launch workspace, if the kernel uses it.
+    pub fn bind_workspace(&self, client: &Client, bindings: &mut KernelArguments) {
+        if self.workspace {
+            let zeros = [0u32; LAUNCH_WORKSPACE_WORDS];
+            let workspace = client.create_from_slice(bytemuck::cast_slice(&zeros));
+            bindings.push_hidden_buffer(workspace.binding());
+        }
+    }
+}
+
 /// Gives the capacity on a runtime that cannot query it.
 ///
 /// A runtime that can query its capacity (CUDA, HIP) uses its own answer instead.
 pub trait CapacityHint {
     /// How many cubes of `kernel` the device runs at the same time.
     fn capacity(client: &Client, kernel: &dyn CubeKernel) -> u32;
+
+    /// Launches the persistent `kernel` with the capacity of this hint.
+    fn launch(
+        client: &Client,
+        kernel: Box<dyn CubeKernel>,
+        count: PersistentCount,
+        bindings: KernelArguments,
+    ) {
+        let capacity = Self::capacity(client, kernel.as_ref());
+        client.launch_persistent(kernel, count, capacity, bindings)
+    }
 }
 
 /// The capacity estimate of [`DefaultCapacity`] on a GPU. Large enough to fill most GPUs.
@@ -58,6 +121,85 @@ impl CapacityHint for DefaultCapacity {
             .num_cpu_cores
             .unwrap_or(DEFAULT_PERSISTENT_CUBES)
     }
+}
+
+/// Tunes the capacity on the first launches of each kernel, with real work.
+///
+/// Each of the first launches uses one of [`CANDIDATES`](Self::CANDIDATES), and is timed. The
+/// later launches use the fastest. Because every tuning launch does the caller's work, the
+/// kernel's buffers stay correct. A runtime that can query its capacity ignores the hint.
+pub struct AutotunedCapacity;
+
+impl AutotunedCapacity {
+    /// The capacities that the tuning tries, each at most the maximum cube count.
+    pub const CANDIDATES: [u32; 5] = [64, 128, 256, 512, 1024];
+}
+
+impl CapacityHint for AutotunedCapacity {
+    fn capacity(client: &Client, kernel: &dyn CubeKernel) -> u32 {
+        tuning(&kernel.id())
+            .best()
+            .unwrap_or(DefaultCapacity::capacity(client, kernel))
+    }
+
+    fn launch(
+        client: &Client,
+        kernel: Box<dyn CubeKernel>,
+        count: PersistentCount,
+        bindings: KernelArguments,
+    ) {
+        let id = kernel.id();
+        let Some(candidate) = tuning(&id).next_candidate() else {
+            let capacity = Self::capacity(client, kernel.as_ref());
+            return client.launch_persistent(kernel, count, capacity, bindings);
+        };
+        let candidate = candidate.min(client.properties().hardware.max_cube_count.0);
+        let name = kernel.name();
+        let launch = || client.launch_persistent(kernel, count, candidate, bindings);
+        let time = client
+            .profile(launch, name)
+            .ok()
+            .and_then(|((), profile)| cubecl_environment::future::block_on(profile.resolve()))
+            .map(|ticks| ticks.duration());
+        TUNINGS.lock().entry(id).or_default().record(time);
+    }
+}
+
+/// The timings of one kernel's tuning launches, by candidate.
+#[derive(Clone, Default)]
+struct Tuning {
+    times: Vec<Option<Duration>>,
+}
+
+impl Tuning {
+    fn next_candidate(&self) -> Option<u32> {
+        AutotunedCapacity::CANDIDATES.get(self.times.len()).copied()
+    }
+
+    /// Records the time of the launch with the next candidate. `None` if it was not measured.
+    fn record(&mut self, time: Option<Duration>) {
+        if self.next_candidate().is_some() {
+            self.times.push(time);
+        }
+    }
+
+    /// The fastest candidate, once every candidate launched.
+    fn best(&self) -> Option<u32> {
+        self.next_candidate().is_none().then_some(())?;
+        let fastest = self
+            .times
+            .iter()
+            .enumerate()
+            .filter_map(|(i, time)| time.map(|time| (i, time)))
+            .min_by_key(|(_, time)| *time)?;
+        Some(AutotunedCapacity::CANDIDATES[fastest.0])
+    }
+}
+
+static TUNINGS: LazyLock<Mutex<HashMap<KernelId, Tuning>>> = LazyLock::new(Default::default);
+
+fn tuning(id: &KernelId) -> Tuning {
+    TUNINGS.lock().get(id).cloned().unwrap_or_default()
 }
 
 /// Read once, because reading the configuration takes a global lock.
@@ -98,6 +240,19 @@ mod tests {
     fn at_most_is_bounded_by_the_capacity() {
         assert_eq!(PersistentCount::AtMost(8).resolve(100, 1000), 8);
         assert_eq!(PersistentCount::AtMost(800).resolve(100, 1000), 100);
+    }
+
+    #[test]
+    fn tuning_picks_the_fastest_measured_candidate() {
+        let mut tuning = Tuning::default();
+        for millis in [Some(5), Some(3), None, Some(4), Some(9)]
+            .map(|m: Option<u64>| m.map(Duration::from_millis))
+        {
+            assert_eq!(tuning.best(), None);
+            tuning.record(millis);
+        }
+        assert_eq!(tuning.next_candidate(), None);
+        assert_eq!(tuning.best(), Some(AutotunedCapacity::CANDIDATES[1]));
     }
 
     #[test]

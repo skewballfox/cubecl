@@ -11,10 +11,6 @@
 use alloc::{boxed::Box, format, string::String, sync::Arc, vec, vec::Vec};
 use core::result::Result;
 
-use cubecl_environment::{
-    collections::HashMap,
-    sync::{LazyLock, Mutex},
-};
 use cubecl_ir::{
     AddressSpace, Builtin, ElemType, OpInserter, Scope, UIntKind,
     dialect::{
@@ -35,8 +31,8 @@ use pliron::{basic_block::BasicBlock, linked_list::ContainsLinkedList, r#type::T
 use crate::{
     client::Client,
     id::KernelId,
-    kernel::{BufferIOAttr, CubeKernel, KernelDefinition, KernelMetadata},
-    server::{CubeCount, KernelArguments, KernelResource},
+    kernel::{CubeKernel, KernelDefinition, KernelMetadata},
+    server::{CubeCount, KernelArguments},
 };
 
 /// What a split kernel needs from the launch.
@@ -55,23 +51,17 @@ pub struct SplitPhase {
 }
 
 impl SplitPhase {
-    /// Launches every phase of `kernel` with `cubes` cubes. Gives `kernel` back if the client
-    /// does not split it.
+    /// Launches every phase of `kernel` with `cubes` cubes, and binds its spill buffers.
     pub fn launch(
         client: &Client,
         kernel: Box<dyn CubeKernel>,
+        plan: &SplitPlan,
         cubes: u32,
         mut bindings: KernelArguments,
-    ) -> Result<(), Box<dyn CubeKernel>> {
-        let Some(plan) = plan(client, kernel.as_ref()) else {
-            return Err(kernel);
-        };
-        for bytes in plan.spill_bytes_per_cube {
+    ) {
+        for bytes in &plan.spill_bytes_per_cube {
             let spill = client.empty(bytes * cubes as usize);
-            bindings
-                .resources
-                .push(KernelResource::Buffer(spill.binding()));
-            bindings.declared_io.push(BufferIOAttr::ReadWrite);
+            bindings.push_hidden_buffer(spill.binding());
         }
         let kernel: Arc<dyn CubeKernel> = kernel.into();
         for phase in 0..plan.phases {
@@ -81,7 +71,6 @@ impl SplitPhase {
             };
             client.launch(Box::new(phase), CubeCount::new_1d(cubes), bindings.clone());
         }
-        Ok(())
     }
 }
 
@@ -115,33 +104,17 @@ impl CubeKernel for SplitPhase {
     }
 }
 
-/// The split plan, if `kernel` is cooperative and the client emulates its grid syncs by
-/// splitting. Expands the kernel only the first time, because the plan is cached.
-fn plan(client: &Client, kernel: &dyn CubeKernel) -> Option<SplitPlan> {
-    static PLANS: LazyLock<Mutex<HashMap<KernelId, SplitPlan>>> = LazyLock::new(Default::default);
-
-    let id = kernel.id();
+/// Whether the client emulates the grid syncs of the kernel `id` by splitting it.
+pub fn splits(client: &Client, id: &KernelId) -> bool {
     let Persistence::Cooperative(options) = id.persistence else {
-        return None;
+        return false;
     };
     let GridSync::Emulated(emulations) = client.properties().features.grid_sync else {
-        return None;
+        return false;
     };
     let spin = options.emulation == GridSyncEmulation::Spin
         && emulations.contains(GridSyncEmulation::Spin);
-    if spin || !emulations.contains(GridSyncEmulation::Split) {
-        return None;
-    }
-
-    let mut plans = PLANS.lock();
-    let plan = plans.entry(id).or_insert_with(|| {
-        // A kernel that does not split is still launched, as one phase that fails to compile.
-        split(&mut kernel.define(), 0).unwrap_or(SplitPlan {
-            phases: 1,
-            spill_bytes_per_cube: Vec::new(),
-        })
-    });
-    Some(plan.clone())
+    !spin && emulations.contains(GridSyncEmulation::Split)
 }
 
 /// Reduces `definition` to phase `phase`.

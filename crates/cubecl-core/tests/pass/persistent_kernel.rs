@@ -16,7 +16,6 @@ fn cooperative_kernel(output: &mut [u32]) {
 }
 
 fn main() {
-    let _ = persistent_kernel::launch::<f32>;
     let _ = persistent_kernel::launch_persistent::<f32>;
     let _ = persistent_kernel::launch_persistent_with::<f32, DefaultCapacity>;
     let _ = persistent_kernel::launch_persistent_unchecked::<f32>;

@@ -17,7 +17,7 @@ pub use cubecl_runtime::{
     client::Client,
     id::KernelId,
     kernel::*,
-    persistent::{CapacityHint, DefaultCapacity, PersistentCount},
+    persistent::{AutotunedCapacity, CapacityHint, DefaultCapacity, PersistentCount},
     server::{CubeCount, CubeDim, LaunchError, ServerError},
 };
 
