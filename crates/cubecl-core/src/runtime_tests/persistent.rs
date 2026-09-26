@@ -3,6 +3,7 @@ use alloc::{string::String, vec, vec::Vec};
 
 use cubecl::prelude::*;
 use cubecl_ir::features::GridSync;
+use cubecl_runtime::persistent::split::split;
 
 /// Adds each input item to the output one time per visit, so an output equal to the input
 /// proves that every item was visited exactly one time.
@@ -119,6 +120,152 @@ fn kernel_sync_grid(output: &mut [u32]) {
     output[0] = 1;
 }
 
+/// Phase 0 writes every item, and phase 1 reads the item that another cube wrote.
+#[cube(launch, cooperative)]
+fn kernel_sync_grid_orders_phases(written: &mut [u32], output: &mut [u32]) {
+    let len = written.len();
+    for item in persistent_range_units(len) {
+        written[item] = item as u32 + 1;
+    }
+    sync_grid();
+    for item in persistent_range_units(len) {
+        output[item] = written[(item + len / 2) % len];
+    }
+}
+
+#[cube(launch, cooperative, create_dummy_kernel)]
+fn kernel_value_in_registers_across_sync_grid(input: &[u32], output: &mut [u32]) {
+    let loaded = input[0];
+    sync_grid();
+    output[0] = loaded;
+}
+
+#[cube(launch, cooperative, create_dummy_kernel)]
+fn kernel_sync_grid_in_loop(output: &mut [u32]) {
+    for _ in 0..CUBE_COUNT {
+        sync_grid();
+    }
+    output[0] = 1;
+}
+
+pub fn test_sync_grid_orders_phases(client: Client) {
+    if client.properties().features.grid_sync == GridSync::None {
+        std::println!("grid sync not supported - skipped");
+        return;
+    }
+    let written = client.empty(ITEMS * core::mem::size_of::<u32>());
+    let output = client.empty(ITEMS * core::mem::size_of::<u32>());
+
+    kernel_sync_grid_orders_phases::launch_persistent(
+        &client,
+        PersistentCount::Exact(4),
+        CubeDim::new_1d(8),
+        unsafe { BufferArg::from_raw_parts(written, ITEMS) },
+        unsafe { BufferArg::from_raw_parts(output.clone(), ITEMS) },
+    );
+
+    let expected: Vec<u32> = (0..ITEMS)
+        .map(|i| ((i + ITEMS / 2) % ITEMS) as u32 + 1)
+        .collect();
+    let output = client.read_one_unchecked(output);
+    assert_eq!(u32::from_bytes(&output), expected);
+}
+
+const SHARED_UNITS: usize = 8;
+
+/// Each unit reads, after the grid sync, the shared value that its neighbour wrote before it.
+#[cube(launch, cooperative)]
+fn kernel_shared_memory_survives_sync_grid(output: &mut [u32]) {
+    let mut shared = Shared::<[u32]>::new_slice(SHARED_UNITS);
+    let unit = UNIT_POS as usize;
+    shared[unit] = CUBE_POS as u32 * 100 + UNIT_POS;
+    sync_grid();
+    output[ABSOLUTE_POS] = shared[(unit + 1) % SHARED_UNITS];
+}
+
+pub fn test_shared_memory_survives_sync_grid(client: Client) {
+    if client.properties().features.grid_sync == GridSync::None {
+        std::println!("grid sync not supported - skipped");
+        return;
+    }
+    let cubes = 3;
+    let len = cubes * SHARED_UNITS;
+    let output = client.empty(len * core::mem::size_of::<u32>());
+
+    kernel_shared_memory_survives_sync_grid::launch_persistent(
+        &client,
+        PersistentCount::Exact(cubes as u32),
+        CubeDim::new_1d(SHARED_UNITS as u32),
+        unsafe { BufferArg::from_raw_parts(output.clone(), len) },
+    );
+
+    let expected: Vec<u32> = (0..len)
+        .map(|i| ((i / SHARED_UNITS) * 100 + (i + 1) % SHARED_UNITS) as u32)
+        .collect();
+    let output = client.read_one_unchecked(output);
+    assert_eq!(u32::from_bytes(&output), expected);
+}
+
+#[cube(
+    launch,
+    cooperative,
+    shared_after_grid_sync = "discard",
+    create_dummy_kernel
+)]
+fn kernel_shared_memory_discarded(output: &mut [u32]) {
+    let mut shared = Shared::<[u32]>::new_slice(SHARED_UNITS);
+    shared[UNIT_POS as usize] = UNIT_POS;
+    sync_grid();
+    output[ABSOLUTE_POS] = shared[UNIT_POS as usize];
+}
+
+pub fn test_discard_needs_no_spill_buffer(client: Client) {
+    let output = unsafe { BufferArg::from_raw_parts(client.empty(4), 1) };
+    let kernel = kernel_shared_memory_discarded::create_dummy_kernel(
+        client.properties_shared(),
+        client.target_properties_shared(),
+        CubeCount::new_single(),
+        CubeDim::new_1d(SHARED_UNITS as u32),
+        output,
+    );
+    let plan = split(&mut kernel.define(), 1).expect("the kernel splits");
+    assert_eq!(plan.phases, 2);
+    assert!(plan.spill_bytes_per_cube.is_empty());
+}
+
+/// The errors of splitting `kernel` at phase `phase`.
+fn split_error(kernel: impl CubeKernel, phase: usize) -> String {
+    let mut definition = kernel.define();
+    split(&mut definition, phase)
+        .map(|_| ())
+        .expect_err("the split must fail")
+}
+
+pub fn test_split_refuses_a_value_in_registers(client: Client) {
+    let buffer = || unsafe { BufferArg::from_raw_parts(client.empty(4), 1) };
+    let kernel = kernel_value_in_registers_across_sync_grid::create_dummy_kernel(
+        client.properties_shared(),
+        client.target_properties_shared(),
+        CubeCount::new_single(),
+        CubeDim::new_1d(1),
+        buffer(),
+        buffer(),
+    );
+    assert!(split_error(kernel, 1).contains("cannot be computed again"));
+}
+
+pub fn test_split_refuses_sync_grid_in_a_loop(client: Client) {
+    let output = unsafe { BufferArg::from_raw_parts(client.empty(4), 1) };
+    let kernel = kernel_sync_grid_in_loop::create_dummy_kernel(
+        client.properties_shared(),
+        client.target_properties_shared(),
+        CubeCount::new_single(),
+        CubeDim::new_1d(1),
+        output,
+    );
+    assert!(split_error(kernel, 0).contains("inside a branch or a loop"));
+}
+
 /// The errors that expanding `kernel` pushes to its scope. A compiler refuses a kernel with any.
 fn expansion_errors(kernel: impl CubeKernel) -> Vec<String> {
     kernel.define().body.pop_errors()
@@ -166,41 +313,29 @@ macro_rules! testgen_persistent {
         mod persistent {
             use super::*;
 
-            #[$crate::runtime_tests::test_log::test]
-            fn test_persistent_range_visits_each_item_once() {
-                let client = TestRuntime::client(&Default::default());
-                cubecl_core::runtime_tests::persistent::test_persistent_range_visits_each_item_once(client);
-            }
-
-            #[$crate::runtime_tests::test_log::test]
-            fn test_persistent_count_reaches_the_kernel() {
-                let client = TestRuntime::client(&Default::default());
-                cubecl_core::runtime_tests::persistent::test_persistent_count_reaches_the_kernel(client);
-            }
-
-            #[$crate::runtime_tests::test_log::test]
-            fn test_persistent_range_units_visits_each_item_once() {
-                let client = TestRuntime::client(&Default::default());
-                cubecl_core::runtime_tests::persistent::test_persistent_range_units_visits_each_item_once(client);
-            }
-
-            #[$crate::runtime_tests::test_log::test]
-            fn test_sync_grid_needs_a_cooperative_kernel() {
-                let client = TestRuntime::client(&Default::default());
-                cubecl_core::runtime_tests::persistent::test_sync_grid_needs_a_cooperative_kernel(client);
-            }
-
-            #[$crate::runtime_tests::test_log::test]
-            fn test_sync_grid_needs_runtime_support() {
-                let client = TestRuntime::client(&Default::default());
-                cubecl_core::runtime_tests::persistent::test_sync_grid_needs_runtime_support(client);
-            }
-
-            #[$crate::runtime_tests::test_log::test]
-            fn test_persistent_capacity() {
-                let client = TestRuntime::client(&Default::default());
-                cubecl_core::runtime_tests::persistent::test_persistent_capacity(client);
-            }
+            $crate::testgen_persistent!(
+                @tests
+                test_persistent_range_visits_each_item_once,
+                test_persistent_count_reaches_the_kernel,
+                test_persistent_range_units_visits_each_item_once,
+                test_persistent_capacity,
+                test_sync_grid_orders_phases,
+                test_shared_memory_survives_sync_grid,
+                test_discard_needs_no_spill_buffer,
+                test_split_refuses_a_value_in_registers,
+                test_split_refuses_sync_grid_in_a_loop,
+                test_sync_grid_needs_a_cooperative_kernel,
+                test_sync_grid_needs_runtime_support
+            );
         }
+    };
+    (@tests $($name:ident),*) => {
+        $(
+            #[$crate::runtime_tests::test_log::test]
+            fn $name() {
+                let client = TestRuntime::client(&Default::default());
+                cubecl_core::runtime_tests::persistent::$name(client);
+            }
+        )*
     };
 }

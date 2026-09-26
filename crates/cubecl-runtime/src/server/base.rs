@@ -1303,7 +1303,7 @@ impl core::fmt::Debug for IoError {
 }
 
 /// Arguments to execute a kernel.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct KernelArguments {
     /// Kernel bindings
     pub resources: Vec<KernelResource>,
@@ -1463,7 +1463,7 @@ impl KernelArguments {
 ///
 /// The [`Server`] is responsible to convert those info into actual [`Binding`] when launching
 /// kernels.
-#[derive(new, Debug, Default)]
+#[derive(new, Debug, Default, Clone)]
 pub struct MetadataBindingInfo {
     /// Scalar and metadata values
     pub data: Vec<u64>,

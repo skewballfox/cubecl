@@ -41,6 +41,7 @@ use spin::LazyLock;
 
 use crate::{
     AddressSpace, AddressType, DeviceProperties, ElemType, FastMath, TargetProperties, TypeHash,
+    UIntKind,
     arena::DropBump,
     attributes::{
         ATTR_BUFFER_BINDING, ATTR_KEY_ARG_ATTRS, ATTR_TENSOR_MAP_BINDING, BoolAttr,
@@ -55,7 +56,7 @@ use crate::{
     interfaces::{ScalarType, TypedExt},
     read_value,
     settings::{KernelSettings, Persistence},
-    types::{PointerType, RuntimeArrayType, cuda::TensorMapType, scalar::BoolType},
+    types::{AtomicType, PointerType, RuntimeArrayType, cuda::TensorMapType, scalar::BoolType},
 };
 
 pub type Types = HashMap<TypeId, ElemType>;
@@ -158,7 +159,12 @@ pub struct GlobalState {
     pub target_properties: TargetProperties,
     pub device_properties: Option<Rc<DeviceProperties>>,
     pub persistence: Persistence,
+    /// The launch workspace, once the kernel asks for it (see [`Scope::launch_workspace`]).
+    pub workspace: Option<Value>,
 }
+
+/// Words in the launch workspace. Slot 0 is the work queue; slots 1 and 2 are the spin barrier.
+pub const LAUNCH_WORKSPACE_WORDS: usize = 16;
 
 unsafe impl Send for GlobalState {}
 
@@ -338,6 +344,7 @@ fn new_context(settings: KernelSettings) -> Rc<UnsafeCell<Context>> {
         device_properties: Default::default(),
         errors: Default::default(),
         persistence: settings.persistence,
+        workspace: None,
     };
     settings.address_type.register(&mut state);
 
@@ -373,6 +380,7 @@ fn dummy_context() -> Rc<UnsafeCell<Context>> {
         device_properties: Default::default(),
         errors: Default::default(),
         persistence: Default::default(),
+        workspace: None,
     };
 
     ctx.set_aux_ty(state);
@@ -752,6 +760,37 @@ impl Scope {
     }
 
     /// Obtain the index-th tensor map
+    /// The first buffer position after every buffer and tensor map the kernel declared.
+    pub fn next_buffer_pos(&self) -> usize {
+        let entry_func = self.state().entry_func;
+        let ctx = self.ctx();
+        let args = entry_func
+            .get_entry_block(ctx)
+            .deref(ctx)
+            .get_num_arguments();
+        (0..args)
+            .filter_map(|i| {
+                entry_func.get_arg_attr::<BufferBindingAttr>(ctx, i, &ATTR_BUFFER_BINDING)
+            })
+            .map(|binding| binding.buffer_pos + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// [`LAUNCH_WORKSPACE_WORDS`] atomic `u32` counters that the runtime zeroes before each
+    /// launch of a persistent kernel. Declared after the kernel's own buffers, the first time the
+    /// kernel asks for it, without metadata.
+    pub fn launch_workspace(&self) -> Value {
+        if let Some(workspace) = self.state().workspace {
+            return workspace;
+        }
+        let word = ElemType::UInt(UIntKind::U32).to_type(self.ctx());
+        let atomic = AtomicType::get(self.ctx(), word).to_handle();
+        let workspace = self.global(self.next_buffer_pos(), None, atomic);
+        self.state_mut().workspace = Some(workspace);
+        workspace
+    }
+
     pub fn tensor_map(&self, buffer_pos: usize, ext_meta_pos: usize) -> Value {
         let entry_func = self.state().entry_func;
         let ctx = self.ctx();

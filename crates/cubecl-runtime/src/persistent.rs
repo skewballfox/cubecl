@@ -7,6 +7,8 @@ use crate::{
 };
 use cubecl_environment::sync::LazyLock;
 
+pub mod split;
+
 /// How many cubes a persistent kernel launches.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PersistentCount {

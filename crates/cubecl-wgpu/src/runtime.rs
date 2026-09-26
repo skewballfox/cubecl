@@ -13,7 +13,10 @@ use cubecl_core::ir::TargetProperties;
 use cubecl_core::server::ServerUtilities;
 use cubecl_core::zspace::{Shape, Strides};
 use cubecl_environment::future;
-use cubecl_ir::{DeviceIdentity, DeviceProperties, HardwareProperties, MemoryDeviceProperties};
+use cubecl_ir::{
+    DeviceIdentity, DeviceProperties, HardwareProperties, MemoryDeviceProperties,
+    features::{GridSync, GridSyncEmulation},
+};
 use cubecl_server::allocator::ContiguousMemoryLayoutPolicy;
 #[cfg(not(feature = "vulkan-validate"))]
 use cubecl_server::logging::ProfileLevel;
@@ -510,6 +513,8 @@ pub(crate) fn create_server<C: WgpuCompiler>(
             physical: backend::physical_device(&setup.adapter, &adapter_info),
         },
     );
+    // Consecutive dispatches are ordered and see each other's writes, so a split is a barrier.
+    device_props.features.grid_sync = GridSync::Emulated(GridSyncEmulation::Split.into());
 
     #[cfg(not(all(target_os = "macos", feature = "msl")))]
     {
