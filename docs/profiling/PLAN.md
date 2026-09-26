@@ -14,7 +14,7 @@ All links point to the commits above. Before you implement a step on a later com
 
 ## 1. Goal
 
-1. A user sets one switch. Then the CPU profilers (`perf`, `samply`) and the GPU profilers (Nsight Compute, `rocprof`, RenderDoc) show kernel samples against the Rust source lines of `#[cube]` functions.
+1. The user sets `debug` in a cargo profile, as for any Rust program. Then the CPU profilers (`perf`, `samply`) and the GPU profilers (Nsight Compute, `rocprof`, RenderDoc) show kernel samples against the Rust source lines of `#[cube]` functions.
 2. The debug data shows each inlined `#[cube]` function as a separate frame. A flamegraph shows the call chain inside a kernel.
 3. A user can get a flamegraph of host call stacks, weighted by the device time of each kernel.
 4. The changes add to the API. They do not change existing signatures.
@@ -42,6 +42,14 @@ The dump code exists in each backend. A **build-time** switch controls it, not a
   - Nothing for expressions. The span call is commented out: [`cubecl-macros/src/generate/expression.rs#L968-L977`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-macros/src/generate/expression.rs#L968-L977).
 - The receivers are empty. Their bodies are commented-out code from the IR that came before pliron: [`cubecl-core/src/frontend/debug.rs#L8-L44`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-core/src/frontend/debug.rs#L8-L44).
 - **Result:** each pliron `Operation` has `Location::Unknown`.
+- The cfg belongs to the build of `cubecl-macros`, not to the profile of the crate that uses the macro. Cargo builds proc macros with the `build-override` profile. Thus `debug = …` in `[profile.release]` has no effect on the cfg.
+- `KernelBuilder::new` sets `debug_symbols` at run time from the compilation log level ([`builder.rs#L128-L141`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-core/src/compute/builder.rs#L128-L141)). Without the capture calls, this flag gives no locations.
+
+### 2.5 Toolchain facts (checked with cargo 1.94.1)
+
+- Cargo gives rustc `-C debuginfo=<level>` for the profile of each crate: `line-tables-only`, `1`, `2`, and so on. It gives no flag for `debug = 0`.
+- A proc macro runs in the rustc process. `std::env::args()` in the macro shows the flags of the crate that **calls** the macro. `std::env::current_dir()` shows the rustc working directory. When `debug` changes, cargo compiles the crate again, and the macro runs again.
+- A build script gets only `DEBUG=true|false`. It gets no level. It also gets `CARGO_ENCODED_RUSTFLAGS`, which contains `-C force-frame-pointers` if the user sets it.
 
 ### 2.3 Source locations in the IR and the backends
 
@@ -61,59 +69,76 @@ The dump code exists in each backend. A **build-time** switch controls it, not a
 
 ## 3. User-facing API
 
-### 3.1 Tier 1: one switch
+### 3.0 Design rule
 
-| Surface | Value | Effect |
+The behavior must be the same as for ordinary Rust code:
+
+- The `debug` key of the cargo profile selects the debug data. The profile that applies is the profile of the crate that contains the `#[cube]` function.
+- Debug data that has no cost at kernel run time needs no run-time setting.
+- A run-time switch is necessary only for a feature that has a run-time cost or a side effect. Such a feature needs the compile-time setting **and** the run-time switch.
+
+### 3.1 Tier 1: the cargo profile only
+
+```toml
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"   # or "full"
+```
+
+| Cargo `debug` | cubecl level | Result |
 |---|---|---|
-| env | `CUBECL_DEBUG_OPTION=profile-native` | New value. The parser is at [`config/base.rs#L115-L139`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-runtime/src/config/base.rs#L115-L139). |
-| `cubecl.toml` | `[profiling] native = true` | Same effect. |
+| `none`, `0`, `false` | `None` | The macro emits no location code. The output is byte-identical to the base commit. |
+| `line-directives-only` | `LineTables` | The LLVM C API has no `DebugDirectivesOnly` kind, so line tables are used. |
+| `line-tables-only`, `limited`, `1` | `LineTables` | Lines and inlined `#[cube]` frames. |
+| `full`, `2`, `true` | `Full` | Also the embedded source text. |
 
-`profile-native` sets these values:
+`-C force-frame-pointers=yes` in `RUSTFLAGS` adds frame pointers to CPU JIT code too.
 
-- `compilation.debug_info = "line-tables"`. The optimization level does not change.
-- `profiling.native.jit_symbols = "perf"` (CPU runtime).
-- `profiling.native.frame_pointers = true` (CPU runtime).
-- It enables location capture for each kernel, if the build permits it. See [D1](DECISIONS.md#d1-location-capture-in-the-macro-compile-time-or-run-time).
+Line data does not change the machine code. It adds only JIT compile time and cache size. Thus it needs no run-time switch.
 
-### 3.2 Tier 2: granular control
+### 3.2 Features with a run-time cost: run-time switch also necessary
 
-| Key | Type | Default | Env |
-|---|---|---|---|
-| `compilation.debug_info` | `DebugInfo { None, LineTables, Full }` | `None` | `CUBECL_DEBUG_INFO` |
-| `compilation.dump_dir` | `Option<PathBuf>` (std) | `None` | `CUBECL_DEBUG_PLIRON` (name kept) |
-| `compilation.time_passes` | `bool` | `false` | `CUBECL_TIME_PASSES` |
-| `profiling.native.jit_symbols` | `JitSymbols { None, Perf, Gdb }` | `None` | `CUBECL_JIT_SYMBOLS` |
-| `profiling.native.frame_pointers` | `bool` | `false` | — |
+| Feature | Run-time cost or side effect | Run-time switch |
+|---|---|---|
+| perf jitdump (CPU runtime) | It writes a file for each process in `$JITDUMPDIR` or `~/.debug/jit`. | `CUBECL_JIT_SYMBOLS=perf`. See [D6](DECISIONS.md#d6-jit-symbol-registration-default-and-fallback). |
+| GPU-time folded stacks | It times each launch. | `cubecl::profiling::FoldedStacks::install(path)` (§9) |
+| IR dumps | File I/O for each kernel. | `CUBECL_DEBUG_PLIRON=<dir>` |
+| Pass timing | Log output for each kernel. | `CUBECL_TIME_PASSES=1` |
 
-- `LineTables` gives lines and inlined frames. `Full` adds embedded source text (§6 step 5, §8). There are no variable locations in either level.
-- The existing per-function controls stay: `#[cube(debug_symbols)]`, `#[cube(no_debug_symbols)]`, `KernelSettings::debug_symbols()`.
-- There is a new function: `cubecl::profiling::FoldedStacks` (§9). It returns a guard. It writes a file when the guard drops.
+The GDB JIT registration has almost no cost. It is automatic when the level is not `None` (D6).
 
-### 3.3 Protections against common traps (built in)
+### 3.3 Tier 2: granular control
+
+- The per-function attributes stay: `#[cube(debug_symbols)]` forces `Full`. `#[cube(no_debug_symbols)]` forces `None`.
+- `CUBECL_DEBUG=1` at build time stays. It forces `Full`, for compatibility.
+- New: `KernelSettings::debug_info(DebugInfo)`. The existing `debug_symbols()` becomes `debug_info(Full)`.
+- New and optional: `compilation.debug_info` in `cubecl.toml`, or `CUBECL_DEBUG_INFO`. It can only **lower** the compiled level, for example to measure JIT time without debug data. It cannot raise the level, because the locations do not exist in a build without them.
+
+### 3.4 Protections against common traps (built in)
 
 | Trap | Protection |
 |---|---|
 | NVRTC `-G` or HIP `-g` turns off optimization, so the profile does not show release code. | Use `-lineinfo`, `-gline-tables-only`, and `CU_JIT_GENERATE_LINE_INFO` only. Do not change the optimization level. |
-| A cached kernel without debug info is used for a debug run. | Add the effective debug level to the `KernelId` hash (§4 step 5). |
-| The dump variable is set, but the binary does not contain the dump code. | Log one warning (§4 step 3). |
-| The kernel has no locations because the macro cfg was off. | If `debug_info != None` and the root op has `Unknown`, log one warning that gives the rebuild command. |
+| The host code has debug data, but the kernels do not. | The same cargo `debug` key controls both (§5 step 0). |
+| The kernel crate and the binary crate use different profiles (a per-package override). | Each `#[cube]` function uses the level of its own crate, as rustc does. A function from a crate at `None` is a transparent frame. |
+| A cached kernel without debug data is used for a build with debug data. | Add the level to the `KernelId` hash (§6 step 8). |
 | All code is inlined, so each sample goes to the kernel entry. | Use a `CallSite` chain for each op (§5). |
 | An LLVM verifier error: "inlinable function call in a function with debug info must have a !dbg location". | Give each instruction a location. Use the kernel entry location as the fallback (§6 step 4). |
 | JIT code is not visible to `perf`. | Use the perf JIT listener (§7). |
-| `perf --call-graph fp` gives broken stacks in JIT code. | Add `frame-pointer=all` when `frame_pointers` is on (§7). |
+| `perf --call-graph fp` gives broken stacks in JIT code. | Follow `-C force-frame-pointers` (§7 step 3). |
 | `TimingRequest::Resolved` runs kernels one at a time. The flamegraph then does not show pipeline time. | `FoldedStacks` uses `Deferred`. The file header shows the timing method (§9). |
-| `file!()` gives a path relative to the workspace. Tools cannot find the file. | Set the `DIFile` directory to `CUBECL_SOURCE_ROOT` or to the current directory. See [D5](DECISIONS.md#d5-source-path-resolution). |
+| `file!()` gives a path relative to the workspace. Tools cannot find the file. | Use the rustc working directory as the DWARF compile directory, as rustc does. See [D5](DECISIONS.md#d5-source-path-resolution--closed). |
 
 ## 4. Phase 0: repair the dump switch
 
 1. Add `dump_dir: Option<PathBuf>` (std only) to `CompilationConfig` in [`cubecl-runtime/src/config/compilation.rs#L4-L20`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-runtime/src/config/compilation.rs#L4-L20). Read `CUBECL_DEBUG_PLIRON` into it in [`config/base.rs#L80`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-runtime/src/config/base.rs#L80), near the `CUBECL_DEBUG_LOG` read. Add `CompilationConfig::kernel_dump_dir(&self, kernel_name) -> Option<PathBuf>`. This function sanitizes the name and creates the directory.
 2. Replace the five helpers listed in §2.1 with calls to `kernel_dump_dir`.
-3. For builds without `pliron-dump`: if `dump_dir.is_some()`, log one warning. The warning must say that the feature is off. The build-time switch itself is [D2](DECISIONS.md#d2-dump-code-build-time-feature-or-always-compiled).
+3. Compile the dump code in all `std` builds, and remove the `pliron-dump` cfg from the four `build.rs` files. The dump cost exists only when `dump_dir` is set, so a run-time switch is sufficient (§3.0). Keep the `pliron-dump` feature as an empty feature for compatibility. See [D2](DECISIONS.md#d2-dump-code-build-time-feature-or-always-compiled--closed).
 4. In [`cubecl-llvm/src/shared/base.rs#L412`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/shared/base.rs#L412), set `print_after_all: ir_printing_dir.is_some()`.
 5. In [`amdgpu/codegen.rs#L120-L125`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/amdgpu/codegen.rs#L120-L125), return `Keep` only if a dump directory exists for this kernel.
 6. Map `compilation.time_passes` to `PMConfig::time_all_passes` ([`pliron/src/pass.rs#L576`](https://github.com/pliron-org/pliron/blob/3517dc6c08370e486297972be8da2b98ed0cd683/src/pass.rs#L576)) in each place that builds a `PMConfig`. This gives compile-time profile data for each pass.
 
-**Verify:** the four `build.rs` files still set the cfg from `CUBECL_DEBUG_PLIRON`, and `shared/base.rs:412` still has `print_after_all: true`. **Done when:** `grep -rn CUBECL_DEBUG_PLIRON crates` finds only `config/base.rs` (and `build.rs` files, if D2 keeps them).
+**Verify:** the four `build.rs` files still set the cfg from `CUBECL_DEBUG_PLIRON`, and `shared/base.rs:412` still has `print_after_all: true`. **Done when:** `grep -rn CUBECL_DEBUG_PLIRON crates` finds only `config/base.rs`.
 
 ## 5. Phase 1: location capture in the frontend
 
@@ -131,6 +156,7 @@ CallSite {
 
 Steps:
 
+0. **Detect the level in the macro.** In `cubecl-macros`, add `fn debug_level() -> DebugLevel`. It reads `-C debuginfo=<level>` from `std::env::args()` one time (in a `OnceLock`) and maps it with the table in §3.1. The detection method is [D1](DECISIONS.md#d1-how-the-macro-detects-the-cargo-debug-level). Replace each `cfg!(debug_symbols)` with `debug_level() != DebugLevel::None`, at [`parse/kernel.rs#L362`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-macros/src/parse/kernel.rs#L362), [`parse/cube_impl.rs#L137`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-macros/src/parse/cube_impl.rs#L137), [`#L200`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-macros/src/parse/cube_impl.rs#L200), and [`generate/kernel.rs#L47`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-macros/src/generate/kernel.rs#L47), [`#L417`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-macros/src/generate/kernel.rs#L417), [`#L508`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-macros/src/generate/kernel.rs#L508). Keep the `CUBECL_DEBUG` cfg as "force `Full`". At `generate/kernel.rs#L416-L420`, emit `.debug_info(DebugInfo::<level>)` in place of `.debug_symbols()`.
 1. Create `crates/cubecl-ir/src/debug.rs` with `DebugState` (context aux data, like `GlobalState` at [`scope.rs#L147-L159`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-ir/src/scope.rs#L147-L159)):
    ```rust
    pub struct DebugState { enabled: bool, frames: Vec<Frame>, cache: Option<Location> }
@@ -143,10 +169,10 @@ Steps:
        pub fn current(&mut self) -> Location;               // chain above; cached until next change
    }
    ```
-   A frame that `enter_fn` does not name is transparent. This applies to a call into a non-`#[cube]` expand function. `current()` does not include such a frame. Set `enabled` from `KernelSettings::debug_symbols` in `Scope::root` ([`scope.rs#L445`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-ir/src/scope.rs#L445)).
+   A frame that `enter_fn` does not name is transparent. This applies to a call into a non-`#[cube]` expand function. `current()` does not include such a frame. Set `enabled` from `KernelSettings::debug_info != None` in `Scope::root` ([`scope.rs#L445`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-ir/src/scope.rs#L445)).
 2. Stamp locations at insertion. Change `OpInserter` at [`scope.rs#L64`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-ir/src/scope.rs#L64) from `IRInserter<DummyListener>` to `IRInserter<LocationListener>`. In `notify_operation_inserted`, if `DebugState.enabled` and the op has `Unknown`, set `current()`. Do the same for the rewriter in [`cubecl-core/src/frontend/branch.rs#L802`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-core/src/frontend/branch.rs#L802). The alias is used everywhere, so other call sites do not change.
-3. Fill the receivers in [`cubecl-core/src/frontend/debug.rs#L8-L44`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-core/src/frontend/debug.rs#L8-L44). `debug_call_expand` calls `enter_call`, the closure, and then `exit_call`. `debug_source_expand` calls `enter_fn`. It pushes a root frame if the stack is empty. Add `debug_span_expand(scope, line, col)`, which calls `set_pos`.
-4. In [`with_span`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-macros/src/generate/expression.rs#L968-L977), emit `debug_span_expand(scope, line!(), column!());` before `#tokens`. Keep `quote_spanned!` so that `line!()` gives the user's line. The granularity is [D9](DECISIONS.md#d9-location-granularity).
+3. Fill the receivers in [`cubecl-core/src/frontend/debug.rs#L8-L44`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-core/src/frontend/debug.rs#L8-L44). `debug_call_expand` calls `enter_call`, the closure, and then `exit_call`. `debug_source_expand` calls `enter_fn`. It pushes a root frame if the stack is empty. Add `debug_span_expand(scope, line, col)`, which calls `set_pos`. Add `debug_source_dir_expand(scope, dir)`. The macro emits it after `debug_source_expand` with the rustc working directory as a string literal (D5). A new function keeps the existing signature unchanged.
+4. In [`with_span`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-macros/src/generate/expression.rs#L968-L977), emit `debug_span_expand(scope, line!(), column!());` before `#tokens`. Keep `quote_spanned!` so that `line!()` gives the user's line. Use expression granularity for all levels other than `None`. It changes only the size of the line tables, as in rustc.
 5. Ops that are built with regions and inserted with `insert_at_back` (for example the `yield` ops at [`scope.rs#L601-L604`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-ir/src/scope.rs#L601-L604)) do not go through the listener. The fallback pass in §6 step 2 gives them a location.
 
 **Verify:** the `DummyListener` alias is still at `scope.rs:64`, and `debug.rs` still has the commented-out bodies.
@@ -155,33 +181,37 @@ Steps:
 
 1. **Propagate in rewrites.** In [`cubecl-ir/src/rewrite.rs#L40-L77`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-ir/src/rewrite.rs#L40-L77), wrap the inner `DialectConversion` / `MatchRewrite` in a `KeepLocation<T>` adapter. In `rewrite()`, record `n = rewriter.get_listener().events.len()` and the op's `loc`. Call the inner `rewrite`. Then, for each `RecorderEvent::InsertedOperation(op)` after index `n` that has `Unknown`, set the recorded location. This covers all cubecl passes without changes to each pattern.
 2. **Fallback pass.** Add `InheritLocationPass` to `crates/cubecl-ir/src/rewrite.rs`. For each op with `Unknown`, it copies the location of the previous sibling op that has a known location. If no such op exists, it uses the parent op's location. Run it last before target export (LLVM, C++, SPIR-V). It covers pliron's own passes (SROA, Mem2Reg, `builtin_to_llvm_pass`). They do not go through the adapter.
-3. **Encode for export.** Create `crates/cubecl-llvm/src/shared/debug_info.rs`. Run `encode_locations(ctx, module) -> LocationTable` after `lower` ([`shared/base.rs#L399-L470`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/shared/base.rs#L399-L470)) and before `to_llvm_ir::convert_module`. It interns each distinct `Location` and attaches the metadata `"cubecl.loc" = !{!"<index>"}` with `attach_metadata`, as [`loop_hints.rs`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/shared/loop_hints.rs#L24-L42) does. Do not attach to ops that fold to constants (`llvm.constant`, `llvm.zero`, `llvm.undef`, `llvm.poison`, `llvm.addressof`). Otherwise `pliron-llvm` logs a warning for each op ([`metadata_conversions.rs#L617-L627`](https://github.com/pliron-org/pliron/blob/3517dc6c08370e486297972be8da2b98ed0cd683/pliron-llvm/src/metadata_conversions.rs#L617-L627)). See [D4](DECISIONS.md#d4-llvm-debug-info-cubecl-side-metadata-bridge-or-pliron-llvm-change) for the alternative.
+3. **Encode for export.** Create `crates/cubecl-llvm/src/shared/debug_info.rs`. Run `encode_locations(ctx, module) -> LocationTable` after `lower` ([`shared/base.rs#L399-L470`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/shared/base.rs#L399-L470)) and before `to_llvm_ir::convert_module`. It interns each distinct `Location` and attaches the metadata `"cubecl.loc" = !{!"<index>"}` with `attach_metadata`, as [`loop_hints.rs`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/shared/loop_hints.rs#L24-L42) does. Do not attach to ops that fold to constants (`llvm.constant`, `llvm.zero`, `llvm.undef`, `llvm.poison`, `llvm.addressof`). Otherwise `pliron-llvm` logs a warning for each op ([`metadata_conversions.rs#L617-L627`](https://github.com/pliron-org/pliron/blob/3517dc6c08370e486297972be8da2b98ed0cd683/pliron-llvm/src/metadata_conversions.rs#L617-L627)). See [D4](DECISIONS.md#d4-llvm-debug-data-cubecl-side-metadata-bridge-or-pliron-llvm-change) for the alternative.
 4. **Decode to DWARF.** Add `LlvmModule::attach_debug_info(&self, table: &LocationTable, level)` in [`shared/llvm_module.rs`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/shared/llvm_module.rs#L54-L135). It uses `llvm_sys::debuginfo`:
-   - It creates one `DIBuilder`, one `DIFile` for each `Source`, and one `DICompileUnit` (`DW_LANG_Rust`, `LineTablesOnly`, `isOptimized = true`).
+   - It creates one `DIBuilder`, one `DIFile` for each `Source` (directory: the rustc working directory that the macro records, see D5), and one `DICompileUnit` (`DW_LANG_Rust`, `LineTablesOnly`, `isOptimized = true`).
    - It creates one `DISubprogram` for the entry function (`LLVMSetSubprogram`). It creates one `DISubprogram` for each distinct `Named` callee, keyed by (name, file).
    - It walks `instructions()` ([`#L316`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/shared/llvm_module.rs#L316)) and reads `cubecl.loc`. It converts `CallSite{callee, caller}` to `DILocation(callee line/col, scope = callee SP, inlinedAt = DILocation(caller))`, recursively. It calls `LLVMInstructionSetDebugLoc` and then removes `cubecl.loc`.
    - It gives each instruction without `cubecl.loc` the entry location.
    - It adds the module flags `"Debug Info Version" = 3` and `"Dwarf Version" = 4` with `add_module_flag` ([`#L106`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/shared/llvm_module.rs#L106)). Then it calls `LLVMDIBuilderFinalize`.
    - Call it right after `LlvmModule::new` at [`nvptx/codegen.rs#L95`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/nvptx/codegen.rs#L95), [`amdgpu/codegen.rs#L86`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/amdgpu/codegen.rs#L86) and [`cpu/jit/engine.rs#L158`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/cpu/jit/engine.rs#L158).
 5. With `Full`: set the `DIFile` source text from the `source_text` that `debug_source_expand` already receives.
-6. Add `debug_info: DebugInfo` to `PlironOptions` ([`shared/base.rs#L66-L85`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/shared/base.rs#L66-L85)). It has `Default`, so this addition is compatible. Fill it from the config in [`cubecl-cpu/src/compute/server.rs#L88-L91`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-cpu/src/compute/server.rs#L88-L91), [`cubecl-cuda/src/compiler.rs#L132`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-cuda/src/compiler.rs#L132) and [`cubecl-hip/src/compiler.rs#L129`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-hip/src/compiler.rs#L129).
+6. Add `debug_info: DebugInfo` to `PlironOptions` ([`shared/base.rs#L66-L85`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/shared/base.rs#L66-L85)). It has `Default`, so this addition is compatible. Fill it from `KernelSettings::debug_info`, lowered by `compilation.debug_info` if that is set, in [`cubecl-cpu/src/compute/server.rs#L88-L91`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-cpu/src/compute/server.rs#L88-L91), [`cubecl-cuda/src/compiler.rs#L132`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-cuda/src/compiler.rs#L132) and [`cubecl-hip/src/compiler.rs#L129`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-hip/src/compiler.rs#L129).
 7. CUDA with LLVM: when the PTX has line info, load it with `cuModuleLoadDataEx` and `CU_JIT_GENERATE_LINE_INFO = 1`, not `load_data` ([`cubecl-cuda/src/compute/context.rs#L480`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-cuda/src/compute/context.rs#L480)).
-8. Add the effective `DebugInfo` level to `KernelId` ([`cubecl-runtime/src/id.rs#L89-L110`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-runtime/src/id.rs#L89-L110)). Use a new builder method `.debug_info(level)`. Call it in the macro `id()` ([`kernel.rs#L457-L470`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-macros/src/generate/kernel.rs#L457-L470)). Add it to `Hash`.
+8. Add the effective `DebugInfo` level (after the lowering in step 6) to `KernelId` ([`cubecl-runtime/src/id.rs#L89-L110`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-runtime/src/id.rs#L89-L110)). Use a new builder method `.debug_info(level)`. Call it in the macro `id()` ([`kernel.rs#L457-L470`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-macros/src/generate/kernel.rs#L457-L470)). Add it to `Hash`.
 
 **Verify:** `pliron-llvm` still drops `Location` in `convert_block`. If a later `pliron-llvm` exports `Location` to `!dbg`, delete steps 3 and 4 and use that export.
 
 ## 7. Phase 3: CPU JIT symbols for `perf` / `samply`
 
-1. In [`cubecl-llvm/src/cpu/jit/engine.rs#L55-L98`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/cpu/jit/engine.rs#L55-L98), replace `LLVMLLJIT::new_with_default_builder()` with a local `JitBuilder` when `jit_symbols != None`. `JitBuilder` calls `LLVMOrcCreateLLJITBuilder` and `LLVMOrcLLJITBuilderSetObjectLinkingLayerCreator`. The creator calls `LLVMOrcCreateRTDyldObjectLinkingLayerWithSectionMemoryManager` and then `LLVMOrcRTDyldObjectLinkingLayerRegisterJITEventListener` with `LLVMCreatePerfJITEventListener()` (`Perf`) or `LLVMCreateGDBRegistrationListener()` (`Gdb`). Keep the current path when `jit_symbols == None`.
-2. If `LLVMCreatePerfJITEventListener()` returns null (LLVM built without `LLVM_USE_PERF`), log one warning and continue. See [D6](DECISIONS.md#d6-fallback-when-the-perf-jit-listener-is-unavailable).
-3. If `frame_pointers` is on, add `"frame-pointer"="all"` to each defined function. Use `add_attributes` ([`llvm_module.rs#L190`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/shared/llvm_module.rs#L190)) in `run_pipeline` ([`engine.rs#L157-L161`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/cpu/jit/engine.rs#L157-L161)), before `run_passes`.
+1. In [`cubecl-llvm/src/cpu/jit/engine.rs#L55-L98`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/cpu/jit/engine.rs#L55-L98), replace `LLVMLLJIT::new_with_default_builder()` with a local `JitBuilder` when the level is not `None`. `JitBuilder` calls `LLVMOrcCreateLLJITBuilder` and `LLVMOrcLLJITBuilderSetObjectLinkingLayerCreator`. The creator calls `LLVMOrcCreateRTDyldObjectLinkingLayerWithSectionMemoryManager` and then `LLVMOrcRTDyldObjectLinkingLayerRegisterJITEventListener` with `LLVMCreateGDBRegistrationListener()`, and also with `LLVMCreatePerfJITEventListener()` if `CUBECL_JIT_SYMBOLS=perf` is set. Keep the current path when the level is `None`.
+2. If `LLVMCreatePerfJITEventListener()` returns null (LLVM built without `LLVM_USE_PERF`), log one warning and continue. See [D6](DECISIONS.md#d6-jit-symbol-registration-default-and-fallback).
+3. In `cubecl-llvm/build.rs`, read `CARGO_ENCODED_RUSTFLAGS`. If it contains `force-frame-pointers=yes`, set the cfg `cubecl_frame_pointers`. With this cfg, add `"frame-pointer"="all"` to each defined function. Use `add_attributes` ([`llvm_module.rs#L190`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/shared/llvm_module.rs#L190)) in `run_pipeline` ([`engine.rs#L157-L161`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/cpu/jit/engine.rs#L157-L161)), before `run_passes`.
 4. Put the user procedure in the book (`cubecl-book/src/advanced-usage/profiling.md`, new):
    ```sh
-   CUBECL_DEBUG=1 CUBECL_DEBUG_OPTION=profile-native cargo build --release
-   perf record -k 1 --call-graph dwarf ./target/release/app
+   # Cargo.toml: [profile.profiling] inherits = "release", debug = "line-tables-only"
+   cargo build --profile profiling
+   # CPU runtime:
+   CUBECL_JIT_SYMBOLS=perf perf record -k 1 --call-graph dwarf ./target/profiling/app
    perf inject --jit -i perf.data -o perf.jit.data
    perf script -i perf.jit.data | inferno-collapse-perf | inferno-flamegraph > cpu.svg
-   # or: samply record ./target/release/app
+   # or: CUBECL_JIT_SYMBOLS=perf samply record ./target/profiling/app
+   # CUDA / HIP runtimes: no cubecl setting
+   ncu --set full --import-source yes ./target/profiling/app
    ```
    Tell the user that CPU kernels run on the runtime worker threads. Thus the kernel stacks do not start at the host call site. Use §9 for host attribution.
 
@@ -213,7 +243,8 @@ Steps:
 
 | Test | Location | Assertion |
 |---|---|---|
-| Location chain | `crates/cubecl-core/src/runtime_tests/debug_info.rs` (new) | A kernel `k → mid → inner` expanded with `debug_symbols` gives the `CallSite` chain from §5 on a leaf op. |
+| Level detection | `crates/cubecl-macros` unit test | The parser maps each argument vector from §3.1 to the correct level. |
+| Location chain | `crates/cubecl-core/src/runtime_tests/debug_info.rs` (new) | A kernel `k → mid → inner` with `#[cube(debug_symbols)]` gives the `CallSite` chain from §5 on a leaf op. |
 | Rewrite keeps location | `crates/cubecl-ir` unit test | After `CubeToLLVMPass`, no op has `Unknown`. |
 | DWARF | `crates/cubecl-cpu/tests/` | The printed IR has `DISubprogram(name: "inner"` and `inlinedAt:`. The module passes the verifier. |
 | C++ `#line` | `crates/cubecl-cpp` | The source has `#line <n> "<file>.rs"`. |
@@ -221,7 +252,7 @@ Steps:
 | Cache key | `crates/cubecl-runtime/src/id.rs` | Two `KernelId`s that differ only in `debug_info` have different hashes. |
 | JIT dump | `crates/cubecl-cpu/tests/` (Linux, ignored if the listener is null) | `$JITDUMPDIR/jit-<pid>.dump` exists. |
 | Folded output | `crates/cubecl-runtime` | The output lines match `^[^ ]+ \d+$`. |
-| No change when off | all | With `debug_info = None`, the generated output is byte-identical to the base commit. |
+| No change when off | all | With `debug = 0`, the generated output is byte-identical to the base commit. |
 
 ## 11. Order and dependencies
 
@@ -232,4 +263,4 @@ P1 (capture) ─► P2 (propagate + LLVM DWARF) ─► P3 (CPU JIT)
 P5 (folded stacks): no dependency
 ```
 
-Each phase is one PR. P0 and P5 can start now. P4 SPIR-V needs one `pliron-spirv` release.
+Each phase is one PR. P0 and P5 can start now. P1 step 0 needs D1. P4 SPIR-V needs one `pliron-spirv` release.
