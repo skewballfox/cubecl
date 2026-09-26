@@ -41,7 +41,7 @@
 | P2 | Deadlock | Some units skip a grid sync (divergent control flow). | Compile error if the block is not device-uniform (3.5 V2). |
 | P3 | Launch failure or deadlock | The capacity is computed from wrong values (hard-coded SM count, stale register count, wrong dynamic shared memory, MPS/MIG). | Capacity comes from the compiled function, at launch time (3.6). If the driver still rejects the count, the runtime lowers it and warns (3.8). |
 | P4 | Stale reads | A cube reads data from another cube without release/acquire. The compiler hoists a load out of a spin loop. | Grid sync includes device fences. Work-queue helpers use atomics only. |
-| P5 | Wrong work distribution on the next launch | A work counter is not reset between launches. | See D5. |
+| P5 | Wrong work distribution on the next launch | A work counter is not reset between launches. | The server zeroes the `WorkQueue` counter before each launch (3.8). The user-owned counter is `unsafe`. |
 | P6 | Hang of the display or a driver reset | A long kernel hits the watchdog (TDR, WDDM). | Documentation only. No enforcement. |
 | P7 | Less throughput | Too many grid syncs. A grid sync costs microseconds. | Documentation. Grid sync is explicit, never implicit. |
 | P8 | Lost concurrency | A kernel that fills the device blocks other streams. | `fill_fraction` configuration value, `PersistentCount::{Fraction, AtMost}` (3.3). |
@@ -113,6 +113,7 @@ These decisions were in `DECISIONS.md`. They are closed. The table gives the sec
 | D2 | Shared memory survives a grid sync on native backends and with Spin. With Split, the kernel selects `spill` (default, survives) or `discard` (undefined). | 3.3, 3.8 E1 |
 | D3 | `Fill` uses `capacity × fill_fraction`. `fill_fraction` is a configuration value. A launch can override it. | 3.3, 3.6 step 8 |
 | D4 | For `Fill`, `Fraction` and `AtMost`, the runtime clamps the count to the capacity. If the driver still rejects the count, the runtime lowers it and logs a warning. For `Exact`, the launch fails. | 3.5 V4, 3.8 CUDA step 5 |
+| D5 | The server zeroes the `WorkQueue` counter before each launch. An `unsafe` constructor lets the user supply and reset the counter. | 3.4, 3.8 |
 | D6 | Without an occupancy query, a constant gives the capacity. A generic `CapacityHint` overrides it. `AutotunedCapacity` is one such hint. | 3.6 step 9 |
 | D8 | Two macro flags: `persistent` (Tier A) and `cooperative` (Tier B). | 3.3, 3.6 step 7 |
 
@@ -176,7 +177,7 @@ Every count is at least `1` and at most `max_cube_count.0`. The kernel reads the
 | `unsafe sync_grid_unchecked()` | same file | Registers `GridSyncOp` with a unit attribute `unchecked`. Validation V1 does not apply. The caller guarantees co-residency. |
 | `persistent_range(len)` | new `cubecl-std/src/persistent.rs` | Returns a cube-uniform range `CUBE_POS, CUBE_POS + CUBE_COUNT, …`. Cube-uniform indices keep `sync_cube` legal inside the loop. |
 | `persistent_range_units(len)` | same file | Unit-strided variant: `ABSOLUTE_POS` stepped by `CUBE_COUNT × CUBE_DIM`. |
-| `WorkQueue` | same file | Atomic ticket counter for dynamic distribution. `next()` returns `Option<u32>`, taken by unit 0 and broadcast through shared memory. The reset strategy is D5. |
+| `WorkQueue` | same file | Atomic ticket counter for dynamic distribution. `next()` returns `Option<u32>`, taken by unit 0 and broadcast through shared memory. `WorkQueue::new()` uses a counter in the launch workspace, which the server zeroes before each launch (D5). `unsafe WorkQueue::from_buffer(counter: &mut [Atomic<u32>])` uses a counter that the user supplies. The caller must write `0` to it before each launch. The `# Safety` section names P5. |
 
 ### 3.5 Validation (trap avoidance)
 
@@ -224,7 +225,7 @@ Add `ResourceLimitError::CooperativeGrid { requested: u32, max: u32, backtrace }
 
 #### Launch workspace (shared by E1 spill, E2, and `WorkQueue`)
 
-A per-launch buffer that the server owns. The compiler pass that needs it declares it as the last buffer binding. The server allocates it from the stream memory pool, zeroes its counter region on the same stream before the launch, and appends it in `prepare_bindings` (wgpu) or the argument array (CUDA, HIP, Metal). The user never sees it. Layout: `[counters: 16 × u32][spill: shared_bytes × cube_count]`.
+A per-launch buffer that the server owns. The compiler pass that needs it declares it as the last buffer binding. The server allocates it from the stream memory pool, zeroes its counter region on the same stream before the launch, and appends it in `prepare_bindings` (wgpu) or the argument array (CUDA, HIP, Metal). The user never sees it. The zero write also resets each `WorkQueue::new()` counter (D5). On CUDA and HIP, use `cuMemsetD32Async` / `hipMemsetD32Async`, so a graph capture records it with the kernel (P9). On wgpu, use `clear_buffer` in the same encoder. Layout: `[counters: 16 × u32][spill: shared_bytes × cube_count]`.
 
 #### CUDA — native (`cubecl-cuda`, `cubecl-cpp`)
 
@@ -278,7 +279,7 @@ Each milestone compiles, passes `cargo xtask` checks, and is releasable alone.
 | M3 | CUDA and HIP native Tier B, V4, V5, clamp and warn. | M2 |
 | M4 | Launch workspace. E1 Split with `Spill` and `Discard` on wgpu and Metal. | M2 |
 | M5 | E2 Spin on wgpu (Vulkan, Metal) and Metal. | M4 |
-| M6 | `WorkQueue`. | M4, D5 |
+| M6 | `WorkQueue::new` (runtime-owned counter) and `unsafe WorkQueue::from_buffer`. | M4 |
 | M7 | `AutotunedCapacity`, V6. | M1 |
 
 ## 5. Tests
@@ -294,6 +295,7 @@ Add `crates/cubecl-core/src/runtime_tests/persistent.rs`. Register it in `runtim
 7. CUDA only: capture a Tier B launch in a graph and replay it (P9).
 8. Configuration: `fill_fraction = 0.5` halves the count of `Fill`. A value outside `(0, 1]` gives `1.0`.
 9. `AutotunedCapacity` on a kernel with a read-write binding gives `DEFAULT_PERSISTENT_CUBES` (V6).
+10. `WorkQueue::new`: launch a kernel 1000 times; every launch processes each item exactly one time. Include a kernel where some cubes exit early (P5).
 
 ## 6. Documentation
 
