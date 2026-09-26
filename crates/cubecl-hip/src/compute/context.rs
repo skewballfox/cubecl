@@ -19,6 +19,7 @@ use cubecl_hip_sys::get_hip_include_path;
 use cubecl_server::compiler::{
     CompilationCache, CompilationRecording, build_id_hash, compilation_store, store_compiled,
 };
+use cubecl_server::cooperative::{is_cooperative, too_many_cubes};
 use cubecl_server::driver::checked;
 use cubecl_server::kernel::BufferIOAttr;
 use cubecl_server::kernel::DebugInformation;
@@ -449,46 +450,100 @@ impl HipContext {
             .collect::<Vec<_>>();
 
         let kernel = self.modules.get(&kernel_id).unwrap();
+        let func = kernel.func;
         let cube_dim = kernel.cube_dim;
+        // Shared memory is collected into a single buffer, with each shared memory being
+        // an offset pointer
+        let shared_mem_bytes = kernel.shared_mem_bytes as u32;
 
-        // SAFETY: `kernel.func` is a valid function handle from a loaded module.
+        // SAFETY: `func` is a valid function handle from a loaded module.
         // `stream.sys` is a valid HIP stream. `bindings` contains valid device pointers
         // for all kernel arguments. The dispatch and cube dimensions are validated by
         // the caller.
-        unsafe {
-            let status = cubecl_hip_sys::hipModuleLaunchKernel(
-                kernel.func,
-                dispatch_count.0,
-                dispatch_count.1,
-                dispatch_count.2,
-                cube_dim.x,
-                cube_dim.y,
-                cube_dim.z,
-                // Shared memory is collected into a single buffer, with each shared memory being
-                // an offset pointer
-                kernel.shared_mem_bytes as u32,
-                stream.sys,
-                bindings.as_mut_ptr(),
-                std::ptr::null_mut(),
-            );
-
-            // Out of memory is told apart from the rest because the caller
-            // can act on it — reclaim and relaunch — where nothing else here
-            // is worth retrying.
-            match checked("hipModuleLaunchKernel", status) {
-                Ok(()) => Ok(()),
-                Err(_) if status == cubecl_hip_sys::hipError_t_hipErrorOutOfMemory => {
-                    Err(LaunchError::OutOfMemory {
-                        reason: format!("out of memory launching kernel {kernel_id:?}"),
-                        backtrace: BackTrace::capture(),
-                    })
-                }
-                Err(err) => Err(LaunchError::Unknown {
-                    reason: format!("{err}, launching kernel {kernel_id:?}"),
-                    backtrace: BackTrace::capture(),
-                }),
+        let (name, status) = unsafe {
+            if is_cooperative(&kernel_id) {
+                let status = cubecl_hip_sys::hipModuleLaunchCooperativeKernel(
+                    func,
+                    dispatch_count.0,
+                    dispatch_count.1,
+                    dispatch_count.2,
+                    cube_dim.x,
+                    cube_dim.y,
+                    cube_dim.z,
+                    shared_mem_bytes,
+                    stream.sys,
+                    bindings.as_mut_ptr(),
+                );
+                ("hipModuleLaunchCooperativeKernel", status)
+            } else {
+                let status = cubecl_hip_sys::hipModuleLaunchKernel(
+                    func,
+                    dispatch_count.0,
+                    dispatch_count.1,
+                    dispatch_count.2,
+                    cube_dim.x,
+                    cube_dim.y,
+                    cube_dim.z,
+                    shared_mem_bytes,
+                    stream.sys,
+                    bindings.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                );
+                ("hipModuleLaunchKernel", status)
             }
+        };
+
+        // Out of memory is told apart from the rest because the caller
+        // can act on it — reclaim and relaunch — where nothing else here
+        // is worth retrying.
+        match checked(name, status) {
+            Ok(()) => Ok(()),
+            Err(_) if status == cubecl_hip_sys::hipError_t_hipErrorOutOfMemory => {
+                Err(LaunchError::OutOfMemory {
+                    reason: format!("out of memory launching kernel {kernel_id:?}"),
+                    backtrace: BackTrace::capture(),
+                })
+            }
+            Err(_) if status == cubecl_hip_sys::hipError_t_hipErrorCooperativeLaunchTooLarge => {
+                let requested = dispatch_count.0 * dispatch_count.1 * dispatch_count.2;
+                Err(too_many_cubes(requested, self.capacity(&kernel_id)?).into())
+            }
+            Err(err) => Err(LaunchError::Unknown {
+                reason: format!("{err}, launching kernel {kernel_id:?}"),
+                backtrace: BackTrace::capture(),
+            }),
         }
+    }
+
+    /// How many cubes of the loaded kernel `kernel_id` the device runs at the same time: the
+    /// driver occupancy per compute unit, with the real cube dim and dynamic shared memory,
+    /// times the compute unit count.
+    pub fn capacity(&mut self, kernel_id: &KernelId) -> Result<u32, LaunchError> {
+        let kernel = self.modules.get(kernel_id).unwrap();
+        let units = kernel.cube_dim.num_elems() as i32;
+        let mut per_cu = 0;
+        // SAFETY: `kernel.func` is a valid function handle from a loaded module, and
+        // `per_cu` outlives the call.
+        let status = unsafe {
+            cubecl_hip_sys::hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
+                &mut per_cu,
+                kernel.func,
+                units,
+                kernel.shared_mem_bytes,
+            )
+        };
+        checked("hipModuleOccupancyMaxActiveBlocksPerMultiprocessor", status).map_err(|err| {
+            LaunchError::Unknown {
+                reason: format!("{err}, querying the capacity of kernel {kernel_id:?}"),
+                backtrace: BackTrace::capture(),
+            }
+        })?;
+        let cus = self
+            .properties
+            .hardware
+            .num_streaming_multiprocessors
+            .unwrap_or(1);
+        Ok(per_cu as u32 * cus)
     }
 
     fn validate_shared(&self, repr: &Option<HipRepresentation>) -> Result<(), LaunchError> {

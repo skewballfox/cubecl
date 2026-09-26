@@ -63,5 +63,8 @@ pub mod timestamp_profiler;
 /// Validation utils for shared properties
 pub mod validation;
 
+/// Cooperative launches on runtimes with native grid sync.
+pub mod cooperative;
+
 /// Allocators moddule.
 pub mod allocator;

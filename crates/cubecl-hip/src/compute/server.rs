@@ -27,6 +27,7 @@ use cubecl_server::command::Refused;
 use cubecl_server::metadata_cache::Lookup;
 use cubecl_server::{
     config::{CubeClRuntimeConfig, RuntimeConfig},
+    cooperative::{LaunchCount, launch_lowering, resolve_count},
     dry_run::LaunchMode,
     id::GraphId,
     kernel::CubeKernel,
@@ -129,54 +130,39 @@ impl Server for HipServer {
         if self.compile_failed(&kernel_id, kernel, &bindings, stream_id, launch_mode) {
             return;
         }
-        // A dry run stops right here, after compilation and before anything
-        // that touches a buffer: resolving resources, uploading metadata or
-        // reading a dynamic cube count would materialize memory the run
-        // exists to leave unmapped.
-        if launch_mode.is_skipped() {
+        let count = LaunchCount::Grid(count);
+        self.launch_compiled(kernel_id, count, bindings, stream_id, launch_mode);
+    }
+
+    fn capacity(
+        &mut self,
+        kernel: Box<dyn CubeKernel>,
+        _stream_id: StreamId,
+    ) -> Result<Option<u32>, ServerError> {
+        let kernel_id = kernel.id();
+        if !self.ctx.is_loaded(&kernel_id) {
+            let logger = self.streams.logger.clone();
+            self.ctx.compile_kernel(&kernel_id, kernel, logger)?;
+        }
+        // Queried for each call, because each `ExecutionMode` compiles to its own function.
+        Ok(Some(self.ctx.capacity(&kernel_id)?))
+    }
+
+    unsafe fn launch_persistent(
+        &mut self,
+        kernel: Box<dyn CubeKernel>,
+        count: PersistentCount,
+        _estimate: u32,
+        bindings: KernelArguments,
+        stream_id: StreamId,
+        launch_mode: LaunchMode,
+    ) {
+        let kernel_id = kernel.id();
+        if self.compile_failed(&kernel_id, kernel, &bindings, stream_id, launch_mode) {
             return;
         }
-        let io = self.ctx.kernel_io(&kernel_id);
-
-        // The count resolves before the scope opens, because entering the
-        // scope replaces whatever claim the outputs carry — and a count that
-        // resolves to zero enqueues nothing, so those claims must be left
-        // exactly as they were, which no exit can restore once entry took
-        // them.
-        let count = match self.resolve_cube_count(count, stream_id) {
-            Ok(count) => count,
-            Err(err) => {
-                // The launch cannot run, so its outputs take the failure
-                // exactly as a failed launch's would: a tainted or unreadable
-                // count buffer travels to everything downstream of it.
-                let mut written = self.write_set();
-                written.extend(bindings.buffers_written(io.as_deref()).cloned());
-                failed_writing(self, stream_id, written, err);
-                return;
-            }
-        };
-        // Zero threads: the driver rejects a zero grid dim, and a launch of
-        // zero threads writes nothing — no scope opens, so a claim an earlier
-        // failure holds on the outputs stays exactly where it was.
-        if count.0 == 0 || count.1 == 0 || count.2 == 0 {
-            return;
-        }
-
-        // The scope claims what the launch writes until the body proves the
-        // work enqueued, so a failure — or a panic — anywhere in it leaves a
-        // read of those buffers failing on the error rather than copying
-        // bytes nothing wrote. An input that already carries a failure skips
-        // the launch instead, and the scope settles that too.
-        let mut written = self.write_set();
-        written.extend(bindings.buffers_written(io.as_deref()).cloned());
-        ExecuteScope::launching(
-            self,
-            kernel_id.clone(),
-            stream_id,
-            bindings.buffers_read(io.as_deref()),
-            written,
-        )
-        .execute(|server| server.launch_checked(kernel_id, count, bindings, stream_id));
+        let count = LaunchCount::Persistent(count);
+        self.launch_compiled(kernel_id, count, bindings, stream_id, launch_mode);
     }
 
     fn check(
@@ -493,6 +479,90 @@ impl HipServer {
         self.ctx.profiler.failure(error);
     }
 
+    /// Launch a kernel that is already compiled.
+    fn launch_compiled(
+        &mut self,
+        kernel_id: KernelId,
+        count: LaunchCount,
+        bindings: KernelArguments,
+        stream_id: StreamId,
+        launch_mode: LaunchMode,
+    ) {
+        // A dry run stops right here, after compilation and before anything
+        // that touches a buffer: resolving resources, uploading metadata or
+        // reading a dynamic cube count would materialize memory the run
+        // exists to leave unmapped.
+        if launch_mode.is_skipped() {
+            return;
+        }
+        let io = self.ctx.kernel_io(&kernel_id);
+
+        // The count resolves before the scope opens, because entering the
+        // scope replaces whatever claim the outputs carry — and a count that
+        // resolves to zero enqueues nothing, so those claims must be left
+        // exactly as they were, which no exit can restore once entry took
+        // them.
+        let lowering = count.lowering();
+        let count = match self.resolve_launch_count(&kernel_id, count, stream_id) {
+            Ok(count) => count,
+            Err(err) => {
+                // The launch cannot run, so its outputs take the failure
+                // exactly as a failed launch's would: a tainted or unreadable
+                // count buffer travels to everything downstream of it.
+                let mut written = self.write_set();
+                written.extend(bindings.buffers_written(io.as_deref()).cloned());
+                failed_writing(self, stream_id, written, err);
+                return;
+            }
+        };
+        // Zero threads: the driver rejects a zero grid dim, and a launch of
+        // zero threads writes nothing — no scope opens, so a claim an earlier
+        // failure holds on the outputs stays exactly where it was.
+        if count.0 == 0 || count.1 == 0 || count.2 == 0 {
+            return;
+        }
+
+        // The scope claims what the launch writes until the body proves the
+        // work enqueued, so a failure — or a panic — anywhere in it leaves a
+        // read of those buffers failing on the error rather than copying
+        // bytes nothing wrote. An input that already carries a failure skips
+        // the launch instead, and the scope settles that too.
+        let mut written = self.write_set();
+        written.extend(bindings.buffers_written(io.as_deref()).cloned());
+        ExecuteScope::launching(
+            self,
+            kernel_id.clone(),
+            stream_id,
+            bindings.buffers_read(io.as_deref()),
+            written,
+        )
+        .execute(|server| server.launch_checked(kernel_id, count, lowering, bindings, stream_id));
+    }
+
+    /// The grid dimensions of a launch of `kernel_id`. A persistent count resolves against the
+    /// capacity of the compiled kernel.
+    ///
+    /// # Errors
+    ///
+    /// See [`resolve_cube_count`](Self::resolve_cube_count) and [`resolve_count`].
+    fn resolve_launch_count(
+        &mut self,
+        kernel_id: &KernelId,
+        count: LaunchCount,
+        stream_id: StreamId,
+    ) -> Result<(u32, u32, u32), ServerError> {
+        match count {
+            LaunchCount::Grid(count) => self.resolve_cube_count(count, stream_id),
+            LaunchCount::Persistent(count) => {
+                let capacity = self.ctx.capacity(kernel_id)?;
+                let max = self.ctx.properties.hardware.max_cube_count.0;
+                let cubes =
+                    resolve_count(kernel_id, count, capacity, max).map_err(LaunchError::from)?;
+                Ok((cubes, 1, 1))
+            }
+        }
+    }
+
     /// The grid dimensions this launch runs with, host-read from the count
     /// buffer when the count is dynamic.
     ///
@@ -538,6 +608,7 @@ impl HipServer {
         &mut self,
         kernel_id: KernelId,
         count: (u32, u32, u32),
+        lowering: Option<PersistentCount>,
         bindings: KernelArguments,
         stream_id: StreamId,
     ) -> Result<(), ServerError> {
@@ -562,7 +633,12 @@ impl HipServer {
 
         resources.push(command.resource(info_handle.binding())?);
 
-        command.kernel(kernel_id, count, &mut resources)?;
+        match lowering {
+            Some(persistent) => launch_lowering(&kernel_id, persistent, count.0, |cubes| {
+                command.kernel(kernel_id.clone(), (cubes, 1, 1), &mut resources)
+            })?,
+            None => command.kernel(kernel_id, count, &mut resources)?,
+        }
 
         Ok(())
     }

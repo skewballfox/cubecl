@@ -16,7 +16,9 @@ use cubecl_core::{
     ir::{
         ContiguousElements, DeviceIdentity, DeviceProperties, HardwareProperties,
         MemoryDeviceProperties, MmaProperties, PciVendor, PhysicalDevice, TargetProperties,
-        VectorSize, amd::GfxArch, features::Plane,
+        VectorSize,
+        amd::GfxArch,
+        features::{GridSync, Plane},
     },
     server::ServerUtilities,
     zspace::{Shape, Strides, striding::has_pitched_row_major_strides},
@@ -175,6 +177,18 @@ impl DeviceService for HipServer {
         device_props.features.alignment = true;
         // `__threadfence` carries a block's writes to device scope.
         device_props.features.device_memory_scope = true;
+        let mut cooperative_launch = 0;
+        // SAFETY: the device index was validated above, and `cooperative_launch` outlives the call.
+        let status = unsafe {
+            cubecl_hip_sys::hipDeviceGetAttribute(
+                &mut cooperative_launch,
+                cubecl_hip_sys::hipDeviceAttribute_t_hipDeviceAttributeCooperativeLaunch,
+                device.index as c_int,
+            )
+        };
+        if checked("hipDeviceGetAttribute", status).is_ok() && cooperative_launch == 1 {
+            device_props.features.grid_sync = GridSync::Native;
+        }
         device_props.features.plane.insert(Plane::Ops);
         device_props
             .features
@@ -191,6 +205,8 @@ impl DeviceService for HipServer {
         if backend == HipBackend::Llvm {
             let wmma = gfx.wmma();
             restrict_features(&mut device_props, GpuTarget::AmdGpu { wmma });
+            // The LLVM target has no grid sync lowering yet (D7 in docs/persistent-kernels).
+            device_props.features.grid_sync = GridSync::None;
         }
 
         let comp_opts = HipCompilationOptions {

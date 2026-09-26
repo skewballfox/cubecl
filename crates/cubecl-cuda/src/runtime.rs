@@ -17,7 +17,7 @@ use cubecl_core::{
         ComplexKind, ContiguousElements, DeviceIdentity, DeviceProperties, ElemType, FloatKind,
         HardwareProperties, MemoryDeviceProperties, MmaProperties, OpaqueType, PciVendor,
         PhysicalDevice, TargetProperties, Type, VectorSize,
-        features::{AtomicUsage, ComplexUsage, Plane, Tma, TypeUsage},
+        features::{AtomicUsage, ComplexUsage, GridSync, Plane, Tma, TypeUsage},
         nvidia::SmArch,
     },
     server::ServerUtilities,
@@ -357,6 +357,16 @@ impl DeviceService for CudaServer {
         device_props.features.alignment = true;
         // `__threadfence` carries a block's writes to device scope.
         device_props.features.device_memory_scope = true;
+        // SAFETY: `device_ptr` is a valid CUDA device; the attribute is a read-only property.
+        let cooperative_launch = unsafe {
+            cudarc::driver::result::device::get_attribute(
+                device_ptr,
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH,
+            )
+        };
+        if matches!(cooperative_launch, Ok(1)) {
+            device_props.features.grid_sync = GridSync::Native;
+        }
         device_props.features.plane.insert(Plane::Ops);
         device_props
             .features
@@ -373,6 +383,8 @@ impl DeviceService for CudaServer {
         let backend = CudaBackend::default();
         if backend == CudaBackend::Llvm {
             restrict_features(&mut device_props, GpuTarget::Nvptx);
+            // The LLVM target has no grid sync lowering yet (D7 in docs/persistent-kernels).
+            device_props.features.grid_sync = GridSync::None;
         }
 
         let comp_opts = CudaCompilationOptions {

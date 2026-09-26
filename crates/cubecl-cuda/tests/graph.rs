@@ -360,3 +360,11 @@ fn cuda_graph_many_launches_dynamic_metadata() {
         &exp_b[..]
     );
 }
+
+/// Capture a cooperative launch with a grid sync, replay it, and check the output (P9).
+#[test]
+fn cuda_graph_cooperative_launch() {
+    let _guard = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let client = CudaRuntime::client(&Default::default());
+    cubecl_core::runtime_tests::persistent::test_sync_grid_graph_replay(client);
+}

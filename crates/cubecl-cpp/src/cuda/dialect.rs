@@ -1,5 +1,5 @@
 use cubecl_core::ir::{
-    dialect::synchronization::{SyncAsyncProxyOp, SyncOp, SyncScope},
+    dialect::synchronization::{GridSyncOp, SyncAsyncProxyOp, SyncOp, SyncScope},
     prelude::*,
 };
 
@@ -63,6 +63,7 @@ macro_rules! ptx_with_out {
 pub(super) use ptx_with_out;
 
 op_includes!(Cuda, [SyncAsyncProxyOp] => "cuda/barrier");
+op_includes!(Cuda, [GridSyncOp] => "cooperative_groups.h");
 
 cuda_op!(SyncOp, |op, ctx| {
     match op.scope(ctx).0 {
@@ -74,6 +75,11 @@ cuda_op!(SyncOp, |op, ctx| {
         SyncScope::Unit => "",
     }
     .into()
+});
+
+// The runtime launches a kernel with a grid sync cooperatively, which this barrier needs.
+cuda_op!(GridSyncOp, |_, _| {
+    "cooperative_groups::this_grid().sync();\n".into()
 });
 
 cuda_op!(SyncAsyncProxyOp, |_, _| {

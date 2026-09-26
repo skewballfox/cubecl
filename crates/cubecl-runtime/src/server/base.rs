@@ -293,6 +293,19 @@ pub enum ResourceLimitError {
         #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
+    /// A cooperative launch has more cubes than the device runs at the same time.
+    #[error(
+        "Too many cubes for a cooperative launch.\nRequested {requested} cubes, the device runs at most {max} at the same time.\nBacktrace\n{backtrace}"
+    )]
+    CooperativeGrid {
+        /// Requested cube count
+        requested: u32,
+        /// The capacity of the kernel
+        max: u32,
+        /// The backtrace for this error.
+        #[cfg_attr(serializable, serde(skip))]
+        backtrace: BackTrace,
+    },
 }
 
 impl core::fmt::Debug for LaunchError {

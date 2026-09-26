@@ -22,12 +22,16 @@ use cubecl_environment::persistence::Store;
 use cubecl_llvm::nvptx::ptx_version::PtxVersion;
 use cubecl_server::{
     compiler::KernelCacheKey,
+    cooperative::{is_cooperative, too_many_cubes},
     kernel::{CompiledKernel, CubeKernel},
     logging::ServerLogger,
 };
 use cudarc::driver::DriverError;
 use cudarc::driver::sys::CUfunc_st;
-use cudarc::driver::sys::{CUctx_st, CUfunction_attribute, CUstream};
+use cudarc::driver::sys::{
+    CUctx_st, CUfunction_attribute, CUlaunchAttribute, CUlaunchAttributeID, CUlaunchConfig,
+    CUresult, CUstream, cuLaunchKernelEx,
+};
 use std::ffi::CString;
 use std::ffi::c_char;
 use std::str::FromStr;
@@ -522,38 +526,71 @@ impl CudaContext {
         resources: &mut [*mut c_void],
     ) -> Result<(), LaunchError> {
         let kernel = self.modules.get(&kernel_id).unwrap();
-        let cube_dim = kernel.cube_dim;
-        // SAFETY: `kernel.func` is a valid function handle from a loaded module.
+        let func = kernel.func;
+        let cube_dim = (kernel.cube_dim.x, kernel.cube_dim.y, kernel.cube_dim.z);
+        // Shared memory is collected into a single buffer, with each shared memory being
+        // an offset pointer
+        let shared_mem_bytes = kernel.shared_mem_bytes;
+        // SAFETY: `func` is a valid function handle from a loaded module.
         // `stream.sys` is a valid CUDA stream. `bindings` contains valid device pointers
         // for all kernel arguments. The dispatch and cube dimensions are validated by
         // the caller.
-        unsafe {
-            cudarc::driver::result::function::set_function_attribute(
-                kernel.func,
-                CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                kernel.shared_mem_bytes as i32,
-            )
-            .map_err(|err| LaunchError::Unknown {
-                reason: format!("{err}"),
-                backtrace: BackTrace::capture(),
-            })?;
-            cudarc::driver::result::launch_kernel(
-                kernel.func,
-                dispatch_count,
-                (cube_dim.x, cube_dim.y, cube_dim.z),
-                // Shared memory is collected into a single buffer, with each shared memory being
-                // an offset pointer
-                kernel.shared_mem_bytes as u32,
-                stream.sys,
-                resources,
-            )
-            .map_err(|err| LaunchError::Unknown {
-                reason: format!("{err}"),
-                backtrace: BackTrace::capture(),
-            })?;
+        let launched = unsafe {
+            allow_dynamic_shared(func, shared_mem_bytes).map_err(driver_error)?;
+            if is_cooperative(&kernel_id) {
+                launch_cooperative(
+                    func,
+                    dispatch_count,
+                    cube_dim,
+                    shared_mem_bytes as u32,
+                    stream.sys,
+                    resources,
+                )
+            } else {
+                cudarc::driver::result::launch_kernel(
+                    func,
+                    dispatch_count,
+                    cube_dim,
+                    shared_mem_bytes as u32,
+                    stream.sys,
+                    resources,
+                )
+            }
         };
 
-        Ok(())
+        match launched {
+            Err(err) if err.0 == CUresult::CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE => {
+                let requested = dispatch_count.0 * dispatch_count.1 * dispatch_count.2;
+                Err(too_many_cubes(requested, self.capacity(&kernel_id)?).into())
+            }
+            launched => launched.map_err(driver_error),
+        }
+    }
+
+    /// How many cubes of the loaded kernel `kernel_id` the device runs at the same time: the
+    /// driver occupancy per SM, with the real cube dim and dynamic shared memory, times the SM
+    /// count.
+    pub fn capacity(&mut self, kernel_id: &KernelId) -> Result<u32, LaunchError> {
+        let kernel = self.modules.get(kernel_id).unwrap();
+        let (func, shared_mem_bytes) = (kernel.func, kernel.shared_mem_bytes);
+        let units = kernel.cube_dim.num_elems() as i32;
+        let sms = self
+            .properties
+            .hardware
+            .num_streaming_multiprocessors
+            .unwrap_or(1);
+        // SAFETY: `func` is a valid function handle from a loaded module.
+        let per_sm = unsafe {
+            // The occupancy counts only as much dynamic shared memory as the launch permits.
+            allow_dynamic_shared(func, shared_mem_bytes).map_err(driver_error)?;
+            cudarc::driver::result::occupancy::max_active_block_per_multiprocessor(
+                func,
+                units,
+                shared_mem_bytes,
+            )
+            .map_err(driver_error)?
+        };
+        Ok(per_sm as u32 * sms)
     }
 
     fn validate_shared(&self, repr: &Option<CudaRepresentation>) -> Result<(), LaunchError> {
@@ -572,6 +609,64 @@ impl CudaContext {
             Ok(())
         }
     }
+}
+
+fn driver_error(err: DriverError) -> LaunchError {
+    LaunchError::Unknown {
+        reason: format!("{err}"),
+        backtrace: BackTrace::capture(),
+    }
+}
+
+/// Lets `func` use `shared_mem_bytes` of dynamic shared memory.
+///
+/// # Safety
+///
+/// `func` must be a valid function handle from a loaded module.
+unsafe fn allow_dynamic_shared(
+    func: *mut CUfunc_st,
+    shared_mem_bytes: usize,
+) -> Result<(), DriverError> {
+    unsafe {
+        cudarc::driver::result::function::set_function_attribute(
+            func,
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            shared_mem_bytes as i32,
+        )
+    }
+}
+
+/// Launches `func` so that all its cubes run at the same time. `cuLaunchKernelEx` with the
+/// cooperative attribute, because a graph capture keeps the attribute in the kernel node.
+///
+/// # Safety
+///
+/// The same as [`cudarc::driver::result::launch_kernel`].
+unsafe fn launch_cooperative(
+    func: *mut CUfunc_st,
+    grid_dim: (u32, u32, u32),
+    block_dim: (u32, u32, u32),
+    shared_mem_bytes: u32,
+    stream: CUstream,
+    params: &mut [*mut c_void],
+) -> Result<(), DriverError> {
+    // SAFETY: an all-zero attribute is a valid value of this plain C struct.
+    let mut attribute: CUlaunchAttribute = unsafe { std::mem::zeroed() };
+    attribute.id = CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
+    attribute.value.cooperative = 1;
+    let config = CUlaunchConfig {
+        gridDimX: grid_dim.0,
+        gridDimY: grid_dim.1,
+        gridDimZ: grid_dim.2,
+        blockDimX: block_dim.0,
+        blockDimY: block_dim.1,
+        blockDimZ: block_dim.2,
+        sharedMemBytes: shared_mem_bytes,
+        hStream: stream,
+        attrs: &mut attribute,
+        numAttrs: 1,
+    };
+    unsafe { cuLaunchKernelEx(&config, func, params.as_mut_ptr(), std::ptr::null_mut()).result() }
 }
 
 /// Writes the PTX for `kernel_id` under the directory named by `CUBECL_CUDA_DUMP_PTX`, if that
