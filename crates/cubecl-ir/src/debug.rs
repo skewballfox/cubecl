@@ -2,7 +2,20 @@
 //!
 //! The macro-generated code of each `#[cube]` function opens a [frame](DebugState::enter_fn) and
 //! moves its [position](DebugState::set_pos). [`LocationListener`] gives each inserted op the
-//! location of the current frame.
+//! location of the current frame, nested in the call sites of its callers.
+//!
+//! Expansion inlines every `#[cube]` call, so the call chain is the only record of the source-level
+//! call stack. For an op in `inner`, called from `outer`, called from kernel `k`:
+//!
+//! ```text
+//! CallSite {
+//!     callee: Named("inner", SrcPos(op)),
+//!     caller: CallSite {
+//!         callee: Named("outer", SrcPos(call to inner)),
+//!         caller: Named("k", SrcPos(call to outer)),
+//!     },
+//! }
+//! ```
 
 use alloc::{boxed::Box, string::String, vec::Vec};
 use pliron::{
@@ -84,7 +97,15 @@ impl DebugState {
 
     /// The location of the current expression, or `None` outside a `#[cube]` function.
     fn location(&self) -> Option<Location> {
-        self.frames.last().map(Frame::location)
+        let (kernel, callees) = self.frames.split_first()?;
+        let location =
+            callees
+                .iter()
+                .fold(kernel.location(), |caller, callee| Location::CallSite {
+                    callee: Box::new(callee.location()),
+                    caller: Box::new(caller),
+                });
+        Some(location)
     }
 }
 

@@ -148,6 +148,11 @@ mod tests {
         x + x
     }
 
+    #[cube]
+    fn quadruple(x: u32) -> u32 {
+        double(x) + double(x)
+    }
+
     /// Runs `expand` on a new kernel scope and returns the location of each op it inserted.
     fn locations(
         debug_info: DebugInfo,
@@ -185,6 +190,26 @@ mod tests {
                 panic!("expected a source position, got {loc:?}");
             };
             assert!((FIRST_LINE..FIRST_LINE + 4).contains(&(pos.line as u32)));
+        }
+    }
+
+    #[test]
+    fn inlined_calls_keep_their_call_site() {
+        let call_sites = locations(DebugInfo::LineTables, |scope, x| {
+            quadruple::expand(scope, x);
+        })
+        .into_iter()
+        .filter_map(|loc| match loc {
+            Location::CallSite { callee, caller } => Some((*callee, *caller)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+        // Every op of the two `double` calls records that `quadruple` called it.
+        assert!(!call_sites.is_empty());
+        for (callee, caller) in call_sites {
+            assert!(matches!(callee, Location::Named { name, .. } if name == "double"));
+            assert!(matches!(caller, Location::Named { name, .. } if name == "quadruple"));
         }
     }
 
