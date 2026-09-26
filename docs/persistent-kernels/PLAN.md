@@ -235,11 +235,11 @@ A per-launch buffer that the server owns. The compiler pass that needs it declar
 4. `compute/server.rs`: override `capacity` (compile, then query; `exact: true`).
 5. `compute/server.rs`: override `launch_persistent`. Resolve the count (3.3). If the driver returns `CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE` for `Fill`, `Fraction` or `AtMost` (for example under MPS), halve the count and launch again, until the launch succeeds or the count is `1`. Log `log::warn!` one time per `KernelId`, with the requested and the used count (D4). For `Exact`, do not retry.
 6. `cubecl-cpp/src/cuda/dialect.rs`: add `cuda_op!(GridSyncOp, …)` → `cooperative_groups::this_grid().sync();`. Declare `cooperative_groups.h` with the same `includes` mechanism as [`builtin.rs` L20-L32](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-cpp/src/cuda/builtin.rs#L20-L32).
-7. LLVM `nvptx` target: see D7. Until D7 is closed, report `GridSync::None` when the LLVM compiler is active.
+7. LLVM `nvptx` target: see D7. LLVM is the default CUDA compiler; steps 1–6 apply only with the `cpp` feature. Until D7 is closed, report `GridSync::None` when `CudaBackend::default()` is `Llvm` (next to `restrict_features`, [`runtime.rs` L373-L376](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-cuda/src/runtime.rs#L373-L376)).
 
 #### HIP — native (`cubecl-hip`, `cubecl-cpp`)
 
-Apply CUDA steps 1–6 with `hipDeviceAttributeCooperativeLaunch`, `hipModuleOccupancyMaxActiveBlocksPerMultiprocessor`, and `hipModuleLaunchCooperativeKernel` in `execute_task` ([L459](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-hip/src/compute/context.rs#L455-L480)). Lower `GridSyncOp` in `cubecl-cpp/src/hip/dialect.rs` to `cooperative_groups::this_grid().sync();` with `hip/hip_cooperative_groups.h`.
+Apply CUDA steps 1–7 with `hipDeviceAttributeCooperativeLaunch`, `hipModuleOccupancyMaxActiveBlocksPerMultiprocessor`, and `hipModuleLaunchCooperativeKernel` in `execute_task` ([L459](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-hip/src/compute/context.rs#L455-L480)). Lower `GridSyncOp` in `cubecl-cpp/src/hip/dialect.rs` to `cooperative_groups::this_grid().sync();` with `hip/hip_cooperative_groups.h`.
 
 #### wgpu — emulated (`cubecl-wgpu`, `cubecl-spirv`, `cubecl-opt`)
 
