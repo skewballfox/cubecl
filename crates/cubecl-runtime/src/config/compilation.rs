@@ -1,4 +1,13 @@
 use super::logger::{LogLevel, LoggerConfig};
+use cubecl_ir::settings::DebugInfo;
+
+/// The debug data the cargo profile asks for: [`LineTables`](DebugInfo::LineTables) when the
+/// profile sets `debug`, as `dev` does by default, else [`None`](DebugInfo::None).
+pub const PROFILE_DEBUG_INFO: DebugInfo = if cfg!(cubecl_debug_info) {
+    DebugInfo::LineTables
+} else {
+    DebugInfo::None
+};
 
 /// Configuration for compilation settings in `CubeCL`.
 #[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -25,6 +34,19 @@ pub struct CompilationConfig {
     /// Log how long each compiler pass takes, at the `info` level. Set by `CUBECL_TIME_PASSES`.
     #[serde(default)]
     pub time_passes: bool,
+    /// The most debug data a kernel may carry. `None` keeps what the cargo profile and the kernel
+    /// ask for. It can only lower that level. Set by `CUBECL_DEBUG_INFO`.
+    #[serde(default)]
+    pub debug_info: Option<DebugInfo>,
+}
+
+impl CompilationConfig {
+    /// The debug data of a kernel that asks for `requested`: at least [`PROFILE_DEBUG_INFO`], at
+    /// most [`debug_info`](Self::debug_info).
+    pub fn resolve_debug_info(&self, requested: DebugInfo) -> DebugInfo {
+        let level = requested.max(PROFILE_DEBUG_INFO);
+        self.debug_info.map_or(level, |limit| level.min(limit))
+    }
 }
 
 /// How far an f32 intermediate is allowed to travel before it is rounded back to f16.
@@ -101,3 +123,39 @@ pub enum CompilationLogLevel {
 }
 
 impl LogLevel for CompilationLogLevel {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_info_follows_the_profile_and_the_kernel() {
+        let config = CompilationConfig::default();
+        assert_eq!(
+            config.resolve_debug_info(DebugInfo::None),
+            PROFILE_DEBUG_INFO
+        );
+        assert_eq!(config.resolve_debug_info(DebugInfo::Full), DebugInfo::Full);
+    }
+
+    #[test]
+    fn debug_info_limit_only_lowers() {
+        let config = CompilationConfig {
+            debug_info: Some(DebugInfo::LineTables),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.resolve_debug_info(DebugInfo::Full),
+            DebugInfo::LineTables
+        );
+
+        let config = CompilationConfig {
+            debug_info: Some(DebugInfo::Full),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.resolve_debug_info(DebugInfo::None),
+            PROFILE_DEBUG_INFO
+        );
+    }
+}
