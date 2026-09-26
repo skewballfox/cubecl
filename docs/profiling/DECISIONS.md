@@ -2,44 +2,21 @@
 
 Base commit: [`a1bb768ce919260eea56dbd0b59c70e55236e22d`](https://github.com/skewballfox/cubecl/commit/a1bb768ce919260eea56dbd0b59c70e55236e22d). Plan: [PLAN.md](PLAN.md).
 
-## Rule for all decisions
+## Rules for all decisions
 
-The behavior must be the same as for ordinary Rust code. The user sets `debug` in a cargo profile. Then the profilers work. A choice that needs a compile-time setting **and** a run-time switch is correct only if the feature has a run-time cost or a side effect that is too high to have in every build with debug data (PLAN §3.0).
+1. The behavior must be the same as for ordinary Rust code. The user sets `debug` in a cargo profile. Then the profilers work. A choice that needs a compile-time setting **and** a run-time switch is correct only if the feature has a run-time cost or a side effect that is too high to have in every build with debug data (PLAN §3.0).
+2. cubecl uses only open formats and interfaces that existing tools read (perf, samply, `cargo flamegraph`, CUPTI, rocprofiler, gdb, `tracing` layers). cubecl adds no profiler and no output format of its own.
 
-A second rule applies: cubecl uses only open formats and interfaces that existing tools read (perf, samply, `cargo flamegraph`, CUPTI, rocprofiler, gdb, `tracing` layers). cubecl adds no profiler and no output format of its own.
+This file lists only the open choices. The plan contains the result of each closed choice. For each open choice, the plan uses the **provisional** option, so work can start. A maintainer must confirm or change it.
 
-This file lists the choices that remain after these rules. For each choice, the plan uses a **provisional** option, so work can start. A maintainer must confirm or change each provisional option.
-
-| ID | Subject | Status | Result or provisional | Blocks |
-|---|---|---|---|---|
-| D1 | How cubecl detects the cargo `debug` setting | Closed | B: `DEBUG` in a build script | — |
-| D2 | Dump code: feature or always compiled | Closed by the rule | B | — |
-| D3 | Location chain: eager or at scope exit | Open | A | P1 |
-| D4 | LLVM debug data: cubecl bridge or pliron-llvm change | Open | C | P2 steps 3–4 |
-| D5 | Source path resolution | Closed by the rule | B | — |
-| D6 | JIT symbol registration: default and fallback | Closed | A and A | — |
-| D6a | Perf map for `cargo flamegraph` | Open | — | P3 |
-| D7 | SPIR-V line format | Open | C | P4 step 4 |
-| D8 | Host-to-kernel attribution | Closed | Existing `tracing` span | — |
-| D9 | Location granularity | Closed by the rule | — | — |
+| ID | Subject | Provisional | Blocks |
+|---|---|---|---|
+| D3 | Location chain: eager or at scope exit | A | P1 |
+| D4 | LLVM debug data: cubecl bridge or pliron-llvm change | C | P2 steps 3–4 |
+| D10 | Trigger for perf symbol files | A + B | P3 step 3 |
+| D11 | Configuration surface for the SPIR-V debug format | A + B | P4 step 4 |
 
 ---
-
-## D1. How cubecl detects the cargo `debug` setting — closed
-
-**Result: B.** A build script reads the cargo variable `DEBUG`. cubecl already uses the build-script interface for its debug cfg ([`cubecl-macros/build.rs#L5-L16`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-macros/build.rs#L5-L16)). That script reads a feature and `CUBECL_DEBUG`, not `DEBUG`. Its crate is a proc macro, which cargo builds with the `build-override` profile. Thus the read goes in `cubecl-runtime/build.rs`, which cargo builds with the target profile (PLAN §5 step 0).
-
-Consequences that the plan accepts:
-
-- `DEBUG` is true or false. It gives no level. `Full` is available only with the existing controls (`#[cube(debug_symbols)]`, the `debug-symbols` feature, `CUBECL_DEBUG=1`).
-- The macro cannot read `DEBUG`, so it always emits the capture calls. Crates with kernels get a larger expansion and more compile time, in all builds.
-- The value comes from the profile of `cubecl-runtime`, not of each kernel crate. A per-package override on a kernel crate alone has no effect.
-
-The rejected option read `-C debuginfo=<level>` from the rustc arguments in the macro. It gave the exact level for each crate, but it is not an official cargo interface.
-
-## D2. Dump code: build-time feature or always compiled — closed
-
-The rule selects **B**. The dumps cost something only when `CUBECL_DEBUG_PLIRON` is set, so a run-time switch is sufficient. Remove the `build.rs` switch. Compile the dump code in all `std` builds. Keep `pliron-dump` as an empty feature for compatibility (PLAN §4 step 3). The remaining cost is a small increase in binary size and the `sanitize_filename` dependency.
 
 ## D3. Location chain: eager or rewritten at scope exit
 
@@ -64,71 +41,36 @@ The rule does not apply. The user-visible behavior is the same.
 
 **Decide with:** whether the pliron maintainers accept B, and how long a release takes.
 
-## D5. Source path resolution — closed
+## D10. Trigger for perf symbol files
 
-The rule selects **B**, the rustc behavior. rustc writes the file name as `file!()` gives it, and writes its working directory as `DW_AT_comp_dir`. The macro records `std::env::current_dir()` at expansion (PLAN §2.5) and uses it as the `DIFile` directory. Users who do not want build paths in the output use `--remap-path-prefix` or the cargo `trim-paths` option, as for other Rust code.
+The perf jitdump and the perf map (PLAN §7) write files that stay after the process stops. Thus rule 1 requires a run-time trigger. The question is which signal starts them.
 
-**Verify during P2:** `file!()` is remapped by `--remap-path-prefix`. Apply the same remap to the recorded directory. If the recorded directory is not remapped, put it in `DW_AT_comp_dir` only when `file!()` is relative.
+**Facts (checked in the source code):**
 
-## D6. JIT symbol registration: default and fallback — closed
-
-**Result: part 1 A, part 2 A.** GDB registration is automatic. perf jitdump needs `CUBECL_JIT_SYMBOLS=perf`. If the perf listener is not available, cubecl logs one warning.
-
-The CPU runtime makes its machine code at run time. Native Rust code needs no registration, because the symbols are in the ELF file. JIT code has no ELF file. Thus the rule does not give a result directly. The cost of each listener decides it.
-
-**Part 1: default**
+- `cargo flamegraph` 0.6.14 runs `perf record` (Linux) or `dtrace` / `xctrace` (macOS). It sets no environment variable on the profiled program.
+- `samply` 0.13.1 sets `DOTNET_PerfMapEnabled` on the program that it starts, if the variable is not already set: `2` (jitdump) on Linux, `3` (perf map) on macOS. The name comes from .NET: `1` = both, `2` = jitdump only, `3` = perf map only.
+- No JIT-neutral standard exists for "a profiler asks for JIT symbols". Each JIT runtime uses its own opt-in: .NET `DOTNET_PerfMapEnabled`, Python `PYTHONPERFSUPPORT` / `-X perf`, Node `--perf-basic-prof`, JVM `-XX:+DumpPerfMapAtExit`.
+- Detection of the parent process (for example `/proc/<ppid>/comm == "perf"`) is not reliable. `perf record -p`, `perf record -a`, eBPF agents and wrapper scripts have a different parent.
 
 | Option | For | Against |
 |---|---|---|
-| **A. GDB registration automatic when the level is not `None`. perf jitdump only with `CUBECL_JIT_SYMBOLS=perf`.** | `gdb` and `lldb` work with no setting, as for native code. No files are written without a request. This is the same as the JVM (`-XX:+DumpPerfMapAtExit`) and Node (`--perf-prof`). | `perf` needs one variable more than for native code. |
-| B. Both listeners automatic when the level is not `None`. | `perf` and `samply` work with no setting. It follows the rule literally. | Each process with debug data writes a jitdump file, and the files stay on disk. This is a side effect of a build setting. |
+| **A. `CUBECL_JIT_SYMBOLS=perf` (or `jitdump`, `perfmap`).** | It is the same convention as all other JIT runtimes. It is clear and not hacky. | One variable more than for native Rust code. |
+| **B. Also accept `DOTNET_PerfMapEnabled` (`1`, `2`, `3`, same meanings).** | `samply record` works with no cubecl variable. | It uses a name from a different runtime. A user who profiles .NET code in the same shell also enables cubecl output. `cargo flamegraph` still needs A. |
+| C. Always write the files when the level is not `None`. | `cargo flamegraph` and `samply` work with no variable, as for native code. | Each dev-profile process, each `cargo test` process included, leaves files in `/tmp` and `~/.debug/jit`. |
 
-**Part 2: fallback if `LLVMCreatePerfJITEventListener()` returns null** (LLVM built without `LLVM_USE_PERF`)
+No clean automatic detection for `cargo flamegraph` exists. B is automatic for `samply` only.
 
-| Option | For | Against |
-|---|---|---|
-| **A. Warn only.** | No new code. | `perf` shows no CPU kernel symbols. |
-| B. Write `/tmp/perf-<pid>.map` in cubecl. | `perf` and `samply` read it. About 50 lines. | Function level only. All code is inlined, so the result is one frame for each kernel. |
-| C. Write jitdump in cubecl, with `JIT_CODE_DEBUG_INFO` records. | Line-level data, independent of the LLVM build. | About 400 lines. It must read DWARF from the object file. |
-| D. Ask `tracel-llvm-bundler` to build with `LLVM_USE_PERF=ON`. | The correct fix. No cubecl code. | It depends on another project. It does not help users with their own LLVM. |
+## D11. Configuration surface for the SPIR-V debug format
 
-**Still to check:** whether the bundled LLVM has perf support. If it does, the warning in part 2 never appears with the bundled LLVM.
+The format is decided: `Auto` selects `NonSemantic.Shader.DebugInfo.100` when the device supports it, else `OpLine` (PLAN §8 step 4). This choice is about **how the user overrides `Auto`**. Each option is a code location where the setting can enter.
 
-## D6a. Perf map for `cargo flamegraph`
+| Option | Code location | For | Against |
+|---|---|---|---|
+| **A. Automatic (default).** Device support sets `supports_non_semantic_info`. | [`vulkan/features.rs#L113-L122`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-wgpu/src/backend/vulkan/features.rs#L113-L122), [`vulkan.rs#L391-L395`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-wgpu/src/backend/vulkan.rs#L391-L395) | No setting. It is always necessary as the base. | No override alone. |
+| **B. Global config: `[compilation] spirv_debug_format = "auto" \| "op-line" \| "non-semantic"` in `cubecl.toml`, and `CUBECL_SPIRV_DEBUG_FORMAT`.** | `CompilationConfig` ([`config/compilation.rs#L4-L20`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-runtime/src/config/compilation.rs#L4-L20)), env read in [`config/base.rs`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-runtime/src/config/base.rs#L80) | Same pattern as `check_mode` and `f16_evaluation`. No API change. It works for tools that fail on one format. | Global, not per device. |
+| C. Per device: a field in `RuntimeOptions`. | [`cubecl-wgpu/src/runtime.rs#L283-L288`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-wgpu/src/runtime.rs#L283-L288) | Programmatic. Different devices can use different formats. | `RuntimeOptions` has public fields and no `#[non_exhaustive]`, so a new field breaks struct literals in user code. |
+| D. Per device: a new `WgpuSetup` builder method or `init_device_with_options`. | [`runtime.rs#L315-L337`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-wgpu/src/runtime.rs#L315-L337) | Programmatic, and additive. | A new function for one setting. |
+| E. Cargo feature on `cubecl-wgpu` (`spirv-non-semantic`). | `crates/cubecl-wgpu/Cargo.toml` | Simple. | It violates rule 1: the format has no run-time cost, so a build switch is not justified. Features are additive, so "force `OpLine`" cannot be a feature. |
+| F. Per kernel: `KernelSettings` or `#[cube(...)]`. | [`cubecl-ir/src/settings.rs#L79-L92`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-ir/src/settings.rs#L79-L92) | Maximum control. | The format is a property of the device and the tool, not of the kernel. It adds noise to the kernel API. |
 
-A fact that D6 did not consider: `perf script` reads `/tmp/perf-<pid>.map` with no extra step, but it reads a jitdump only after `perf inject --jit`. `cargo flamegraph` runs `perf record` and `perf script` and does not run `perf inject`. Thus, with D6 alone, `cargo flamegraph` shows CPU runtime kernels as unknown addresses. `samply` reads both formats.
-
-| Option | For | Against |
-|---|---|---|
-| A. No perf map. The book gives the `perf inject` procedure. | No new code. | `cargo flamegraph` does not show CPU runtime kernels. |
-| B. With `CUBECL_JIT_SYMBOLS=perf`, also write `/tmp/perf-<pid>.map` (`<addr> <size> <name>`, the open perf map format). | `cargo flamegraph` and other tools that read perf maps show each kernel by name. About 50 lines. | Function level only, so there is one frame for each kernel, with no lines or inlined frames. The function size must come from the object file. |
-
-Only the CPU runtime is affected. GPU kernels do not go through `perf`.
-
-
-## D7. SPIR-V line format
-
-The rule maps the format to the cargo level. A device capability limits it.
-
-| Option | For | Against |
-|---|---|---|
-| A. `OpLine` (core SPIR-V) for all levels. | Simple. All drivers accept it. RenderDoc shows it. | No inlined frames. |
-| B. `NonSemantic.Shader.DebugInfo.100` (`DebugLine`, `DebugScope`, `DebugInlinedAt`) for all levels. | Full inlined call chains, as in DWARF. | It needs `VK_KHR_shader_non_semantic_info` or Vulkan 1.3. The modules are larger. Tool support is not complete. |
-| **C. B if the device has the extension, else A.** | Inlined frames when possible, and a working result on each device. | Two code paths and two sets of tests. |
-
-## D8. Host-to-kernel attribution — closed
-
-**What the earlier version meant.** It proposed `FoldedStacks`, a cubecl observer that wrote its own flamegraph file. Each line was the host call stack of a launch plus the kernel name, weighted by the device time of the kernel. The decision was how to get that host call stack: from `tracing` spans, from `std::backtrace`, or from a manual API.
-
-**Result: removed.** It is a cubecl-specific output, so the second rule excludes it. The conventional channels already exist:
-
-- **Host call site of a launch:** `launch_inner` opens a `tracing` span with `kernel.name` and `kernel.id` ([`client.rs#L1065-L1078`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-runtime/src/client.rs#L1065-L1078)). Standard `tracing` layers send it to Perfetto, Tracy, `tracing-flame`, OpenTelemetry, or NVTX.
-- **GPU time for each kernel:** CUPTI (Nsight Systems) and rocprofiler record each kernel with its name and correlate it with the host thread. Tracy GPU zones already exist with `profile-tracy`.
-- **Time inside a GPU kernel:** CUPTI PC sampling (Nsight Compute) and rocprofiler read the line data from PLAN §6 and §8.
-- **Time inside a CPU runtime kernel:** perf and samply read the DWARF and JIT symbols from PLAN §6 and §7.
-
-PLAN §9 now contains only documentation for these tools.
-
-## D9. Location granularity — closed
-
-The rule selects expression granularity for each level other than `None`, as rustc does. The granularity changes only the size of the line tables. It does not change the machine code or the run time (PLAN §5 step 4).
+Provisional: A as the default, B as the override. Add D only if a user needs different formats on two devices in one process.
