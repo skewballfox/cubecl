@@ -11,23 +11,11 @@ This file lists only the open choices. The plan contains the result of each clos
 
 | ID | Subject | Provisional | Blocks |
 |---|---|---|---|
-| D3 | Location chain: eager or at scope exit | A | P1 |
 | D4 | LLVM debug data: cubecl bridge or pliron-llvm change | C | P2 steps 3–4 |
 | D10 | Trigger for perf symbol files | A + B | P3 step 3 |
 | D11 | Configuration surface for the SPIR-V debug format | A + B | P4 step 4 |
 
 ---
-
-## D3. Location chain: eager or rewritten at scope exit
-
-The rule does not apply. Both options give the same output.
-
-| Option | For | Against |
-|---|---|---|
-| **A. Eager.** Build the full `CallSite` chain at insertion, from the frame stack (PLAN §5). | One pass. It is easy to test. Each op is final when it is inserted. | Each op keeps a copy of the full chain. The memory cost is O(ops × depth). A cache for each frame makes this smaller. |
-| B. Lazy (the method the maintainer described). Set `SrcPos` on the leaf. At function exit, wrap each op of that call in `CallSite`. | Each op keeps a short location while its function is open. It is the same as the MLIR inliner. | It must track the ops that each call inserted. Ops that a later pass moves or duplicates can get the wrong frame. It walks the ops again at each exit. |
-
-**Decide with:** the peak memory of expansion with A for the largest `cubecl-matmul` kernel.
 
 ## D4. LLVM debug data: cubecl-side metadata bridge or pliron-llvm change
 

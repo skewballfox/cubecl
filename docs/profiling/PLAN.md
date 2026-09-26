@@ -153,7 +153,9 @@ The GDB JIT registration (gdb, lldb) has almost no cost and writes no files. It 
 
 ## 5. Phase 1: location capture in the frontend
 
-**Model.** Each op gets its full location when it is inserted. The `CallSite` chain is built directly from a frame stack. The maintainer's method sets `SrcPos` first and wraps it in `CallSite` when the function returns. The output of the two methods is the same. The eager method does not need a second walk. The choice is open: [D3](DECISIONS.md#d3-location-chain-eager-or-rewritten-at-scope-exit).
+**Model.** Each op gets its full location when it is inserted. The `CallSite` chain is built directly from a frame stack (the eager method).
+
+The rejected alternative sets `SrcPos` first and wraps each op in `CallSite` when its function returns. Both methods give the same final locations, so they also use the same memory at the end. The alternative also needs a list of the ops that each call inserted, rewrites an op once for each level of nesting, and gives the wrong frame to ops that the frontend inserts outside the current call (loop flags, `yield` ops). The chain construction is in one dedicated commit (step 2a), so a maintainer can revert it and put the alternative in its place.
 
 For a leaf op in `inner`, called from `mid`, called from kernel `k`:
 
