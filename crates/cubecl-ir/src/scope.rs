@@ -54,7 +54,7 @@ use crate::{
     },
     interfaces::{ScalarType, TypedExt},
     read_value,
-    settings::KernelSettings,
+    settings::{KernelSettings, Persistence},
     types::{PointerType, RuntimeArrayType, cuda::TensorMapType, scalar::BoolType},
 };
 
@@ -157,6 +157,7 @@ pub struct GlobalState {
     pub modes: InstructionModes,
     pub target_properties: TargetProperties,
     pub device_properties: Option<Rc<DeviceProperties>>,
+    pub persistence: Persistence,
 }
 
 unsafe impl Send for GlobalState {}
@@ -336,6 +337,7 @@ fn new_context(settings: KernelSettings) -> Rc<UnsafeCell<Context>> {
         target_properties: Default::default(),
         device_properties: Default::default(),
         errors: Default::default(),
+        persistence: settings.persistence,
     };
     settings.address_type.register(&mut state);
 
@@ -370,6 +372,7 @@ fn dummy_context() -> Rc<UnsafeCell<Context>> {
         target_properties: Default::default(),
         device_properties: Default::default(),
         errors: Default::default(),
+        persistence: Default::default(),
     };
 
     ctx.set_aux_ty(state);
@@ -385,6 +388,7 @@ impl Debug for GlobalState {
             .field("modes", &self.modes)
             .field("target_properties", &self.target_properties)
             .field("device_properties", &self.device_properties)
+            .field("persistence", &self.persistence)
             .finish()
     }
 }

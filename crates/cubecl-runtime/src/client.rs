@@ -1,9 +1,11 @@
 use crate::{
     config::{TypeNameFormatLevel, type_name_format},
+    dry_run::LaunchMode,
     id::{GraphId, KernelId},
     kernel::CubeKernel,
     logging::ProfileLevel,
     memory_management::{MemoryAllocationMode, MemoryReport, MemoryScope},
+    persistent::PersistentCount,
     server::{
         BufferBinding, Collective, CommunicationId, CopyDescriptor, CubeCount, Handle,
         KernelArguments, KernelResource, MemoryLayout, MemoryLayoutDescriptor,
@@ -1073,17 +1075,17 @@ impl Client {
     unsafe fn launch_inner(
         &self,
         kernel: Box<dyn CubeKernel>,
-        count: CubeCount,
+        shape: LaunchShape,
         bindings: KernelArguments,
         stream_id: StreamId,
     ) {
         // No work, and some drivers reject a zero grid dim.
-        if let CubeCount::Static(x, y, z) = &count
+        if let LaunchShape::Count(CubeCount::Static(x, y, z)) = &shape
             && (*x == 0 || *y == 0 || *z == 0)
         {
             return;
         }
-        if let CubeCount::Dynamic(binding) = &count {
+        if let LaunchShape::Count(CubeCount::Dynamic(binding)) = &shape {
             self.expect_local(binding);
         }
         for resource in &bindings.resources {
@@ -1127,7 +1129,7 @@ impl Client {
                         None
                     };
 
-                    unsafe { state.launch(kernel, count, bindings, stream_id, launch_mode) };
+                    unsafe { shape.launch(state, kernel, bindings, stream_id, launch_mode) };
 
                     if let Some(info) = execution_info {
                         utilities.logger.register_execution(info);
@@ -1146,19 +1148,19 @@ impl Client {
                 // computation.
                 let slot = Arc::new(cubecl_environment::sync::Mutex::new(Some((
                     kernel,
-                    count.clone(),
+                    shape.clone(),
                     bindings,
                 ))));
                 let to_launch = slot.clone();
                 let profiled = self.profile(
                     move || {
-                        let (kernel, count, bindings) = to_launch
+                        let (kernel, shape, bindings) = to_launch
                             .lock()
                             .take()
                             .expect("filled right above, emptied only here");
                         context
                             .submit_blocking(move |state| unsafe {
-                                state.launch(kernel, count, bindings, stream_id, launch_mode)
+                                shape.launch(state, kernel, bindings, stream_id, launch_mode)
                             })
                             .unwrap_or_resume()
                     },
@@ -1178,14 +1180,14 @@ impl Client {
                             // The refusal came before the closure ran, so the
                             // kernel was never submitted. Launch it the way an
                             // unobserved run would have.
-                            Some((kernel, count, bindings)) => {
+                            Some((kernel, shape, bindings)) => {
                                 let utilities = self.utilities.clone();
                                 let kernel_id = kernel.id();
                                 self.device.submit(move |state| {
                                     unsafe {
-                                        state.launch(
+                                        shape.launch(
+                                            state,
                                             kernel,
-                                            count,
                                             bindings,
                                             stream_id,
                                             launch_mode,
@@ -1245,7 +1247,7 @@ impl Client {
                 // either never took this path or returned above.
                 let info = match level {
                     Some(ProfileLevel::Full) => {
-                        format!("{name}: {kernel_id} CubeCount {count:?}")
+                        format!("{name}: {kernel_id} {shape}")
                     }
                     _ => profile_label(name, &kernel_id),
                 };
@@ -1257,7 +1259,35 @@ impl Client {
     /// Launches the `kernel` with the given `bindings`.
     #[track_caller]
     pub fn launch(&self, kernel: Box<dyn CubeKernel>, count: CubeCount, bindings: KernelArguments) {
-        unsafe { self.launch_inner(kernel, count, bindings, self.stream_id()) }
+        let shape = LaunchShape::Count(count);
+        unsafe { self.launch_inner(kernel, shape, bindings, self.stream_id()) }
+    }
+
+    /// Launches the persistent `kernel` with the given `bindings`.
+    ///
+    /// `capacity` is the caller's estimate of how many cubes of the kernel the device runs at
+    /// the same time (see [`CapacityHint`](crate::persistent::CapacityHint)). A runtime that can
+    /// query the capacity uses its own value.
+    #[track_caller]
+    pub fn launch_persistent(
+        &self,
+        kernel: Box<dyn CubeKernel>,
+        count: PersistentCount,
+        capacity: u32,
+        bindings: KernelArguments,
+    ) {
+        let estimate = count.resolve(capacity, self.properties().hardware.max_cube_count.0);
+        let shape = LaunchShape::Persistent { count, estimate };
+        unsafe { self.launch_inner(kernel, shape, bindings, self.stream_id()) }
+    }
+
+    /// How many cubes of `kernel` the device runs at the same time, or `None` if the runtime
+    /// cannot query it.
+    pub fn capacity(&self, kernel: Box<dyn CubeKernel>) -> Result<Option<u32>, ServerError> {
+        let stream_id = self.stream_id();
+        self.device
+            .submit_blocking(move |server| server.capacity(kernel, stream_id))
+            .unwrap_or_resume()
     }
 
     /// Whether the bytes behind `handles` can be trusted, right now and with
@@ -1771,4 +1801,48 @@ impl Client {
 fn profile_label(name: &'static str, kernel_id: &KernelId) -> String {
     let base = type_name_format(name, TypeNameFormatLevel::Balanced);
     kernel_id.entrypoint_name(&base)
+}
+
+/// The cube count of a launch, as the caller gave it.
+#[derive(Clone)]
+enum LaunchShape {
+    Count(CubeCount),
+    Persistent {
+        count: PersistentCount,
+        estimate: u32,
+    },
+}
+
+impl LaunchShape {
+    /// # Safety
+    ///
+    /// The same as [`Server::launch`].
+    unsafe fn launch(
+        self,
+        server: &mut dyn Server,
+        kernel: Box<dyn CubeKernel>,
+        bindings: KernelArguments,
+        stream_id: StreamId,
+        launch_mode: LaunchMode,
+    ) {
+        match self {
+            Self::Count(count) => unsafe {
+                server.launch(kernel, count, bindings, stream_id, launch_mode)
+            },
+            Self::Persistent { count, estimate } => unsafe {
+                server.launch_persistent(kernel, count, estimate, bindings, stream_id, launch_mode)
+            },
+        }
+    }
+}
+
+impl core::fmt::Display for LaunchShape {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Count(count) => write!(f, "CubeCount {count:?}"),
+            Self::Persistent { count, estimate } => {
+                write!(f, "PersistentCount {count:?} (estimate {estimate})")
+            }
+        }
+    }
 }

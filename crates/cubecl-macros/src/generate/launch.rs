@@ -19,7 +19,6 @@ impl ToTokens for Launch {
 
         let name = &self.func.sig.name;
         let launch = self.launch();
-        let launch_unchecked = self.launch_unchecked();
         let aliases = self.create_type_alias();
         let dummy = self.create_dummy_kernel();
         let kernel = self.kernel_definition();
@@ -38,7 +37,6 @@ impl ToTokens for Launch {
 
                 #kernel
                 #launch
-                #launch_unchecked
                 #dummy
             }
         };
@@ -52,88 +50,186 @@ impl ToTokens for Launch {
     }
 }
 
+/// The cube count a generated launch function takes, and how it launches the kernel.
+enum LaunchCount {
+    /// A `CubeCount` from the caller.
+    Grid,
+    /// A `PersistentCount`, with the capacity from the default hint.
+    Persistent,
+    /// A `PersistentCount`, with the capacity from a hint generic.
+    PersistentWith,
+}
+
 impl Launch {
     fn launch(&self) -> TokenStream {
-        if self.args.launch.is_present() {
-            let compute_client = prelude_type("Client");
-            let cube_count = prelude_type("CubeCount");
-            let cube_dim = prelude_type("CubeDim");
-            let address_type = prelude_type("AddressType");
-
-            let kernel_doc = format!(
-                "Launch the kernel [{}()] on the given runtime",
-                self.func.sig.name
-            );
-            let generics = &self.launch_generics;
-            let args = self.launch_args();
-            let body = self.launch_body(ExecutionMode::Checked);
-
-            let address_type = match self.args.address_type {
-                AddressType::Dynamic => quote![__address_type: #address_type,],
-                _ => quote![],
-            };
-
-            quote! {
-                #[allow(clippy::too_many_arguments)]
-                #[doc = #kernel_doc]
-                pub fn launch #generics(
-                    __client: &#compute_client,
-                    __cube_count: #cube_count,
-                    __cube_dim: #cube_dim,
-                    #address_type
-                    #(#args),*
-                ) {
-                    #body
-                    launcher.launch(__cube_count, __kernel, __client)
-                }
+        let mut out = TokenStream::new();
+        // A plain launch of a cooperative kernel could exceed the capacity and hang.
+        let grid = !self.args.cooperative.is_present();
+        let persistent = self.args.is_persistent();
+        for (flag, mode, suffix) in [
+            (&self.args.launch, ExecutionMode::Checked, ""),
+            (
+                &self.args.launch_unchecked,
+                ExecutionMode::Unchecked,
+                "_unchecked",
+            ),
+        ] {
+            if !flag.is_present() {
+                continue;
             }
-        } else {
-            TokenStream::new()
+            if grid {
+                out.extend(self.launch_fn(
+                    format_ident!("launch{suffix}"),
+                    mode,
+                    LaunchCount::Grid,
+                ));
+            }
+            if persistent {
+                for (name, count) in [
+                    ("launch_persistent", LaunchCount::Persistent),
+                    ("launch_persistent_with", LaunchCount::PersistentWith),
+                ] {
+                    out.extend(self.launch_fn(format_ident!("{name}{suffix}"), mode, count));
+                }
+                out.extend(self.capacity_fn(format_ident!("capacity{suffix}"), mode));
+            }
+        }
+        out
+    }
+
+    fn launch_fn(&self, name: Ident, mode: ExecutionMode, count: LaunchCount) -> TokenStream {
+        let compute_client = prelude_type("Client");
+        let cube_dim = prelude_type("CubeDim");
+        let kernel_name = &self.func.sig.name;
+        let mut doc = format!("Launch the kernel [{kernel_name}()] on the given runtime");
+        if !matches!(count, LaunchCount::Grid) {
+            doc.push_str(" as a persistent kernel");
+        }
+        if matches!(mode, ExecutionMode::Unchecked) {
+            doc.push_str(" without bound checks");
+        }
+        let mut generics = self.launch_fn_generics(mode);
+
+        let (count_param, launch) = match count {
+            LaunchCount::Grid => {
+                let cube_count = prelude_type("CubeCount");
+                (
+                    quote![__cube_count: #cube_count],
+                    quote![launcher.launch(__cube_count, __kernel, __client)],
+                )
+            }
+            LaunchCount::Persistent | LaunchCount::PersistentWith => {
+                let persistent_count = prelude_type("PersistentCount");
+                let hint = match count {
+                    LaunchCount::PersistentWith => {
+                        let capacity_hint = prelude_type("CapacityHint");
+                        generics.params.push(parse_quote![__H: #capacity_hint]);
+                        doc.push_str(
+                            ".\n\n`__H` estimates the capacity on a runtime that cannot query it.",
+                        );
+                        quote![__H]
+                    }
+                    _ => prelude_type("DefaultCapacity").into_token_stream(),
+                };
+                (
+                    quote![__count: #persistent_count],
+                    quote![launcher.launch_persistent::<#hint, _>(__count, __kernel, __client)],
+                )
+            }
+        };
+        let unsafety = self.safety_doc(mode, &mut doc);
+        let args = self.launch_args();
+        let address_type = self.address_type_param();
+        let body = self.launch_body(mode);
+
+        quote! {
+            #[allow(clippy::too_many_arguments)]
+            #[doc = #doc]
+            pub #unsafety fn #name #generics(
+                __client: &#compute_client,
+                #count_param,
+                __cube_dim: #cube_dim,
+                #address_type
+                #(#args),*
+            ) {
+                #body
+                #launch
+            }
         }
     }
 
-    fn launch_unchecked(&self) -> TokenStream {
-        if self.args.launch_unchecked.is_present() {
-            let compute_client = prelude_type("Client");
-            let cube_count = prelude_type("CubeCount");
-            let cube_dim = prelude_type("CubeDim");
-            let address_type = prelude_type("AddressType");
+    /// How many cubes of the kernel the device runs at the same time.
+    fn capacity_fn(&self, name: Ident, mode: ExecutionMode) -> TokenStream {
+        let compute_client = prelude_type("Client");
+        let cube_dim = prelude_type("CubeDim");
+        let server_error = prelude_type("ServerError");
+        let doc = format!(
+            "How many cubes of the kernel [{}()] the device runs at the same time, or `None` if \
+             the runtime cannot query it.",
+            self.func.sig.name
+        );
+        let generics = self.launch_fn_generics(mode);
+        let args = self.launch_args();
+        let address_type = self.address_type_param();
+        let body = self.launch_body(mode);
 
-            let kernel_doc = format!(
-                "Launch the kernel [{}()] on the given runtime without bound checks.\n\n\
-                 # Safety\n\n\
-                 The kernel must not:\n\
-                 - Contain any out of bounds reads or writes. Doing so is immediate UB.\n\
-                 - Contain any loops that never terminate. These may be optimized away entirely or cause\n\
-                   other unpredictable behaviour.",
-                self.func.sig.name
-            );
-            let generics = &self.kernel_generics;
-            let args = self.launch_args();
-            let body = self.launch_body(ExecutionMode::Unchecked);
-
-            let address_type = match self.args.address_type {
-                AddressType::Dynamic => quote![__address_type: #address_type,],
-                _ => quote![],
-            };
-
-            quote! {
-                #[allow(clippy::too_many_arguments)]
-                #[doc = #kernel_doc]
-                pub unsafe fn launch_unchecked #generics(
-                    __client: &#compute_client,
-                    __cube_count: #cube_count,
-                    __cube_dim: #cube_dim,
-                    #address_type
-                    #(#args),*
-                ) {
-                    #body
-                    launcher.launch(__cube_count, __kernel, __client)
-                }
+        quote! {
+            #[allow(clippy::too_many_arguments)]
+            #[doc = #doc]
+            pub fn #name #generics(
+                __client: &#compute_client,
+                __cube_dim: #cube_dim,
+                #address_type
+                #(#args),*
+            ) -> Result<Option<u32>, #server_error> {
+                #body
+                launcher.capacity(__kernel, __client)
             }
-        } else {
-            TokenStream::new()
         }
+    }
+
+    fn launch_fn_generics(&self, mode: ExecutionMode) -> Generics {
+        match mode {
+            ExecutionMode::Checked => self.launch_generics.clone(),
+            ExecutionMode::Unchecked => self.kernel_generics.clone(),
+        }
+    }
+
+    fn address_type_param(&self) -> TokenStream {
+        let address_type = prelude_type("AddressType");
+        match self.args.address_type {
+            AddressType::Dynamic => quote![__address_type: #address_type,],
+            _ => quote![],
+        }
+    }
+
+    /// Appends the `# Safety` section to `doc`, and returns `unsafe` if the function needs it.
+    fn safety_doc(&self, mode: ExecutionMode, doc: &mut String) -> TokenStream {
+        let mut rules = Vec::new();
+        if matches!(mode, ExecutionMode::Unchecked) {
+            rules.push("Contain any out of bounds reads or writes. Doing so is immediate UB.");
+            rules.push(
+                "Contain any loops that never terminate. These may be optimized away entirely or \
+                 cause\n  other unpredictable behaviour.",
+            );
+        }
+        if self.args.may_hang() {
+            rules.push(
+                "Run on a device that does not run all cubes of the launch at the same time. \
+                 The `spin` grid sync then hangs.",
+            );
+        }
+        if rules.is_empty() {
+            return TokenStream::new();
+        }
+        if !doc.ends_with('.') {
+            doc.push('.');
+        }
+        doc.push_str("\n\n# Safety\n\nThe kernel must not:\n");
+        for rule in rules {
+            doc.push_str(&format!("- {rule}\n"));
+        }
+        quote![unsafe]
     }
 
     fn launch_body(&self, execution_mode: ExecutionMode) -> TokenStream {

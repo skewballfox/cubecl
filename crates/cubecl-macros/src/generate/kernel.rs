@@ -9,8 +9,8 @@ use syn::{Ident, TypeParamBound, parse_quote};
 use crate::{
     parse::{
         kernel::{
-            DefinedGeneric, ExecutionMode, KernelBody, KernelFn, Launch, anon_lifetime_to_static,
-            map_type_normalized, strip_ref,
+            DefinedGeneric, ExecutionMode, GridSyncEmulation, KernelBody, KernelFn, Launch,
+            SharedAfterGridSync, anon_lifetime_to_static, map_type_normalized, strip_ref,
         },
         signature::KernelReturns,
     },
@@ -412,15 +412,7 @@ impl Launch {
             let info_ty = self.info_ty(&info_ty_name);
             let info_generics = generic_names.as_turbofish();
 
-            let kernel_source_name = self.kernel_entrypoint_name();
-            let mut settings = quote![settings.kernel_name(#kernel_source_name)];
-            let cfg_debug = cfg!(debug_symbols) && !self.args.no_debug_symbols.is_present();
-            if cfg_debug || self.args.debug_symbols.is_present() {
-                settings.extend(quote![.debug_symbols()]);
-            }
-            if let Some(cluster_dim) = &self.args.cluster_dim {
-                settings.extend(quote![.cluster_dim(#cluster_dim.into())]);
-            }
+            let settings = self.settings();
 
             quote! {
                 #[doc = #kernel_doc]
@@ -464,6 +456,7 @@ impl Launch {
                             .address_type(address_type)
                             .cube_dim(self.settings.cube_dim.clone())
                             .mode(self.settings.execution_mode)
+                            .persistence(self.settings.persistence)
                             .info(#info_ty_name #info_generics {
                                 #(#info_names: self.#info_names.clone(),)*
                                 #phantom_data_init
@@ -486,6 +479,47 @@ impl Launch {
         }
     }
 
+    /// The kernel settings, with every option the macro arguments set.
+    fn settings(&self) -> TokenStream {
+        let kernel_source_name = self.kernel_entrypoint_name();
+        let mut settings = quote![settings.kernel_name(#kernel_source_name)];
+        let cfg_debug = cfg!(debug_symbols) && !self.args.no_debug_symbols.is_present();
+        if cfg_debug || self.args.debug_symbols.is_present() {
+            settings.extend(quote![.debug_symbols()]);
+        }
+        if let Some(cluster_dim) = &self.args.cluster_dim {
+            settings.extend(quote![.cluster_dim(#cluster_dim.into())]);
+        }
+        if let Some(persistence) = self.persistence() {
+            settings.extend(quote![.persistence(#persistence)]);
+        }
+        settings
+    }
+
+    fn persistence(&self) -> Option<TokenStream> {
+        let ir = core_type("ir");
+        if self.args.persistent.is_present() {
+            return Some(quote![#ir::settings::Persistence::Persistent]);
+        }
+        if !self.args.cooperative.is_present() {
+            return None;
+        }
+        let emulation = match self.args.grid_sync_emulation.unwrap_or_default() {
+            GridSyncEmulation::Split => quote![Split],
+            GridSyncEmulation::Spin => quote![Spin],
+        };
+        let shared = match self.args.shared_after_grid_sync.unwrap_or_default() {
+            SharedAfterGridSync::Spill => quote![Spill],
+            SharedAfterGridSync::Discard => quote![Discard],
+        };
+        Some(quote! {
+            #ir::settings::Persistence::Cooperative(#ir::settings::CooperativeOptions {
+                emulation: #ir::features::GridSyncEmulation::#emulation,
+                shared: #ir::settings::SharedAfterGridSync::#shared,
+            })
+        })
+    }
+
     fn info_ty(&self, name: &Ident) -> proc_macro2::TokenStream {
         let const_params: Vec<_> = self.comptime_params().collect();
         let param_names = self
@@ -502,16 +536,6 @@ impl Launch {
             .into_iter()
             .chain(args.clone())
             .collect::<Vec<_>>();
-
-        let kernel_source_name = self.kernel_entrypoint_name();
-        let mut settings = quote![settings.kernel_name(#kernel_source_name)];
-        let cfg_debug = cfg!(debug_symbols) && !self.args.no_debug_symbols.is_present();
-        if cfg_debug || self.args.debug_symbols.is_present() {
-            settings.extend(quote![.debug_symbols()]);
-        }
-        if let Some(cluster_dim) = &self.args.cluster_dim {
-            settings.extend(quote![.cluster_dim(#cluster_dim.into())]);
-        }
 
         let generics = &self.kernel_generics;
         let (type_generics_names, impl_generics, where_generics) =

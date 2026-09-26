@@ -4,6 +4,7 @@ use cubecl_ir::{ExpandValue, OpInserter, dialect::branch::RangeLoopOp};
 use num_traits::NumCast;
 
 use crate as cubecl;
+use crate::unexpanded;
 use cubecl::prelude::*;
 
 #[derive_expand(CubeType)]
@@ -556,4 +557,45 @@ pub mod range_stepped {
             inclusive: false,
         }
     }
+}
+
+/// Cube-strided range over `0..len` for a persistent kernel. Cube `c` gets the items `c`,
+/// `c + CUBE_COUNT`, `c + 2 * CUBE_COUNT`, and so on.
+///
+/// Every unit of a cube gets the same items, so the loop body may call `sync_cube`.
+#[allow(unused_variables)]
+pub fn persistent_range(len: usize) -> Box<dyn Iterator<Item = usize>> {
+    unexpanded!()
+}
+
+pub mod persistent_range {
+    use super::*;
+
+    pub fn expand(scope: &Scope, len: NativeExpand<usize>) -> SteppedRangeExpand<usize> {
+        let start = CUBE_POS::expand(scope);
+        let step = CUBE_COUNT::expand(scope);
+        range_stepped::expand(scope, start, len, step)
+    }
+}
+
+/// Unit-strided range over `0..len` for a persistent kernel. Unit `u` gets the items `u`,
+/// `u + CUBE_COUNT * CUBE_DIM`, and so on, where `u` is [`ABSOLUTE_POS`].
+#[allow(unused_variables)]
+pub fn persistent_range_units(len: usize) -> Box<dyn Iterator<Item = usize>> {
+    unexpanded!()
+}
+
+pub mod persistent_range_units {
+    use super::*;
+
+    pub fn expand(scope: &Scope, len: NativeExpand<usize>) -> SteppedRangeExpand<usize> {
+        let start = ABSOLUTE_POS::expand(scope);
+        let step = units_launched::expand(scope);
+        range_stepped::expand(scope, start, len, step)
+    }
+}
+
+#[cube]
+fn units_launched() -> usize {
+    CUBE_COUNT * CUBE_DIM as usize
 }

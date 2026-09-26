@@ -72,3 +72,6 @@ pub mod dry_run;
 pub mod launched;
 /// Runtime trait and related types
 pub mod runtime;
+
+/// Persistent kernels: the cube count follows the device, not the problem size.
+pub mod persistent;

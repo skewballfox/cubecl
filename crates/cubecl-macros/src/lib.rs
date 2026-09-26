@@ -39,6 +39,13 @@ mod statement;
 /// # Arguments
 /// * `launch` - generates a function to launch the kernel
 /// * `launch_unchecked` - generates a launch function without checks
+/// * `persistent` - also generates `launch_persistent`: the runtime sets the cube count from the
+///   number of cubes the device runs at the same time
+/// * `cooperative` - like `persistent`, and the kernel may call `sync_grid`
+/// * `grid_sync_emulation = "spin"` - with `cooperative`: a faster grid sync on runtimes without
+///   native support, which can hang. Makes the launch functions `unsafe`
+/// * `shared_after_grid_sync = "discard"` - with `cooperative`: shared memory is undefined after
+///   an emulated grid sync, instead of kept
 /// * `debug` - panics after generation to print the output to console
 /// * `create_dummy_kernel` - Generates a function to create a kernel without launching it. Used for
 ///   testing.

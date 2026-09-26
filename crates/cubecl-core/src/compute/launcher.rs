@@ -6,7 +6,10 @@ use crate::{InfoBuilder, ScalarArgType};
 use core::cell::RefCell;
 use cubecl_ir::{AddressType, ElemType, Scope, settings::KernelSettings};
 use cubecl_runtime::kernel::BufferIOAttr;
-use cubecl_runtime::server::{BufferBinding, CubeCount, KernelResource, TensorMapBinding};
+use cubecl_runtime::persistent::{CapacityHint, PersistentCount};
+use cubecl_runtime::server::{
+    BufferBinding, CubeCount, KernelResource, ServerError, TensorMapBinding,
+};
 use cubecl_runtime::{client::Client, kernel::CubeKernel, server::KernelArguments};
 
 #[cfg(feature = "std")]
@@ -70,6 +73,30 @@ impl KernelLauncher {
         let kernel = Box::new(kernel);
 
         client.launch(kernel, cube_count, bindings)
+    }
+
+    /// Launch a persistent kernel. `H` estimates the capacity on a runtime that cannot query it.
+    #[track_caller]
+    pub fn launch_persistent<H: CapacityHint, K: CubeKernel>(
+        self,
+        count: PersistentCount,
+        kernel: K,
+        client: &Client,
+    ) {
+        let capacity = H::capacity(client, &kernel);
+        let bindings = self.into_bindings();
+
+        client.launch_persistent(Box::new(kernel), count, capacity, bindings)
+    }
+
+    /// The capacity of `kernel` (see [`Client::capacity`]). Registers nothing to launch.
+    pub fn capacity<K: CubeKernel>(
+        self,
+        kernel: K,
+        client: &Client,
+    ) -> Result<Option<u32>, ServerError> {
+        self.discard();
+        client.capacity(Box::new(kernel))
     }
 
     /// Drop a launcher that will never launch, releasing what it registered.

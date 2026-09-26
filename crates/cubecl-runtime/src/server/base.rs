@@ -11,6 +11,7 @@ use crate::{
     memory_management::{
         ManagedMemoryHandle, ManagedMemoryId, MemoryAllocationMode, StreamMemoryReport,
     },
+    persistent::PersistentCount,
     server::{BufferBinding, KernelResource},
     storage::{ComputeStorage, ManagedResource},
     tma::{OobFill, TensorMapFormat, TensorMapInterleave, TensorMapPrefetch, TensorMapSwizzle},
@@ -627,6 +628,39 @@ pub trait Server:
         stream_id: StreamId,
         launch_mode: LaunchMode,
     );
+
+    /// How many cubes of `kernel` the device runs at the same time, or `None` if the runtime
+    /// cannot query it.
+    fn capacity(
+        &mut self,
+        kernel: Box<dyn CubeKernel>,
+        stream_id: StreamId,
+    ) -> Result<Option<u32>, ServerError> {
+        let _ = (kernel, stream_id);
+        Ok(None)
+    }
+
+    /// Executes a persistent `kernel` (see [`PersistentCount`]).
+    ///
+    /// `estimate` is the cube count that `count` gives with the client's capacity estimate. A
+    /// runtime that can query its [`capacity`](Self::capacity) computes the count again.
+    ///
+    /// # Safety
+    ///
+    /// The same as [`launch`](Self::launch).
+    unsafe fn launch_persistent(
+        &mut self,
+        kernel: Box<dyn CubeKernel>,
+        count: PersistentCount,
+        estimate: u32,
+        bindings: KernelArguments,
+        stream_id: StreamId,
+        launch_mode: LaunchMode,
+    ) {
+        let _ = count;
+        let cube_count = CubeCount::new_1d(estimate);
+        unsafe { self.launch(kernel, cube_count, bindings, stream_id, launch_mode) }
+    }
 
     /// Flush all outstanding tasks in the server.
     ///
