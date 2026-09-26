@@ -1007,6 +1007,7 @@ dependencies = [
  "num-traits",
  "paste",
  "pliron",
+ "sanitize-filename",
  "serde",
  "serde_json",
  "tempfile",
@@ -1034,7 +1035,6 @@ dependencies = [
  "num-traits",
  "paste",
  "pliron",
- "sanitize-filename",
  "thiserror",
 ]
 
@@ -1375,7 +1375,6 @@ dependencies = [
  "paste",
  "pliron",
  "pliron-spirv",
- "sanitize-filename",
  "serde",
  "tracel-rspirv",
 ]
@@ -1426,7 +1425,6 @@ dependencies = [
  "paste",
  "pliron",
  "renderdoc",
- "sanitize-filename",
  "test-log",
  "thiserror",
  "tracel-ash",
