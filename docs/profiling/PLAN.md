@@ -6,7 +6,7 @@
 | pliron | `0.18.0`, commit [`3517dc6`](https://github.com/pliron-org/pliron/tree/3517dc6c08370e486297972be8da2b98ed0cd683) |
 | pliron-spirv | `0.15.0+sdk-1.4.357.0`, commit [`daa0d7b`](https://github.com/tracel-ai/tracel-rspirv/tree/daa0d7b84e2cfe0786e00e42160303ce7587e726/pliron-spirv) |
 | Open decisions | [DECISIONS.md](DECISIONS.md) |
-| Status | Phase 0 done ([`86d4822`](https://github.com/skewballfox/cubecl/commit/86d482246b293ea183653e4414290a94e47d0f26)). Phase 1 done ([`a0bb831`](https://github.com/skewballfox/cubecl/commit/a0bb831a168fd2efc272f7656edbb59366ba3bd2)). Phases 2–5 not started. |
+| Status | Phase 0 done ([`86d4822`](https://github.com/skewballfox/cubecl/commit/86d482246b293ea183653e4414290a94e47d0f26)). Phase 1 done ([`a0bb831`](https://github.com/skewballfox/cubecl/commit/a0bb831a168fd2efc272f7656edbb59366ba3bd2)). Phase 3 step 3 (perf map) done ([`c0c8f1a`](https://github.com/skewballfox/cubecl/commit/c0c8f1a281c54c44bc3677bc3aff6e0e0422d6dc)), before Phase 2 (§11). Phases 2–5 not started otherwise. |
 | Language | ASD-STE100 / Attempto Controlled English. Domain terms are permitted. |
 
 All links point to the commits above. Before you implement a step on a later commit, do the check in its **Verify** line again.
@@ -131,6 +131,7 @@ The GDB JIT registration (gdb, lldb) has almost no cost and writes no files. It 
 | An LLVM verifier error: "inlinable function call in a function with debug info must have a !dbg location". | Give each instruction a location. Use the kernel entry location as the fallback (§6 step 4). |
 | JIT code is not visible to `perf`. | Use the perf JIT listener (§7). |
 | `cargo flamegraph` does not run `perf inject --jit`, so it cannot read a jitdump. | Also write a perf map, which `perf script` reads with no extra step (§7 step 3). |
+| `cargo flamegraph` records with `--call-graph dwarf` by default. perf cannot unwind a JIT frame with DWARF, so `perf script` prints each sample in JIT code with an empty stack, and the flamegraph drops it. | Record with frame pointers: `cargo flamegraph -c "record -F 997 --call-graph fp -g"`. The book must say this (§7 step 5). |
 | `perf --call-graph fp` gives broken stacks in JIT code. | Follow `-C force-frame-pointers` (§7 step 3). |
 | `file!()` gives a path relative to the workspace. Tools cannot find the file. | Use the rustc working directory as the DWARF compile directory, as rustc does. Users remove build paths with `--remap-path-prefix` or cargo `trim-paths`, as for other Rust code. |
 
@@ -221,7 +222,11 @@ Steps:
 
 1. In [`cubecl-llvm/src/cpu/jit/engine.rs#L55-L98`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/cpu/jit/engine.rs#L55-L98), replace `LLVMLLJIT::new_with_default_builder()` with a local `JitBuilder` when the level is not `None`. `JitBuilder` calls `LLVMOrcCreateLLJITBuilder` and `LLVMOrcLLJITBuilderSetObjectLinkingLayerCreator`. The creator calls `LLVMOrcCreateRTDyldObjectLinkingLayerWithSectionMemoryManager` and then `LLVMOrcRTDyldObjectLinkingLayerRegisterJITEventListener` with `LLVMCreateGDBRegistrationListener()` (gdb, lldb), and also with `LLVMCreatePerfJITEventListener()` (perf jitdump) if `CUBECL_JIT_SYMBOLS=perf` is set. Keep the current path when the level is `None`.
 2. If `LLVMCreatePerfJITEventListener()` returns null (LLVM built without `LLVM_USE_PERF`), log one warning and continue. The perf map from step 3 still works.
-3. **Perf map.** With `CUBECL_JIT_SYMBOLS=perf` (other triggers: [D10](DECISIONS.md#d10-trigger-for-perf-symbol-files)), also append `<addr hex> <size hex> <name>` for each kernel to `/tmp/perf-<pid>.map`. This is the open perf map format. `perf script` (thus `cargo flamegraph`) and `samply` read it with no extra step.
+3. **Perf map — done** in [`c0c8f1a`](https://github.com/skewballfox/cubecl/commit/c0c8f1a281c54c44bc3677bc3aff6e0e0422d6dc). **Perf map.** With `CUBECL_JIT_SYMBOLS=perf` (other triggers: [D10](DECISIONS.md#d10-trigger-for-perf-symbol-files)), also append `<addr hex> <size hex> <name>` for each kernel to `/tmp/perf-<pid>.map`. This is the open perf map format. `perf script` (thus `cargo flamegraph`) and `samply` read it with no extra step.
+   - **Done as:** cubecl now owns the LLJIT: [`lljit.rs`](https://github.com/skewballfox/cubecl/blob/c0c8f1a281c54c44bc3677bc3aff6e0e0422d6dc/crates/cubecl-llvm/src/cpu/jit/lljit.rs). `pliron-llvm`'s `LLVMLLJIT` keeps its `LLVMOrcLLJITRef` private, so a hook on the object layer is not possible through it. The optimized `LlvmModule` goes to the JIT directly. Before, it was printed and parsed again.
+   - The triggers (D10, A + B) and the map writer: [`symbols.rs`](https://github.com/skewballfox/cubecl/blob/c0c8f1a281c54c44bc3677bc3aff6e0e0422d6dc/crates/cubecl-llvm/src/cpu/jit/symbols.rs). `CUBECL_JIT_SYMBOLS` is `perf` (both files), `perfmap` or `jitdump`. Any other value turns both off, also when `DOTNET_PerfMapEnabled` is set. Without it, `DOTNET_PerfMapEnabled` has the .NET meanings (`1`, `2`, `3`).
+   - Rule 1 applies: the files need debug data **and** the switch. A kernel with the level `None` writes no line. `PlironEngine::compile_with_debug_info` is new, so `compile` keeps its signature. The CPU compiler passes `KernelSettings::debug_info`, which `KernelBuilder` already lowered by `compilation.debug_info`.
+   - **Verify result:** `perf report` names the kernel with no extra step. `cargo flamegraph` names it only with `--call-graph fp` (§3.4). Without frame pointers in the JIT code (step 4), the kernel frame is directly under the thread: `DSD-0-0;k_f_f32_…`.
    - Address: the result of `lookup_symbol` ([`engine.rs#L85`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-llvm/src/cpu/jit/engine.rs#L85)).
    - Size: install an object transform with `LLVMOrcObjectTransformLayerSetTransform(LLVMOrcLLJITGetObjTransformLayer(jit), …)`. In the transform, read the symbol sizes with `LLVMCreateBinary`, `LLVMObjectFileCopySymbolIterator` and `LLVMGetSymbolSize`, and return the buffer unchanged.
    - Name: the kernel entry name. The perf map gives one frame for each kernel. The jitdump gives lines and inlined frames.
@@ -285,7 +290,7 @@ No code. The host call site of a launch is already in the `tracing` span of `lau
 | SPIR-V `OpLine` | `crates/cubecl-spirv` | With `OpLine`, the disassembly has `OpLine`. |
 | SPIR-V NonSemantic | `crates/cubecl-spirv` | With `NonSemantic`, the disassembly has `DebugInlinedAt`, and `spirv-val` accepts the module. |
 | SPIR-V fallback | `crates/cubecl-spirv` | `Auto` without device support gives `OpLine`. |
-| Perf map | `crates/cubecl-cpu/tests/` (Linux) | With `CUBECL_JIT_SYMBOLS=perf`, `/tmp/perf-<pid>.map` has one line for each kernel, with a size greater than 0. |
+| Perf map (done: `perf_map.rs`) | `crates/cubecl-cpu/tests/` (Linux) | With `CUBECL_JIT_SYMBOLS=perf`, `/tmp/perf-<pid>.map` has one line for each kernel, with a size greater than 0. |
 | Cache key | `crates/cubecl-runtime/src/id.rs` | Two `KernelId`s that differ only in `debug_info` have different hashes. |
 | JIT dump | `crates/cubecl-cpu/tests/` (Linux, ignored if the listener is null) | `$JITDUMPDIR/jit-<pid>.dump` exists. |
 | No change when off | all (release profile with `debug = 0`) | The generated kernel output is byte-identical to the base commit. |
@@ -299,4 +304,6 @@ P1 (capture) ─► P2 (propagate + LLVM DWARF) ─► P3 (CPU JIT)
 P5 (docs): after P3 and P4
 ```
 
-Each phase is one PR. P0 and P1 are done. P4 SPIR-V needs one `pliron-spirv` release.
+Each phase is one PR. P0 and P1 are done.
+
+**Changed order:** the perf map (P3 step 3) is done before P2. It needs no DWARF, and it is the fastest way to get a named kernel frame in `cargo flamegraph`. The rest of P3 still needs P2. P4 SPIR-V needs one `pliron-spirv` release.
