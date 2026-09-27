@@ -11,6 +11,7 @@ use rspirv::{binary::Disassemble, dr::Module};
 
 pub mod attributes;
 pub mod compiler;
+mod lines;
 pub mod lower;
 pub mod ops;
 pub mod target;

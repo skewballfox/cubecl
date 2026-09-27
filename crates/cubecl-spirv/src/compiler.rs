@@ -33,8 +33,8 @@ use cubecl_ir::{
     attributes::{ATTR_BUFFER_IO, BufferIOAttr, EntrypointInterface},
     dialect::{scf::BranchToSCFPass, ssa_matrix::MatrixToSSAPass},
     prelude::{OperationPtrExt, SingleBlockRegionInterface, SymbolOpInterface},
-    rewrite::{CanonicalizePass, visit_all_ops_of_type_mut},
-    settings::{Dim3, KernelSettings},
+    rewrite::{CanonicalizePass, InheritLocationPass, visit_all_ops_of_type_mut},
+    settings::{DebugInfo, Dim3, KernelSettings},
 };
 use cubecl_opt::passes::{
     alloc_shared_memory::AllocateSharedMemoryBlockPass,
@@ -292,6 +292,11 @@ impl SpirvCompiler {
 
         passes.add_pass(ConvertArgsPass);
         passes.add_pass(NestedOpsPass::new(func_passes));
+        // Some passes insert ops without a location. They get the location of the op before them.
+        let lines = settings.debug_info != DebugInfo::None;
+        if lines {
+            passes.add_pass(InheritLocationPass);
+        }
 
         // The conversion pass reports ops it must not compile (e.g.
         // cube.poison) as errors, not bugs; surface them as a compilation
@@ -300,6 +305,9 @@ impl SpirvCompiler {
 
         let (shared_size, shared_args) = lower_shared(ctx, spirv_module);
         declare_entry_point(ctx, spirv_module, shared_args);
+        if lines {
+            crate::lines::insert_line_ops(ctx, spirv_module_op);
+        }
 
         // Make sure this is the last pass so it catches all ops
         OpPass::<SpirvModuleOp, CollectVerCapExtPass>::default()
