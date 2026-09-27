@@ -111,7 +111,7 @@ impl LlvmModule {
 
     /// # Errors
     /// The message of LLVM's verifier, when the module is not valid.
-    #[cfg(feature = "debug-info")]
+    #[cfg(all(feature = "debug-info", debug_assertions))]
     pub(crate) fn verify(&self) -> Result<(), String> {
         use llvm_sys::analysis::{LLVMVerifierFailureAction, LLVMVerifyModule};
 
