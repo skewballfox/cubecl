@@ -224,6 +224,9 @@ CubeCL supports several environment variables to override configuration at runti
   - `"none"`, `"line-tables"`, `"full"`
 - `CUBECL_TIME_PASSES`: Sets `compilation.time_passes`.
   - `"1"`/`"true"`/`"on"`, `"0"`/`"false"`/`"off"`
+- `CUBECL_JIT_SYMBOLS`: The profiler symbol files of the `cpu` runtime (see
+  [Profiling Kernels](./profiling.md)).
+  - `"perf"`, `"perfmap"`, `"jitdump"`
 - `CUBECL_ENVIRONMENT`: Sets `environment.name`, the environment to activate.
 - `CUBECL_ENVIRONMENT_RECORDS`: Sets `environment.records.level`, how much the
   environment records of its own build.
