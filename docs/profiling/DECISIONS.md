@@ -11,7 +11,7 @@ This file lists only the open choices. The plan contains the result of each clos
 
 | ID | Subject | Provisional | Blocks |
 |---|---|---|---|
-| D4 | LLVM debug data: cubecl bridge or pliron-llvm change | C | P2 steps 3–4 |
+| D4 | LLVM debug data: cubecl bridge or pliron-llvm change | B (on a `pliron` fork revision, not released) | upstream review of B |
 | D10 | Trigger for perf symbol files | A + B | P3 step 3 |
 | D11 | Configuration surface for the SPIR-V debug format | A + B | P4 step 4 |
 
@@ -28,6 +28,16 @@ The rule does not apply. The user-visible behavior is the same.
 | **C. A now, B later.** Remove A when B is released. | You get the feature now, with a path to the clean design. | The work is done twice. |
 
 **Decide with:** whether the pliron maintainers accept B, and how long a release takes.
+
+**Status:** A was done first ([`9ee8163`](https://github.com/skewballfox/cubecl/commit/9ee81636f029fecb387f16973bae522c10f48174)). B is now done in the `pliron` fork, commit [`d3a31a1`](https://github.com/skewballfox/pliron/tree/d3a31a15d253797f6f90fa2245c53caf800264ad) on `v0.18.0`. A is removed in [`0692c38`](https://github.com/skewballfox/cubecl/commit/0692c3850c5ee65c8dfe750d76d80b8cea3d48e6) (PLAN §6). cubecl uses B through `[patch.crates-io]`. The fork branch `cubecl-patch` also merges `pliron` `master`, which cubecl does not compile with. Thus the patch uses the revision, not the branch. B has these designs for the open points:
+
+- `Named`: the name of the outermost frame of a location is the name of a function. Other names have no effect.
+- `CallSite`: the callee gets a `DISubprogram` from its name, inlined at the location of the caller. A callee without a name gets the location of the caller.
+- `Fused`: the first location that converts. The LLVM C-API cannot merge locations.
+- `Unknown`: line 0 in the function scope.
+- No `DI*` metadata nodes are modelled. The conversion uses the LLVM `DIBuilder` directly.
+
+The choice stays open until the pliron maintainers accept B or ask for changes.
 
 ## D10. Trigger for perf symbol files
 
