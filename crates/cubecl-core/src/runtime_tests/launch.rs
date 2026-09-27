@@ -275,7 +275,7 @@ pub fn test_kernel_max_shared<R: Runtime>(client: Client) {
 /// unwritten, and the claim on those bytes is what carries the reason. So the
 /// read is the assertion: it must fail, and it must fail on the limit that
 /// stopped the launch rather than on anything the runtime invented.
-fn resource_error(client: &Client, out: Handle) -> ResourceLimitError {
+pub(crate) fn resource_error(client: &Client, out: Handle) -> ResourceLimitError {
     let err = client
         .read_one(out)
         .expect_err("a refused launch never wrote the buffer, so the read must fail");

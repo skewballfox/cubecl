@@ -5,7 +5,7 @@ use cubecl_core::{
     ir::{
         AddressType, DeviceIdentity, DeviceProperties, ElemType, FloatKind, HardwareProperties,
         IntKind, MemoryDeviceProperties, PhysicalDevice, TargetProperties, Type, UIntKind,
-        features::{AtomicUsage, Plane, TypeUsage},
+        features::{AtomicUsage, GridSync, GridSyncEmulation, Plane, TypeUsage},
     },
     zspace::{Shape, Strides, striding::has_pitched_row_major_strides},
 };
@@ -185,6 +185,10 @@ fn register_metal_features(props: &mut DeviceProperties) {
     props.features.alignment = true;
     // MSL's `threadgroup_barrier(mem_flags::mem_device)` orders device memory at device scope.
     props.features.device_memory_scope = true;
+    // Dispatches on a stream are ordered, so a split is a barrier. The device memory scope above
+    // makes a spin barrier possible.
+    props.features.grid_sync =
+        GridSync::Emulated(GridSyncEmulation::Split | GridSyncEmulation::Spin);
     props.features.plane.insert(Plane::Ops);
     props.features.plane.insert(Plane::Sync);
     props.features.plane.insert(Plane::NonUniformControlFlow);

@@ -1,4 +1,5 @@
 use crate::config::memory::MemoryConfig;
+use crate::config::persistent::PersistentConfig;
 use crate::config::streaming::StreamingConfig;
 
 use super::{
@@ -40,6 +41,10 @@ pub struct CubeClRuntimeConfig {
     /// Configuration for memory settings.
     #[serde(default)]
     pub memory: MemoryConfig,
+
+    /// Configuration for persistent kernels.
+    #[serde(default)]
+    pub persistent: PersistentConfig,
 
     /// Which named environment to warm into.
     #[serde(default)]

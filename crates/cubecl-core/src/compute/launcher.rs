@@ -6,7 +6,10 @@ use crate::{InfoBuilder, ScalarArgType};
 use core::cell::RefCell;
 use cubecl_ir::{AddressType, ElemType, Scope, settings::KernelSettings};
 use cubecl_runtime::kernel::BufferIOAttr;
-use cubecl_runtime::server::{BufferBinding, CubeCount, KernelResource, TensorMapBinding};
+use cubecl_runtime::persistent::{CapacityHint, PersistentCount};
+use cubecl_runtime::server::{
+    BufferBinding, CubeCount, KernelResource, ServerError, TensorMapBinding,
+};
 use cubecl_runtime::{client::Client, kernel::CubeKernel, server::KernelArguments};
 
 #[cfg(feature = "std")]
@@ -70,6 +73,45 @@ impl KernelLauncher {
         let kernel = Box::new(kernel);
 
         client.launch(kernel, cube_count, bindings)
+    }
+
+    /// Launch a persistent kernel. `H` gives the capacity on a runtime that cannot query it.
+    #[track_caller]
+    pub fn launch_persistent<H: CapacityHint, K: CubeKernel>(
+        self,
+        count: PersistentCount,
+        kernel: K,
+        client: &Client,
+    ) {
+        let bindings = self.into_bindings();
+        H::launch(client, Box::new(kernel), count, bindings)
+    }
+
+    /// Launch a persistent kernel as an exclusive launch. `H` gives the capacity on a runtime
+    /// that cannot query it.
+    ///
+    /// # Safety
+    ///
+    /// See [`Client::launch_persistent_exclusive`].
+    #[track_caller]
+    pub unsafe fn launch_persistent_exclusive<H: CapacityHint, K: CubeKernel>(
+        self,
+        count: PersistentCount,
+        kernel: K,
+        client: &Client,
+    ) {
+        let bindings = self.into_bindings();
+        unsafe { H::launch_exclusive(client, Box::new(kernel), count, bindings) }
+    }
+
+    /// The capacity of `kernel` (see [`Client::capacity`]). Registers nothing to launch.
+    pub fn capacity<K: CubeKernel>(
+        self,
+        kernel: K,
+        client: &Client,
+    ) -> Result<Option<u32>, ServerError> {
+        self.discard();
+        client.capacity(Box::new(kernel))
     }
 
     /// Drop a launcher that will never launch, releasing what it registered.

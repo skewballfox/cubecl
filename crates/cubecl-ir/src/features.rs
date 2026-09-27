@@ -35,6 +35,11 @@ pub struct Features {
     /// Whether vectors can be read from / stored to addresses not aligned
     /// with the `vector_size`
     pub unaligned_io: bool,
+    /// How the runtime supports a grid sync: a barrier that every cube of a launch must reach.
+    pub grid_sync: GridSync,
+    /// Whether an exclusive persistent launch gets native grid sync. It can be `true` while
+    /// `grid_sync` is an emulation: other work shares the device, so the default launch splits.
+    pub exclusive_grid_sync: bool,
 }
 
 /// Type support for a device
@@ -145,6 +150,29 @@ impl AtomicUsage {
     pub fn all() -> EnumSet<Self> {
         EnumSet::all()
     }
+}
+
+/// How a runtime supports a grid sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum GridSync {
+    /// No grid sync. A kernel that uses it does not compile.
+    #[default]
+    None,
+    /// The driver runs all cubes at the same time, and gives the barrier.
+    Native,
+    /// The runtime emulates the barrier with one of these methods.
+    Emulated(EnumSet<GridSyncEmulation>),
+}
+
+/// A method that emulates a grid sync on a runtime without native support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, EnumSetType)]
+pub enum GridSyncEmulation {
+    /// Each grid sync ends one dispatch and starts the next. Always correct.
+    #[default]
+    Split,
+    /// Cubes wait on a counter in device memory. Can hang if the device does not run all
+    /// cubes at the same time.
+    Spin,
 }
 
 /// Supported plane features

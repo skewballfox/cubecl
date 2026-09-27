@@ -43,6 +43,7 @@ use cubecl_opt::passes::{
     alloc_shared_memory::AllocateSharedMemoryBlockPass,
     annotate_buffer_visibility::AnnotateGlobalVisibilityPass, inst_combine::InstCombinePass,
     sccp::SCCPPass, simple_cse::SimpleCSEPass, sroa::SROAPass,
+    verify_grid_sync::VerifyGridSyncPass,
 };
 use cubecl_runtime::compiler::{CompilationError, Compiler};
 use pliron::{
@@ -280,7 +281,12 @@ where
 
         // SCCP/DCE may unlock more mem2reg opportunities, and vice versa. So we do a sandwich.
         func_passes.add_pass(Mem2RegPass);
+        passes.add_pass(NestedOpsPass::new(func_passes));
 
+        // Needs the values that mem2reg promoted: it reads a load from a local as non-uniform.
+        passes.add_pass(VerifyGridSyncPass);
+
+        let mut func_passes = OpPass::<FuncOp, Passes>::default();
         func_passes.add_pass(SROAPass);
         func_passes.add_pass(SCCPPass);
         func_passes.add_pass(SimpleCSEPass::with_memory());

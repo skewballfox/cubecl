@@ -23,6 +23,7 @@ pub mod launch;
 pub mod metadata;
 pub mod minifloat;
 pub mod numeric;
+pub mod persistent;
 pub mod plane;
 pub mod profiling;
 pub mod properties;
@@ -155,6 +156,7 @@ macro_rules! testgen_untyped {
         cubecl_core::testgen_properties!();
 
         cubecl_core::testgen_sync_plane!();
+        cubecl_core::testgen_persistent!();
         cubecl_core::testgen_tensor_indexing!();
         cubecl_core::testgen_debug!();
         cubecl_core::testgen_binary_untyped!();

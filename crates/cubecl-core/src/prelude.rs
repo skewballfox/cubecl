@@ -17,7 +17,8 @@ pub use cubecl_runtime::{
     client::Client,
     id::KernelId,
     kernel::*,
-    server::{CubeCount, CubeDim, LaunchError},
+    persistent::{AutotunedCapacity, CapacityHint, DefaultCapacity, PersistentCount},
+    server::{CubeCount, CubeDim, LaunchError, ServerError},
 };
 
 pub use crate::io::{read_checked, write_checked};

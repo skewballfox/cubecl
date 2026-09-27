@@ -6,7 +6,7 @@ use pliron::{
     opts::dce::SideEffects,
 };
 
-use crate::{CanMaterialize, interfaces::Synchronizes, prelude::*};
+use crate::{CanMaterialize, attributes::BoolAttr, interfaces::Synchronizes, prelude::*};
 
 /// Scope that the synchronization should apply to. This is a *minimum*, when fine-grained control
 /// is not available it should synchronize at the smallest scope that includes this scope
@@ -64,3 +64,30 @@ impl SideEffects for SyncOp {
 #[result_ty(none)]
 #[op_traits(CanMaterialize)]
 pub struct SyncAsyncProxyOp {}
+
+/// Barrier that every unit of every cube of the launch must reach. It orders memory like
+/// [`SyncScope::Device`]. It needs all cubes to run at the same time, so only a cooperative kernel
+/// may use it, unless `checked` is `false`.
+#[cube_op(name = "sync.sync_grid")]
+#[result_ty(none)]
+#[op_traits(CanMaterialize)]
+pub struct GridSyncOp {
+    pub checked: BoolAttr,
+}
+
+#[op_interface_impl]
+impl Synchronizes for GridSyncOp {
+    fn minimum_scope(&self, _ctx: &Context) -> SyncScope {
+        SyncScope::Device
+    }
+    fn maximum_scope(&self, _ctx: &Context) -> SyncScope {
+        SyncScope::Device
+    }
+}
+
+#[op_interface_impl]
+impl SideEffects for GridSyncOp {
+    fn has_side_effects(&self, _ctx: &Context) -> bool {
+        true
+    }
+}

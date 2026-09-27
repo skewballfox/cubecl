@@ -13,7 +13,10 @@ use cubecl_core::ir::TargetProperties;
 use cubecl_core::server::ServerUtilities;
 use cubecl_core::zspace::{Shape, Strides};
 use cubecl_environment::future;
-use cubecl_ir::{DeviceIdentity, DeviceProperties, HardwareProperties, MemoryDeviceProperties};
+use cubecl_ir::{
+    DeviceIdentity, DeviceProperties, HardwareProperties, MemoryDeviceProperties,
+    features::{EnumSet, GridSync, GridSyncEmulation},
+};
 use cubecl_server::allocator::ContiguousMemoryLayoutPolicy;
 #[cfg(not(feature = "vulkan-validate"))]
 use cubecl_server::logging::ProfileLevel;
@@ -529,6 +532,7 @@ pub(crate) fn create_server<C: WgpuCompiler>(
         .insert(cubecl_ir::features::Plane::NonUniformControlFlow);
 
     backend::register_features(&setup.adapter, &mut device_props, &mut compilation_options);
+    device_props.features.grid_sync = GridSync::Emulated(grid_sync_emulations(&device_props));
 
     let logger = alloc::sync::Arc::new(ServerLogger::default());
     let name = runtime_name(setup.backend, &compilation_options);
@@ -890,5 +894,14 @@ mod device_tests {
 
             assert_eq!(<WgpuRuntime>::find_device(device.to_id()), Err(discrete));
         }
+    }
+}
+
+/// Consecutive dispatches are ordered and see each other's writes, so a split is always a
+/// barrier. A spin barrier also needs device-scope memory ordering between workgroups.
+fn grid_sync_emulations(props: &DeviceProperties) -> EnumSet<GridSyncEmulation> {
+    match props.features.device_memory_scope {
+        true => GridSyncEmulation::Split | GridSyncEmulation::Spin,
+        false => GridSyncEmulation::Split.into(),
     }
 }
