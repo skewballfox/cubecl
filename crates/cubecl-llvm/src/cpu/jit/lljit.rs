@@ -7,7 +7,7 @@ use crate::shared::llvm_module::{LlvmModule, error_message};
 use llvm_sys::{
     core::LLVMDisposeMessage,
     error::LLVMErrorRef,
-    execution_engine::{LLVMCreateGDBRegistrationListener, LLVMCreatePerfJITEventListener},
+    execution_engine::LLVMCreateGDBRegistrationListener,
     object::{
         LLVMCreateBinary, LLVMDisposeBinary, LLVMDisposeSymbolIterator, LLVMGetSymbolName,
         LLVMGetSymbolSize, LLVMMoveToNextSymbol, LLVMObjectFileCopySymbolIterator,
@@ -28,7 +28,7 @@ use llvm_sys::{
             LLVMOrcLLJITRef,
         },
     },
-    prelude::LLVMMemoryBufferRef,
+    prelude::{LLVMJITEventListenerRef, LLVMMemoryBufferRef},
 };
 use std::{
     ffi::{CStr, CString, c_char, c_void},
@@ -151,13 +151,17 @@ extern "C" fn create_listened_layer(
             LLVMCreateGDBRegistrationListener(),
         );
         if !jitdump.is_null() {
-            let perf = LLVMCreatePerfJITEventListener();
+            let perf = perf_listener();
             if perf.is_null() {
                 static WARN: Once = Once::new();
                 WARN.call_once(|| {
+                    let cause = if cfg!(feature = "jitdump") {
+                        "this LLVM has no perf JIT listener (LLVM_USE_PERF)"
+                    } else {
+                        "cubecl is built without the `jitdump` feature"
+                    };
                     log::warn!(
-                        "This LLVM has no perf JIT listener (LLVM_USE_PERF), so no jitdump is \
-                         written. The perf map still names each kernel."
+                        "No jitdump is written: {cause}. The perf map still names each kernel."
                     )
                 });
             } else {
@@ -165,6 +169,21 @@ extern "C" fn create_listened_layer(
             }
         }
         layer
+    }
+}
+
+/// The perf JIT listener of LLVM, or null. It is null without the `jitdump` feature, which keeps
+/// the listener and the DWARF reader of LLVM out of the binary. It is also null when LLVM was built
+/// without `LLVM_USE_PERF`. The listener opens its jitdump in `$JITDUMPDIR` on the first call.
+fn perf_listener() -> LLVMJITEventListenerRef {
+    #[cfg(feature = "jitdump")]
+    {
+        // SAFETY: LLVM gives a process-wide listener, or null.
+        unsafe { llvm_sys::execution_engine::LLVMCreatePerfJITEventListener() }
+    }
+    #[cfg(not(feature = "jitdump"))]
+    {
+        std::ptr::null_mut()
     }
 }
 
@@ -205,18 +224,18 @@ mod tests {
     use super::*;
 
     /// With the jitdump asked for, the perf listener writes `jit-<pid>.dump` under `$JITDUMPDIR`.
-    /// Skipped when this LLVM was built without `LLVM_USE_PERF`.
+    /// Skipped without the `jitdump` feature, or when this LLVM was built without `LLVM_USE_PERF`.
     #[test]
     fn the_jitdump_is_written() {
-        // SAFETY: LLVM gives a process-wide listener, or null.
-        if unsafe { LLVMCreatePerfJITEventListener() }.is_null() {
-            eprintln!("skipped: this LLVM has no perf JIT listener");
-            return;
-        }
+        // The listener opens its file on the first call, so `JITDUMPDIR` is set before it.
         let dir = std::env::temp_dir().join(format!("cubecl-jitdump-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
         // SAFETY: no other test of this binary reads `JITDUMPDIR`.
         unsafe { std::env::set_var("JITDUMPDIR", &dir) };
+        if perf_listener().is_null() {
+            eprintln!("skipped: no perf JIT listener");
+            return;
+        }
+        std::fs::create_dir_all(&dir).unwrap();
         pliron_llvm::llvm_sys::target::initialize_native().unwrap();
 
         let symbols = JitSymbols {
