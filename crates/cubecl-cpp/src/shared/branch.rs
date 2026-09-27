@@ -65,7 +65,9 @@ fn line_directive(
     if next_line.as_ref() == Some(&source) {
         return next_line;
     }
-    if !out.is_empty() && !out.ends_with('\n') {
+    // A directive must start a line. The caller can put a block after other text on its line, as
+    // `case N: { <block> }`, so an empty `out` also gets the newline.
+    if !out.ends_with('\n') {
         out.push('\n');
     }
     let file = source.0.replace('\\', "\\\\").replace('"', "\\\"");
@@ -256,6 +258,10 @@ mod tests {
     #[test]
     fn source_lines_are_line_directives() {
         let source = source(DebugInfo::LineTables);
+        let starts_a_line = source
+            .match_indices("#line")
+            .all(|(at, _)| at == 0 || source.as_bytes()[at - 1] == b'\n');
+        assert!(starts_a_line, "a directive is not at the start of a line:\n{source}");
         let mut lines = directive_lines(&source);
         lines.sort();
         lines.dedup();
