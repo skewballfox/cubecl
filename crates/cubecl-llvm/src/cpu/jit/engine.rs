@@ -78,17 +78,24 @@ impl PlironEngine {
         let dump = KernelDump::new(kernel_name);
         dump.write("llvm.ll", || llvm_module.print());
 
+        let symbols = match debug_info {
+            DebugInfo::None => JitSymbols::default(),
+            _ => JitSymbols::from_env(),
+        };
         #[cfg(cubecl_frame_pointers)]
         llvm_module.add_function_attribute("frame-pointer", "all");
+        // The perf support plugin copies the `.eh_frame` of each kernel into the jitdump. Then
+        // `perf --call-graph dwarf` can unwind through the kernel. `2` is `uwtable(async)`, as rustc
+        // gives the host code.
+        #[cfg(feature = "jitdump")]
+        if symbols.jitdump {
+            llvm_module.add_function_enum_attribute("uwtable", 2);
+        }
         llvm_module
             .run_passes(PASS_PIPELINE, None)
             .unwrap_or_else(|err| panic!("LLVM optimization failed for '{kernel_name}': {err}"));
         dump.write("llvm.opt.ll", || llvm_module.print());
 
-        let symbols = match debug_info {
-            DebugInfo::None => JitSymbols::default(),
-            _ => JitSymbols::from_env(),
-        };
         let jit = Jit::new(symbols, debug_info != DebugInfo::None).expect("failed to create LLJIT");
         jit.add_module(llvm_module)
             .expect("failed to add module to JIT");
