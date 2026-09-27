@@ -73,9 +73,30 @@ impl LlvmModule {
         }
     }
 
-    #[cfg(any(feature = "amdgpu", feature = "nvptx"))]
     pub(crate) fn raw(&self) -> LLVMModuleRef {
         self.module
+    }
+
+    pub(crate) fn context(&self) -> LLVMContextRef {
+        self.ctx
+    }
+
+    /// # Errors
+    /// The message of LLVM's verifier, when the module is not valid.
+    pub(crate) fn verify(&self) -> Result<(), String> {
+        use llvm_sys::analysis::{LLVMVerifierFailureAction, LLVMVerifyModule};
+
+        let mut message = std::ptr::null_mut();
+        // SAFETY: the module is live, and the message is ours to free.
+        unsafe {
+            let failed = LLVMVerifyModule(
+                self.module,
+                LLVMVerifierFailureAction::LLVMReturnStatusAction,
+                &mut message,
+            ) != 0;
+            let message = take_message(message);
+            if failed { Err(message) } else { Ok(()) }
+        }
     }
 
     #[cfg(any(feature = "amdgpu", feature = "nvptx"))]

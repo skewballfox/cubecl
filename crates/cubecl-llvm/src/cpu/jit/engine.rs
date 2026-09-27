@@ -6,7 +6,10 @@ use super::{
 use crate::{
     cpu::shared_memory::SharedMemories,
     prelude::{Context, ModuleOp},
-    shared::llvm_module::LlvmModule,
+    shared::{
+        debug_info::{attach_debug_info, encode_locations},
+        llvm_module::LlvmModule,
+    },
 };
 use cubecl_core::{codegen::KernelDump, ir::settings::DebugInfo};
 use cubecl_runtime::kernel::BufferIOAttr;
@@ -77,12 +80,12 @@ impl PlironEngine {
             initialize_native().expect("failed to initialize native target");
         });
 
-        let llvm_ctx = LLVMContext::default();
-        let llvm_module = to_llvm_ir::convert_module(ctx, &llvm_ctx, module)?;
+        let llvm_module = to_llvm_module(ctx, module, kernel_name, debug_info)?;
         let dump = KernelDump::new(kernel_name);
-        dump.write("llvm.ll", || llvm_module.to_string());
+        dump.write("llvm.ll", || llvm_module.print());
 
-        let llvm_module = optimize(&llvm_module.to_string())
+        llvm_module
+            .run_passes(PASS_PIPELINE, None)
             .unwrap_or_else(|err| panic!("LLVM optimization failed for '{kernel_name}': {err}"));
         dump.write("llvm.opt.ll", || llvm_module.print());
 
@@ -144,11 +147,28 @@ impl Display for PlironEngine {
     }
 }
 
+/// Converts `module` to an LLVM module, with the DWARF of `debug_info`.
+pub(crate) fn to_llvm_module(
+    ctx: &Context,
+    module: ModuleOp,
+    kernel_name: &str,
+    debug_info: DebugInfo,
+) -> pliron::result::Result<LlvmModule> {
+    let locations = (debug_info != DebugInfo::None).then(|| encode_locations(ctx, module));
+    let llvm_ctx = LLVMContext::default();
+    let llvm_module = to_llvm_ir::convert_module(ctx, &llvm_ctx, module)?;
+    let llvm_module = LlvmModule::new(&llvm_module.to_string())
+        .unwrap_or_else(|err| panic!("LLVM IR does not parse for '{kernel_name}': {err}"));
+    if let Some(locations) = &locations {
+        attach_debug_info(&llvm_module, locations, debug_info);
+        // The test suites build with debug data, so they check every kernel.
+        #[cfg(debug_assertions)]
+        if let Err(err) = llvm_module.verify() {
+            panic!("the debug data of '{kernel_name}' does not verify: {err}");
+        }
+    }
+    Ok(llvm_module)
+}
+
 /// Optimization pipeline for JIT compilation.
 const PASS_PIPELINE: &CStr = c"default<O3>";
-
-fn optimize(ir: &str) -> Result<LlvmModule, String> {
-    let module = LlvmModule::new(ir)?;
-    module.run_passes(PASS_PIPELINE, None)?;
-    Ok(module)
-}
