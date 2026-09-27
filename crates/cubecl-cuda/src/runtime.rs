@@ -40,13 +40,15 @@ use cubecl_llvm::shared::lowered_features::{GpuTarget, restrict_features};
 use cubecl_server::{
     allocator::PitchedMemoryLayoutPolicy,
     config::{CubeClRuntimeConfig, RuntimeConfig},
+    cooperative::{DeviceSharing, display_connected, set_native_grid_sync},
     logging::ServerLogger,
     runtime::Runtime,
 };
 #[cfg(windows)]
 use cudarc::driver::sys::cuDeviceGetLuid;
 use cudarc::driver::sys::{
-    CUDA_VERSION, CUdevice, cuDeviceGetPCIBusId, cuDeviceTotalMem_v2, cuDriverGetVersion,
+    CUDA_VERSION, CUdevice, CUdevice_attribute, cuDeviceGetPCIBusId, cuDeviceTotalMem_v2,
+    cuDriverGetVersion,
 };
 use std::{ffi::CStr, mem::MaybeUninit, sync::Arc};
 
@@ -201,6 +203,7 @@ impl DeviceService for CudaServer {
         // the compilation namespace and the identity. Built once and shared
         // with `CudaContext` below, so the two cannot disagree.
         let fingerprint = format!("ptx_sm{arch_version}");
+        let pci_address = probe.physical.pci_address;
 
         let mut device_props = DeviceProperties::new(
             Default::default(),
@@ -357,15 +360,29 @@ impl DeviceService for CudaServer {
         device_props.features.alignment = true;
         // `__threadfence` carries a block's writes to device scope.
         device_props.features.device_memory_scope = true;
-        // SAFETY: `device_ptr` is a valid CUDA device; the attribute is a read-only property.
-        let cooperative_launch = unsafe {
-            cudarc::driver::result::device::get_attribute(
-                device_ptr,
-                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH,
-            )
+        // Which backend compiles here decides what may be advertised: the two are not at the
+        // same point, and a feature the selected one cannot honour is a kernel that fails to
+        // compile rather than a slower one.
+        let backend = CudaBackend::default();
+        let attribute = |attribute| {
+            // SAFETY: `device_ptr` is a valid CUDA device; the attribute is a read-only property.
+            unsafe { cudarc::driver::result::device::get_attribute(device_ptr, attribute) }
         };
-        if matches!(cooperative_launch, Ok(1)) {
-            device_props.features.grid_sync = GridSync::Native;
+        let cooperative_launch =
+            attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH);
+        if backend == CudaBackend::Cpp && matches!(cooperative_launch, Ok(1)) {
+            let watchdog = attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_KERNEL_EXEC_TIMEOUT);
+            let watchdog = !matches!(watchdog, Ok(0));
+            // Off Linux, the watchdog is the display signal: WDDM sets it, TCC does not.
+            let sharing = DeviceSharing {
+                integrated: !matches!(
+                    attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED),
+                    Ok(0)
+                ),
+                watchdog,
+                display: display_connected(pci_address).or(Some(watchdog)),
+            };
+            set_native_grid_sync(&mut device_props.features, sharing);
         }
         device_props.features.plane.insert(Plane::Ops);
         device_props
@@ -377,10 +394,6 @@ impl DeviceService for CudaServer {
         register_mma_features(supported_mma_combinations, &mut device_props);
         register_scaled_mma_features(supported_scaled_mma_combinations, &mut device_props);
 
-        // Which backend compiles here decides what may be advertised: the two are not at the
-        // same point, and a feature the selected one cannot honour is a kernel that fails to
-        // compile rather than a slower one.
-        let backend = CudaBackend::default();
         if backend == CudaBackend::Llvm {
             restrict_features(&mut device_props, GpuTarget::Nvptx);
             // The LLVM target has no grid sync lowering yet (D7 in docs/persistent-kernels).

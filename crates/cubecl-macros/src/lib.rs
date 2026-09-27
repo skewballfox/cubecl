@@ -41,7 +41,8 @@ mod statement;
 /// * `launch_unchecked` - generates a launch function without checks
 /// * `persistent` - generates `launch_persistent` instead of `launch`: the runtime sets the cube
 ///   count from the number of cubes the device runs at the same time
-/// * `cooperative` - like `persistent`, and the kernel may call `sync_grid`
+/// * `cooperative` - like `persistent`, and the kernel may call `sync_grid`. Also generates the
+///   `unsafe` `launch_persistent_exclusive`: native grid sync on a device that other work shares
 /// * `grid_sync_emulation = "spin"` - with `cooperative`: on runtimes without native grid sync,
 ///   a spin barrier instead of a split launch. It permits `sync_grid` in loops, but it hangs if
 ///   the device does not run all cubes at the same time, so the launch functions are `unsafe`

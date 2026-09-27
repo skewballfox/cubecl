@@ -37,6 +37,9 @@ pub struct Features {
     pub unaligned_io: bool,
     /// How the runtime supports a grid sync: a barrier that every cube of a launch must reach.
     pub grid_sync: GridSync,
+    /// Whether an exclusive persistent launch gets native grid sync. It can be `true` while
+    /// `grid_sync` is an emulation: other work shares the device, so the default launch splits.
+    pub exclusive_grid_sync: bool,
 }
 
 /// Type support for a device

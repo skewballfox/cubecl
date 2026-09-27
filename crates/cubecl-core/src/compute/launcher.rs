@@ -87,6 +87,23 @@ impl KernelLauncher {
         H::launch(client, Box::new(kernel), count, bindings)
     }
 
+    /// Launch a persistent kernel as an exclusive launch. `H` gives the capacity on a runtime
+    /// that cannot query it.
+    ///
+    /// # Safety
+    ///
+    /// See [`Client::launch_persistent_exclusive`].
+    #[track_caller]
+    pub unsafe fn launch_persistent_exclusive<H: CapacityHint, K: CubeKernel>(
+        self,
+        count: PersistentCount,
+        kernel: K,
+        client: &Client,
+    ) {
+        let bindings = self.into_bindings();
+        unsafe { H::launch_exclusive(client, Box::new(kernel), count, bindings) }
+    }
+
     /// The capacity of `kernel` (see [`Client::capacity`]). Registers nothing to launch.
     pub fn capacity<K: CubeKernel>(
         self,

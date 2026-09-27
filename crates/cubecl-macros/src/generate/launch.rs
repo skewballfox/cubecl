@@ -82,6 +82,7 @@ impl Launch {
                     format_ident!("launch{suffix}"),
                     mode,
                     LaunchCount::Grid,
+                    false,
                 ));
             }
             if persistent {
@@ -89,21 +90,42 @@ impl Launch {
                     ("launch_persistent", LaunchCount::Persistent),
                     ("launch_persistent_with", LaunchCount::PersistentWith),
                 ] {
-                    out.extend(self.launch_fn(format_ident!("{name}{suffix}"), mode, count));
+                    out.extend(self.launch_fn(format_ident!("{name}{suffix}"), mode, count, false));
                 }
                 out.extend(self.capacity_fn(format_ident!("capacity{suffix}"), mode));
+            }
+            // Only a grid sync needs the device to itself (D9).
+            if self.args.cooperative.is_present() {
+                for (name, count) in [
+                    ("launch_persistent_exclusive", LaunchCount::Persistent),
+                    (
+                        "launch_persistent_exclusive_with",
+                        LaunchCount::PersistentWith,
+                    ),
+                ] {
+                    out.extend(self.launch_fn(format_ident!("{name}{suffix}"), mode, count, true));
+                }
             }
         }
         out
     }
 
-    fn launch_fn(&self, name: Ident, mode: ExecutionMode, count: LaunchCount) -> TokenStream {
+    fn launch_fn(
+        &self,
+        name: Ident,
+        mode: ExecutionMode,
+        count: LaunchCount,
+        exclusive: bool,
+    ) -> TokenStream {
         let compute_client = prelude_type("Client");
         let cube_dim = prelude_type("CubeDim");
         let kernel_name = &self.func.sig.name;
         let mut doc = format!("Launch the kernel [{kernel_name}()] on the given runtime");
         if !matches!(count, LaunchCount::Grid) {
             doc.push_str(" as a persistent kernel");
+        }
+        if exclusive {
+            doc.push_str(", with native grid sync on a device that other work shares");
         }
         if matches!(mode, ExecutionMode::Unchecked) {
             doc.push_str(" without bound checks");
@@ -131,13 +153,17 @@ impl Launch {
                     }
                     _ => prelude_type("DefaultCapacity").into_token_stream(),
                 };
-                (
-                    quote![__count: #persistent_count],
-                    quote![launcher.launch_persistent::<#hint, _>(__count, __kernel, __client)],
-                )
+                let launch = if exclusive {
+                    quote![unsafe {
+                        launcher.launch_persistent_exclusive::<#hint, _>(__count, __kernel, __client)
+                    }]
+                } else {
+                    quote![launcher.launch_persistent::<#hint, _>(__count, __kernel, __client)]
+                };
+                (quote![__count: #persistent_count], launch)
             }
         };
-        let unsafety = self.safety_doc(mode, &mut doc);
+        let unsafety = self.safety_doc(mode, exclusive, &mut doc);
         let args = self.launch_args();
         let address_type = self.address_type_param();
         let body = self.launch_body(mode);
@@ -204,7 +230,7 @@ impl Launch {
     }
 
     /// Appends the `# Safety` section to `doc`, and returns `unsafe` if the function needs it.
-    fn safety_doc(&self, mode: ExecutionMode, doc: &mut String) -> TokenStream {
+    fn safety_doc(&self, mode: ExecutionMode, exclusive: bool, doc: &mut String) -> TokenStream {
         let mut rules = Vec::new();
         if matches!(mode, ExecutionMode::Unchecked) {
             rules.push("Contain any out of bounds reads or writes. Doing so is immediate UB.");
@@ -219,15 +245,26 @@ impl Launch {
                  The `spin` grid sync then hangs.",
             );
         }
-        if rules.is_empty() {
+        if rules.is_empty() && !exclusive {
             return TokenStream::new();
         }
         if !doc.ends_with('.') {
             doc.push('.');
         }
-        doc.push_str("\n\n# Safety\n\nThe kernel must not:\n");
+        doc.push_str("\n\n# Safety\n");
+        if !rules.is_empty() {
+            doc.push_str("\nThe kernel must not:\n");
+        }
         for rule in rules {
             doc.push_str(&format!("- {rule}\n"));
+        }
+        if exclusive {
+            doc.push_str(
+                "\nNo other work may use the compute units of the device during the launch. \
+                 This includes a display and other processes. Else some cubes cannot start, the \
+                 grid sync deadlocks, and the driver resets the device. A reset destroys every \
+                 context on the device.\n",
+            );
         }
         quote![unsafe]
     }

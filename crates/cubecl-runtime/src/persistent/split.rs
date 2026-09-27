@@ -32,6 +32,7 @@ use crate::{
     client::Client,
     id::KernelId,
     kernel::{CubeKernel, KernelDefinition, KernelMetadata},
+    persistent::PersistentCount,
     server::{CubeCount, KernelArguments},
 };
 
@@ -57,13 +58,43 @@ impl SplitPhase {
         kernel: Box<dyn CubeKernel>,
         plan: &SplitPlan,
         cubes: u32,
+        bindings: KernelArguments,
+    ) {
+        Self::launch_shared(client, kernel.into(), plan, cubes, bindings);
+    }
+
+    /// Launches every phase of `kernel` with the count that a native launch uses: `count`
+    /// resolved against the capacity of the whole kernel. A runtime that cannot query its
+    /// capacity uses `estimate`.
+    pub(crate) fn launch_persistent(
+        client: &Client,
+        kernel: Box<dyn CubeKernel>,
+        plan: &SplitPlan,
+        count: PersistentCount,
+        estimate: u32,
+        bindings: KernelArguments,
+    ) {
+        let kernel: Arc<dyn CubeKernel> = kernel.into();
+        let mut cubes = estimate;
+        if !matches!(count, PersistentCount::Exact(_))
+            && let Ok(Some(capacity)) = client.capacity(Box::new(Whole(kernel.clone())))
+        {
+            cubes = count.resolve(capacity, client.properties().hardware.max_cube_count.0);
+        }
+        Self::launch_shared(client, kernel, plan, cubes, bindings);
+    }
+
+    fn launch_shared(
+        client: &Client,
+        kernel: Arc<dyn CubeKernel>,
+        plan: &SplitPlan,
+        cubes: u32,
         mut bindings: KernelArguments,
     ) {
         for bytes in &plan.spill_bytes_per_cube {
             let spill = client.empty(bytes * cubes as usize);
             bindings.push_hidden_buffer(spill.binding());
         }
-        let kernel: Arc<dyn CubeKernel> = kernel.into();
         for phase in 0..plan.phases {
             let phase = Self {
                 kernel: kernel.clone(),
@@ -91,6 +122,29 @@ impl KernelMetadata for SplitPhase {
 
     fn address_type(&self) -> ElemType {
         self.kernel.address_type()
+    }
+}
+
+/// The kernel before the split, shared with its phases, for the capacity query.
+struct Whole(Arc<dyn CubeKernel>);
+
+impl KernelMetadata for Whole {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+
+    fn id(&self) -> KernelId {
+        self.0.id()
+    }
+
+    fn address_type(&self) -> ElemType {
+        self.0.address_type()
+    }
+}
+
+impl CubeKernel for Whole {
+    fn define(&self) -> KernelDefinition {
+        self.0.define()
     }
 }
 

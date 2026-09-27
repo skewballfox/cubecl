@@ -363,17 +363,26 @@ impl TwoPhaseSum {
         }
     }
 
-    fn launch(&self, client: &Client, count: PersistentCount, partials: &Handle) {
+    /// Launches the kernel. An `exclusive` launch needs [`exclusive_native_grid_sync`].
+    fn launch(&self, client: &Client, count: PersistentCount, partials: &Handle, exclusive: bool) {
         let len = |handle: &Handle| handle.size() as usize / core::mem::size_of::<u32>();
-        kernel_two_phase_sum::launch_persistent(
-            client,
-            count,
-            CubeDim::new_1d(SUM_UNITS),
-            unsafe { BufferArg::from_raw_parts(self.input.clone(), ITEMS) },
-            unsafe { BufferArg::from_raw_parts(partials.clone(), len(partials)) },
-            unsafe { BufferArg::from_raw_parts(self.sums.clone(), len(&self.sums)) },
-            unsafe { BufferArg::from_raw_parts(self.cubes.clone(), 1) },
-        );
+        let input = unsafe { BufferArg::from_raw_parts(self.input.clone(), ITEMS) };
+        let partials = unsafe { BufferArg::from_raw_parts(partials.clone(), len(partials)) };
+        let sums = unsafe { BufferArg::from_raw_parts(self.sums.clone(), len(&self.sums)) };
+        let cubes = unsafe { BufferArg::from_raw_parts(self.cubes.clone(), 1) };
+        let dim = CubeDim::new_1d(SUM_UNITS);
+        if !exclusive {
+            kernel_two_phase_sum::launch_persistent(
+                client, count, dim, input, partials, sums, cubes,
+            );
+            return;
+        }
+        // SAFETY: the caller checked `exclusive_native_grid_sync`.
+        unsafe {
+            kernel_two_phase_sum::launch_persistent_exclusive(
+                client, count, dim, input, partials, sums, cubes,
+            )
+        };
     }
 
     /// The sum that each cube computed.
@@ -388,9 +397,19 @@ impl TwoPhaseSum {
 /// Launches [`kernel_two_phase_sum`] with at most `max_cubes` cubes, and returns the sum that
 /// each cube computed.
 fn two_phase_sum(client: &Client, count: PersistentCount, max_cubes: u32) -> Vec<u32> {
+    two_phase_sum_as(client, count, max_cubes, false)
+}
+
+/// [`two_phase_sum`], as an exclusive launch if `exclusive` is set.
+fn two_phase_sum_as(
+    client: &Client,
+    count: PersistentCount,
+    max_cubes: u32,
+    exclusive: bool,
+) -> Vec<u32> {
     let sum = TwoPhaseSum::new(client, max_cubes);
     let partials = client.empty(max_cubes as usize * core::mem::size_of::<u32>());
-    sum.launch(client, count, &partials);
+    sum.launch(client, count, &partials, exclusive);
     sum.read(client)
 }
 
@@ -412,13 +431,24 @@ fn assert_every_cube_sums_all_items(sums: &[u32]) {
     assert!(sums.iter().all(|sum| *sum == TOTAL), "{sums:?}");
 }
 
-/// Whether the runtime has native grid sync. Prints why the calling test is skipped if not.
-fn native_grid_sync(client: &Client) -> bool {
-    let native = client.properties().features.grid_sync == GridSync::Native;
-    if !native {
+/// Set to `1` when no other work uses the device, for example with the display on another GPU.
+/// It permits the exclusive tests on a device that the runtime counts as shared (D9).
+const ASSUME_EXCLUSIVE: &str = "CUBECL_TEST_ASSUME_EXCLUSIVE_DEVICE";
+
+/// Whether an exclusive launch gets native grid sync, and no other work uses the device. Prints
+/// why the calling test is skipped if not.
+fn exclusive_native_grid_sync(client: &Client) -> bool {
+    let features = &client.properties().features;
+    if !features.exclusive_grid_sync {
         std::println!("native grid sync not supported - skipped");
+        return false;
     }
-    native
+    let assumed = std::env::var(ASSUME_EXCLUSIVE).is_ok_and(|value| value == "1");
+    if features.grid_sync != GridSync::Native && !assumed {
+        std::println!("other work shares the device, see {ASSUME_EXCLUSIVE} - skipped");
+        return false;
+    }
+    true
 }
 
 pub fn test_sync_grid_two_phase_sum(client: Client) {
@@ -470,19 +500,22 @@ fn kernel_sync_grid_in_uniform_loop(values: &mut [u32], rounds: u32) {
 
 /// Native grid sync permits a grid sync in a `for` loop with uniform bounds. Split does not (S1).
 pub fn test_sync_grid_in_uniform_loop(client: Client) {
-    if !native_grid_sync(&client) {
+    if !exclusive_native_grid_sync(&client) {
         return;
     }
     let initial: Vec<u32> = (0..LOOP_CUBES).map(|cube| cube * 1000).collect();
     let values = client.create_from_slice(u32::as_bytes(&initial));
 
-    kernel_sync_grid_in_uniform_loop::launch_persistent(
-        &client,
-        PersistentCount::Exact(LOOP_CUBES),
-        CubeDim::new_1d(8),
-        unsafe { BufferArg::from_raw_parts(values.clone(), LOOP_CUBES as usize) },
-        LOOP_ROUNDS,
-    );
+    // SAFETY: `exclusive_native_grid_sync` holds.
+    unsafe {
+        kernel_sync_grid_in_uniform_loop::launch_persistent_exclusive(
+            &client,
+            PersistentCount::Exact(LOOP_CUBES),
+            CubeDim::new_1d(8),
+            BufferArg::from_raw_parts(values.clone(), LOOP_CUBES as usize),
+            LOOP_ROUNDS,
+        )
+    };
 
     let expected: Vec<u32> = (0..LOOP_CUBES)
         .map(|cube| initial[((cube + LOOP_ROUNDS) % LOOP_CUBES) as usize] + LOOP_ROUNDS)
@@ -491,10 +524,42 @@ pub fn test_sync_grid_in_uniform_loop(client: Client) {
     assert_eq!(u32::from_bytes(&values), expected);
 }
 
+/// D9: a device that other work shares splits by default, so the safe launch refuses a grid sync
+/// in a loop (S1). An exclusive launch gets native grid sync.
+pub fn test_shared_device_splits_by_default(client: Client) {
+    let features = &client.properties().features;
+    if features.grid_sync == GridSync::Native {
+        assert!(features.exclusive_grid_sync);
+        std::println!("no other work shares the device - skipped");
+        return;
+    }
+    if !features.exclusive_grid_sync {
+        std::println!("native grid sync not supported - skipped");
+        return;
+    }
+    assert_eq!(
+        features.grid_sync,
+        GridSync::Emulated(GridSyncEmulation::Split.into())
+    );
+    let values = client.empty(LOOP_CUBES as usize * core::mem::size_of::<u32>());
+    kernel_sync_grid_in_uniform_loop::launch_persistent(
+        &client,
+        PersistentCount::Exact(LOOP_CUBES),
+        CubeDim::new_1d(8),
+        unsafe { BufferArg::from_raw_parts(values.clone(), LOOP_CUBES as usize) },
+        LOOP_ROUNDS,
+    );
+    let error = client
+        .read_one(values)
+        .expect_err("the kernel must not split");
+    let error = std::format!("{error:?}");
+    assert!(error.contains("inside a branch or a loop"), "{error}");
+}
+
 /// V4: the launch fails before the driver call. The capacity is the driver occupancy per SM
 /// times the SM count, and the driver runs exactly that many cubes of the kernel.
 pub fn test_sync_grid_exact_above_capacity_fails(client: Client) {
-    if !native_grid_sync(&client) {
+    if !exclusive_native_grid_sync(&client) {
         return;
     }
     let capacity = two_phase_sum_capacity(&client).expect("native grid sync has a capacity");
@@ -508,13 +573,18 @@ pub fn test_sync_grid_exact_above_capacity_fails(client: Client) {
         "{capacity} for {sms} SMs"
     );
 
-    let sums = two_phase_sum(&client, PersistentCount::Exact(capacity), capacity);
+    let sums = two_phase_sum_as(&client, PersistentCount::Exact(capacity), capacity, true);
     assert_eq!(sums.len(), capacity as usize);
     assert_every_cube_sums_all_items(&sums);
 
     let sum = TwoPhaseSum::new(&client, capacity + 1);
     let partials = client.empty((capacity as usize + 1) * core::mem::size_of::<u32>());
-    sum.launch(&client, PersistentCount::Exact(capacity + 1), &partials);
+    sum.launch(
+        &client,
+        PersistentCount::Exact(capacity + 1),
+        &partials,
+        true,
+    );
     let error = resource_error(&client, sum.sums);
     assert!(
         matches!(
@@ -546,7 +616,7 @@ pub fn test_fill_gives_the_capacity(client: Client) {
 /// Not in `testgen_persistent!`: while a graph capture records, the driver refuses allocations
 /// on every other stream of the process. `cubecl-cuda/tests/graph.rs` runs this test alone.
 pub fn test_sync_grid_graph_replay(client: Client) {
-    if !native_grid_sync(&client) {
+    if !exclusive_native_grid_sync(&client) {
         return;
     }
     if let Err(error) = client.graph_prepare() {
@@ -558,11 +628,11 @@ pub fn test_sync_grid_graph_replay(client: Client) {
     let count = PersistentCount::AtMost(SUM_CUBES);
 
     // The warmup run compiles the kernel and allocates, so the capture does neither.
-    sum.launch(&client, count, &partials);
+    sum.launch(&client, count, &partials, true);
     assert_every_cube_sums_all_items(&sum.read(&client));
 
     client.start_capture().expect("start_capture");
-    sum.launch(&client, count, &partials);
+    sum.launch(&client, count, &partials, true);
     let graph = client.stop_capture().expect("stop_capture");
 
     // New input between the replays, so each replay must run to give the new sums.
@@ -589,17 +659,21 @@ fn kernel_sync_grid_in_unit_branch(output: &mut [u32]) {
 
 /// V2: the compiler refuses a grid sync that only some units reach.
 pub fn test_sync_grid_in_unit_branch_fails_to_compile(client: Client) {
-    if !native_grid_sync(&client) {
+    if !client.properties().features.exclusive_grid_sync {
+        std::println!("native grid sync not supported - skipped");
         return;
     }
     let output = client.empty(8 * core::mem::size_of::<u32>());
 
-    kernel_sync_grid_in_unit_branch::launch_persistent(
-        &client,
-        PersistentCount::Exact(1),
-        CubeDim::new_1d(8),
-        unsafe { BufferArg::from_raw_parts(output.clone(), 8) },
-    );
+    // SAFETY: the kernel does not compile, so it never runs on the device.
+    unsafe {
+        kernel_sync_grid_in_unit_branch::launch_persistent_exclusive(
+            &client,
+            PersistentCount::Exact(1),
+            CubeDim::new_1d(8),
+            BufferArg::from_raw_parts(output.clone(), 8),
+        )
+    };
 
     let error = client
         .read_one(output)
@@ -763,6 +837,7 @@ macro_rules! testgen_persistent {
                 test_sync_grid_two_phase_sum,
                 test_sync_grid_two_phase_sum_repeated,
                 test_sync_grid_in_uniform_loop,
+                test_shared_device_splits_by_default,
                 test_sync_grid_exact_above_capacity_fails,
                 test_fill_gives_the_capacity,
                 test_sync_grid_in_unit_branch_fails_to_compile,

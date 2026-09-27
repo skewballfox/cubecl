@@ -1276,12 +1276,43 @@ impl Client {
         capacity: u32,
         bindings: KernelArguments,
     ) {
+        self.launch_persistent_as(kernel, count, capacity, bindings, false)
+    }
+
+    /// Launches the persistent `kernel` like [`Self::launch_persistent`], but with native grid sync
+    /// on a device that other work shares. There, [`Self::launch_persistent`] splits the kernel.
+    ///
+    /// # Safety
+    ///
+    /// No other work may use the compute units of the device during the launch. This includes a
+    /// display and other processes. Else some cubes cannot start, the grid sync deadlocks, and the
+    /// driver resets the device. A reset destroys every context on the device.
+    #[track_caller]
+    pub unsafe fn launch_persistent_exclusive(
+        &self,
+        kernel: Box<dyn CubeKernel>,
+        count: PersistentCount,
+        capacity: u32,
+        bindings: KernelArguments,
+    ) {
+        self.launch_persistent_as(kernel, count, capacity, bindings, true)
+    }
+
+    #[track_caller]
+    fn launch_persistent_as(
+        &self,
+        kernel: Box<dyn CubeKernel>,
+        count: PersistentCount,
+        capacity: u32,
+        bindings: KernelArguments,
+        exclusive: bool,
+    ) {
         let estimate = count.resolve(capacity, self.properties().hardware.max_cube_count.0);
-        let plan = LaunchPlan::of(self, kernel.as_ref());
+        let plan = LaunchPlan::of(self, kernel.as_ref(), exclusive);
         let mut bindings = bindings;
         plan.bind_workspace(self, &mut bindings);
         if let Some(split) = &plan.split {
-            return SplitPhase::launch(self, kernel, split, estimate, bindings);
+            return SplitPhase::launch_persistent(self, kernel, split, count, estimate, bindings);
         }
         let shape = LaunchShape::Persistent { count, estimate };
         unsafe { self.launch_inner(kernel, shape, bindings, self.stream_id()) }

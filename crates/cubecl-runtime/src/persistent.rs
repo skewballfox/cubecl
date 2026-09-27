@@ -56,14 +56,17 @@ pub(crate) struct LaunchPlan {
 }
 
 impl LaunchPlan {
-    pub fn of(client: &Client, kernel: &dyn CubeKernel) -> Self {
-        static PLANS: LazyLock<Mutex<HashMap<KernelId, LaunchPlan>>> =
+    /// The plan of `kernel`. An `exclusive` launch does not split where the device has native
+    /// grid sync (D9).
+    pub fn of(client: &Client, kernel: &dyn CubeKernel, exclusive: bool) -> Self {
+        static PLANS: LazyLock<Mutex<HashMap<(KernelId, bool), LaunchPlan>>> =
             LazyLock::new(Default::default);
 
         let id = kernel.id();
-        let splits = split::splits(client, &id);
+        let native = exclusive && client.properties().features.exclusive_grid_sync;
+        let splits = !native && split::splits(client, &id);
         let mut plans = PLANS.lock();
-        let plan = plans.entry(id).or_insert_with(|| {
+        let plan = plans.entry((id, splits)).or_insert_with(|| {
             let mut definition = kernel.define();
             let workspace = definition.body.state().workspace.is_some();
             // A kernel that does not split is still launched, as one phase that fails to compile.
@@ -104,6 +107,21 @@ pub trait CapacityHint {
     ) {
         let capacity = Self::capacity(client, kernel.as_ref());
         client.launch_persistent(kernel, count, capacity, bindings)
+    }
+
+    /// Launches the persistent `kernel` with the capacity of this hint, as an exclusive launch.
+    ///
+    /// # Safety
+    ///
+    /// See [`Client::launch_persistent_exclusive`].
+    unsafe fn launch_exclusive(
+        client: &Client,
+        kernel: Box<dyn CubeKernel>,
+        count: PersistentCount,
+        bindings: KernelArguments,
+    ) {
+        let capacity = Self::capacity(client, kernel.as_ref());
+        unsafe { client.launch_persistent_exclusive(kernel, count, capacity, bindings) }
     }
 }
 

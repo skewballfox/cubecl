@@ -41,7 +41,11 @@ use cubecl_cpp::{
 use cubecl_hip_sys::{hipDeviceScheduleSpin, hipGetDeviceCount, hipSetDeviceFlags};
 use cubecl_llvm::shared::lowered_features::{GpuTarget, restrict_features};
 use cubecl_server::{
-    allocator::PitchedMemoryLayoutPolicy, driver::checked, logging::ServerLogger, runtime::Runtime,
+    allocator::PitchedMemoryLayoutPolicy,
+    cooperative::{DeviceSharing, display_connected, set_native_grid_sync},
+    driver::checked,
+    logging::ServerLogger,
+    runtime::Runtime,
 };
 use std::{
     ffi::CStr,
@@ -177,6 +181,9 @@ impl DeviceService for HipServer {
         device_props.features.alignment = true;
         // `__threadfence` carries a block's writes to device scope.
         device_props.features.device_memory_scope = true;
+        // Which backend compiles here decides what may be advertised: a feature the selected
+        // one cannot honour is a kernel that fails to compile rather than a slower one.
+        let backend = HipBackend::default();
         let mut cooperative_launch = 0;
         // SAFETY: the device index was validated above, and `cooperative_launch` outlives the call.
         let status = unsafe {
@@ -186,8 +193,17 @@ impl DeviceService for HipServer {
                 device.index as c_int,
             )
         };
-        if checked("hipDeviceGetAttribute", status).is_ok() && cooperative_launch == 1 {
-            device_props.features.grid_sync = GridSync::Native;
+        if backend == HipBackend::Cpp
+            && checked("hipDeviceGetAttribute", status).is_ok()
+            && cooperative_launch == 1
+        {
+            // ROCm reports no watchdog while a display uses the device, so sysfs finds it.
+            let sharing = DeviceSharing {
+                integrated: probe.integrated,
+                watchdog: false,
+                display: display_connected(probe.physical.pci_address),
+            };
+            set_native_grid_sync(&mut device_props.features, sharing);
         }
         device_props.features.plane.insert(Plane::Ops);
         device_props
@@ -199,9 +215,6 @@ impl DeviceService for HipServer {
         register_mma_features(supported_mma_combinations, &mut device_props);
         register_scaled_mma_features(supported_scaled_mma_combinations, &mut device_props);
 
-        // Which backend compiles here decides what may be advertised: a feature the selected
-        // one cannot honour is a kernel that fails to compile rather than a slower one.
-        let backend = HipBackend::default();
         if backend == HipBackend::Llvm {
             let wmma = gfx.wmma();
             restrict_features(&mut device_props, GpuTarget::AmdGpu { wmma });
