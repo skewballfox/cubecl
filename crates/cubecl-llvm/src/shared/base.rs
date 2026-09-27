@@ -33,7 +33,12 @@ use cubecl_core::ir::nvidia::SmArch;
 use cubecl_core::{
     Compiler,
     codegen::KernelDump,
-    ir::{amd::GfxArch, dialect::scf::BranchToSCFPass, metadata::Info, rewrite::SimplifyOpsPass},
+    ir::{
+        amd::GfxArch,
+        dialect::scf::BranchToSCFPass,
+        metadata::Info,
+        rewrite::{InheritLocationPass, SimplifyOpsPass},
+    },
     post_processing::{
         bitwise::PromoteBitwisePass,
         minifloat::{LowerMinifloatCastPass, LowerMinifloatComparePass},
@@ -449,6 +454,8 @@ fn lower(
     let mut passes = OpPass::<ModuleOp, Passes>::default();
     passes.add_pass(NestedOpsPass::new(lowering_passes));
     passes.add_pass(builtin_to_llvm_pass());
+    // Last, for the ops that pliron's own passes insert without a location.
+    passes.add_pass(InheritLocationPass);
     run(&mut passes, module_op, ctx, &mut analyses)?;
 
     verify_operation(module_op, ctx).map_err(|err| {

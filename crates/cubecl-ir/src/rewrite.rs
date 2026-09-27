@@ -18,8 +18,11 @@ use pliron::{
     },
     irbuild::{
         dialect_conversion::apply_dialect_conversion,
+        listener::RecorderEvent,
         match_rewrite::{RewriterOrder, apply_match_rewrite},
     },
+    linked_list::ContainsLinkedList,
+    location::Location,
     op::{OpInterfaceMarker, OpObj},
     verify_err_noloc,
 };
@@ -52,7 +55,7 @@ impl<T: DialectConversion + NamedRewrite> Pass for DialectConversionPass<T> {
         _analyses: &mut AnalysisManager,
     ) -> Result<PassResult> {
         let mut res = PassResult::default();
-        res.ir_changed = apply_dialect_conversion(ctx, &mut self.0, op)?;
+        res.ir_changed = apply_dialect_conversion(ctx, &mut KeepLocation(&mut self.0), op)?;
         Ok(res)
     }
 }
@@ -72,9 +75,146 @@ impl<T: MatchRewrite + NamedRewrite> Pass for MatchRewritePass<T> {
         _analyses: &mut AnalysisManager,
     ) -> Result<PassResult> {
         let mut res = PassResult::default();
-        res.ir_changed = apply_match_rewrite(ctx, &mut self.0, RewriterOrder::default(), op)?;
+        res.ir_changed = apply_match_rewrite(
+            ctx,
+            &mut KeepLocation(&mut self.0),
+            RewriterOrder::default(),
+            op,
+        )?;
         Ok(res)
     }
+}
+
+/// A rewrite that gives each op it inserts without a location the location of the op it
+/// rewrites. [`DialectConversionPass`] and [`MatchRewritePass`] use it for every rewrite.
+pub struct KeepLocation<'a, T>(pub &'a mut T);
+
+impl<T: DialectConversion> DialectConversion for KeepLocation<'_, T> {
+    fn can_convert_op(&self, ctx: &Context, op: Ptr<Operation>) -> bool {
+        self.0.can_convert_op(ctx, op)
+    }
+
+    fn can_convert_type(&self, ctx: &Context, ty: TypeHandle) -> bool {
+        self.0.can_convert_type(ctx, ty)
+    }
+
+    fn convert_type(&mut self, ctx: &mut Context, ty: TypeHandle) -> Result<TypeHandle> {
+        self.0.convert_type(ctx, ty)
+    }
+
+    fn rewrite(
+        &mut self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        op: Ptr<Operation>,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        keep_location(ctx, rewriter, op, |ctx, rewriter| {
+            self.0.rewrite(ctx, rewriter, op, operands_info)
+        })
+    }
+}
+
+impl<T: MatchRewrite> MatchRewrite for KeepLocation<'_, T> {
+    fn r#match(&mut self, ctx: &Context, op: Ptr<Operation>) -> bool {
+        self.0.r#match(ctx, op)
+    }
+
+    fn rewrite(
+        &mut self,
+        ctx: &mut Context,
+        rewriter: &mut MatchRewriter,
+        op: Ptr<Operation>,
+    ) -> Result<()> {
+        keep_location(ctx, rewriter, op, |ctx, rewriter| {
+            self.0.rewrite(ctx, rewriter, op)
+        })
+    }
+}
+
+/// Runs `rewrite` on `op`, then gives the location of `op` to each op that `rewrite` inserted
+/// without one.
+fn keep_location(
+    ctx: &mut Context,
+    rewriter: &mut IRRewriter<Recorder>,
+    op: Ptr<Operation>,
+    rewrite: impl FnOnce(&mut Context, &mut IRRewriter<Recorder>) -> Result<()>,
+) -> Result<()> {
+    let loc = op.deref(ctx).loc();
+    if loc.is_unknown() {
+        return rewrite(ctx, rewriter);
+    }
+    let first = rewriter.get_listener().events.len();
+    rewrite(ctx, rewriter)?;
+
+    let events = &rewriter.get_listener().events[first..];
+    // An op that the rewrite inserted and then erased is not live.
+    let erased = events
+        .iter()
+        .filter_map(|event| match event {
+            RecorderEvent::ErasedOperation(op) => Some(*op),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for event in events {
+        if let RecorderEvent::InsertedOperation(new_op) = event
+            && !erased.contains(new_op)
+            && new_op.deref(ctx).loc().is_unknown()
+        {
+            new_op.deref_mut(ctx).set_loc(loc.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Gives each op without a location the location of the op before it in its block. The first op
+/// of a block takes the location of the op that holds the block. Run it last before export, for the ops that passes outside [`KeepLocation`]
+/// insert.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InheritLocationPass;
+
+#[pass_name]
+impl Pass for InheritLocationPass {
+    fn run(
+        &mut self,
+        op: Ptr<Operation>,
+        ctx: &mut Context,
+        _analyses: &mut AnalysisManager,
+    ) -> Result<PassResult> {
+        let loc = op.deref(ctx).loc();
+        let mut res = PassResult::default();
+        if inherit_locations(ctx, op, &loc) {
+            res.ir_changed = IRStatus::Changed;
+        }
+        Ok(res)
+    }
+}
+
+/// Gives the ops nested in `op` a location, where `loc` is the location of `op`. Returns whether
+/// an op changed.
+fn inherit_locations(ctx: &Context, op: Ptr<Operation>, loc: &Location) -> bool {
+    let mut changed = false;
+    let regions = op.deref(ctx).regions().collect::<Vec<_>>();
+    for region in regions {
+        let blocks = region.deref(ctx).iter(ctx).collect::<Vec<_>>();
+        for block in blocks {
+            let mut previous = loc.clone();
+            let ops = block.deref(ctx).iter(ctx).collect::<Vec<_>>();
+            for child in ops {
+                let child_loc = child.deref(ctx).loc();
+                if child_loc.is_unknown() {
+                    if !previous.is_unknown() {
+                        child.deref_mut(ctx).set_loc(previous.clone());
+                        changed = true;
+                    }
+                } else {
+                    previous = child_loc;
+                }
+                changed |= inherit_locations(ctx, child, &previous);
+            }
+        }
+    }
+    changed
 }
 
 #[derive(new, Clone, Copy, Default, Debug)]
