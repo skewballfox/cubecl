@@ -139,7 +139,10 @@ fn finalize(
     entry: &AmdGpuEntry,
 ) -> Result<(), String> {
     let cube_dim = entry.cube_dim;
-    let flat_work_group_size = format!("1,{}", cube_dim.num_elems());
+    // `reqd_work_group_size` fixes the size, and LLVM's verifier requires the flat range to be
+    // exactly its product.
+    let units = cube_dim.num_elems();
+    let flat_work_group_size = format!("{units},{units}");
     let mut attributes = vec![
         ("target-cpu", arch.name()),
         ("amdgpu-flat-work-group-size", &flat_work_group_size),
