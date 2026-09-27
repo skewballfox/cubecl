@@ -27,8 +27,8 @@ use cubecl_core::{
         features::{AtomicUsage, EnumSet, TypeUsage},
         interfaces::TypedExt,
         metadata::Info,
-        rewrite::{SimplifyOpsPass, visit_all_values},
-        settings::Dim3,
+        rewrite::{InheritLocationPass, SimplifyOpsPass, visit_all_values},
+        settings::{DebugInfo, Dim3},
         types::scalar::{Complex32Type, Complex64Type},
     },
     post_processing::{
@@ -184,6 +184,10 @@ where
             info: kernel.info,
         };
 
+        let line_directives = kernel.settings.debug_info != DebugInfo::None;
+        if line_directives {
+            ctx.set_aux_ty(super::branch::LineDirectives);
+        }
         ctx.set_aux_ty(compilation_options);
         ctx.set_aux_ty(state);
         ctx.set_aux_ty(T::target());
@@ -286,6 +290,11 @@ where
         passes.add_pass(AnnotateGlobalVisibilityPass);
         passes.add_pass(DeclareVectorTypesPass);
         passes.add_pass(CollectIncludesPass::<T>::default());
+        // Some passes insert ops without a location. They get the location of the op before them,
+        // so each line of the source has a `#line`.
+        if line_directives {
+            passes.add_pass(InheritLocationPass);
+        }
 
         passes.run(module_op, &mut ctx, &mut analyses)?;
 

@@ -17,7 +17,11 @@
 //! }
 //! ```
 
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
+};
 use pliron::{
     basic_block::BasicBlock,
     combine::stream::position::SourcePosition,
@@ -145,4 +149,27 @@ impl InsertionListener for LocationListener {
     }
 
     fn notify_block_inserted(&mut self, _ctx: &Context, _block: Ptr<BasicBlock>) {}
+}
+
+/// The source line of an op: the file and the line of the innermost frame of `loc`. A target that
+/// cannot show inlined frames, such as a `#line` directive, uses it. `None` for an unknown
+/// location, or for a position in memory.
+pub fn leaf_line(ctx: &Context, loc: &Location) -> Option<(String, u32)> {
+    match loc {
+        Location::CallSite { callee, .. } => leaf_line(ctx, callee),
+        Location::Named { child_loc, .. } => leaf_line(ctx, child_loc),
+        Location::SrcPos {
+            src: Source::File(key),
+            pos,
+        } => Some((
+            pliron::uniqued_any::get(ctx, *key).display().to_string(),
+            pos.line.max(0) as u32,
+        )),
+        Location::Fused { locations, .. } => locations.iter().find_map(|loc| leaf_line(ctx, loc)),
+        Location::SrcPos {
+            src: Source::InMemory,
+            ..
+        }
+        | Location::Unknown => None,
+    }
 }
