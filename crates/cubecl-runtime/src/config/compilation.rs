@@ -9,6 +9,33 @@ pub const PROFILE_DEBUG_INFO: DebugInfo = if cfg!(cubecl_debug_info) {
     DebugInfo::None
 };
 
+/// The debug data of a kernel that asks for `requested`, with the global configuration: the same
+/// level as [`CompilationConfig::resolve_debug_info`]. It reads the configuration once, so a kernel
+/// id can call it at each launch.
+pub fn effective_debug_info(requested: DebugInfo) -> DebugInfo {
+    use super::{CubeClRuntimeConfig, RuntimeConfig};
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    const UNREAD: u8 = u8::MAX;
+    const NO_LIMIT: u8 = u8::MAX - 1;
+    static LIMIT: AtomicU8 = AtomicU8::new(UNREAD);
+
+    let mut limit = LIMIT.load(Ordering::Relaxed);
+    if limit == UNREAD {
+        limit = CubeClRuntimeConfig::get()
+            .compilation
+            .debug_info
+            .map_or(NO_LIMIT, |level| level as u8);
+        LIMIT.store(limit, Ordering::Relaxed);
+    }
+    let level = requested.max(PROFILE_DEBUG_INFO);
+    match limit {
+        0 => DebugInfo::None,
+        1 => level.min(DebugInfo::LineTables),
+        _ => level,
+    }
+}
+
 /// Configuration for compilation settings in `CubeCL`.
 #[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CompilationConfig {
