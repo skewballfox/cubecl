@@ -270,8 +270,15 @@ impl PlironCompiler {
             shared_memories: shared_memories.take(),
         };
 
-        PlironEngine::compile(&ctx, module, &kernel.settings.kernel_name, requirements, io)
-            .map_err(|err| generic(format!("converting to LLVM IR: {err}")))
+        PlironEngine::compile_with_debug_info(
+            &ctx,
+            module,
+            &kernel.settings.kernel_name,
+            requirements,
+            io,
+            kernel.settings.debug_info,
+        )
+        .map_err(|err| generic(format!("converting to LLVM IR: {err}")))
     }
 
     #[cfg(feature = "amdgpu")]

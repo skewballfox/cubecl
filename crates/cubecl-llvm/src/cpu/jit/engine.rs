@@ -1,17 +1,17 @@
-use super::data::PlironData;
+use super::{
+    data::PlironData,
+    lljit::Jit,
+    symbols::{JitSymbols, write_perf_map},
+};
 use crate::{
     cpu::shared_memory::SharedMemories,
     prelude::{Context, ModuleOp},
     shared::llvm_module::LlvmModule,
 };
-use cubecl_core::codegen::KernelDump;
+use cubecl_core::{codegen::KernelDump, ir::settings::DebugInfo};
 use cubecl_runtime::kernel::BufferIOAttr;
 use pliron_llvm::{
-    llvm_sys::{
-        core::{LLVMContext, LLVMMemoryBuffer, LLVMModule},
-        lljit::LLVMLLJIT,
-        target::initialize_native,
-    },
+    llvm_sys::{core::LLVMContext, target::initialize_native},
     to_llvm_ir,
 };
 use std::{
@@ -40,7 +40,7 @@ struct JitKernel {
     requirements: KernelRequirements,
     /// Buffer access modes in binding order.
     io: Vec<BufferIOAttr>,
-    _lljit: LLVMLLJIT,
+    _jit: Jit,
 }
 
 /// SAFETY: Compiled code is immutable and its JIT owns the context.
@@ -60,6 +60,19 @@ impl PlironEngine {
         requirements: KernelRequirements,
         io: Vec<BufferIOAttr>,
     ) -> pliron::result::Result<Self> {
+        Self::compile_with_debug_info(ctx, module, kernel_name, requirements, io, DebugInfo::None)
+    }
+
+    /// [`compile`](Self::compile), for a kernel that carries `debug_info`. With debug data, the
+    /// profiler symbol files that the environment asks for are written.
+    pub fn compile_with_debug_info(
+        ctx: &Context,
+        module: ModuleOp,
+        kernel_name: &str,
+        requirements: KernelRequirements,
+        io: Vec<BufferIOAttr>,
+        debug_info: DebugInfo,
+    ) -> pliron::result::Result<Self> {
         INIT_NATIVE.call_once(|| {
             initialize_native().expect("failed to initialize native target");
         });
@@ -69,17 +82,23 @@ impl PlironEngine {
         let dump = KernelDump::new(kernel_name);
         dump.write("llvm.ll", || llvm_module.to_string());
 
-        let llvm_module = optimize(llvm_module, &llvm_ctx, kernel_name)
+        let llvm_module = optimize(&llvm_module.to_string())
             .unwrap_or_else(|err| panic!("LLVM optimization failed for '{kernel_name}': {err}"));
-        dump.write("llvm.opt.ll", || llvm_module.to_string());
+        dump.write("llvm.opt.ll", || llvm_module.print());
 
-        let lljit = LLVMLLJIT::new_with_default_builder().expect("failed to create LLJIT");
-        lljit
-            .add_module(llvm_ctx, llvm_module)
+        let symbols = match debug_info {
+            DebugInfo::None => JitSymbols::default(),
+            _ => JitSymbols::from_env(),
+        };
+        let jit = Jit::new(symbols).expect("failed to create LLJIT");
+        jit.add_module(llvm_module)
             .expect("failed to add module to JIT");
-        let addr = lljit
-            .lookup_symbol(kernel_name)
+        let addr = jit
+            .lookup(kernel_name)
             .unwrap_or_else(|err| panic!("kernel symbol '{kernel_name}' not found: {err}"));
+        if let Some(size) = jit.symbol_size(kernel_name) {
+            write_perf_map(addr, size, kernel_name);
+        }
         // SAFETY: The generated entry point matches `KernelFn`.
         let func: KernelFn = unsafe { std::mem::transmute::<u64, KernelFn>(addr) };
 
@@ -87,7 +106,7 @@ impl PlironEngine {
             func,
             requirements,
             io,
-            _lljit: lljit,
+            _jit: jit,
         })))
     }
 
@@ -128,21 +147,8 @@ impl Display for PlironEngine {
 /// Optimization pipeline for JIT compilation.
 const PASS_PIPELINE: &CStr = c"default<O3>";
 
-fn optimize(
-    module: LLVMModule,
-    llvm_ctx: &LLVMContext,
-    kernel_name: &str,
-) -> Result<LLVMModule, String> {
-    let optimized = run_pipeline(&module.to_string())?;
-    drop(module);
-    LLVMModule::from_ir_in_memory_buffer(
-        llvm_ctx,
-        LLVMMemoryBuffer::from_str(&optimized, kernel_name),
-    )
-}
-
-fn run_pipeline(ir: &str) -> Result<String, String> {
+fn optimize(ir: &str) -> Result<LlvmModule, String> {
     let module = LlvmModule::new(ir)?;
     module.run_passes(PASS_PIPELINE, None)?;
-    Ok(module.print())
+    Ok(module)
 }
