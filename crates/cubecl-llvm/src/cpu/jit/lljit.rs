@@ -230,36 +230,112 @@ extern "C" fn record_symbol_sizes(
     std::ptr::null_mut()
 }
 
-#[cfg(all(test, feature = "jitdump", target_os = "linux"))]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// The tests run one at a time: a JIT removes its objects from the GDB JIT interface when it
+    /// is dropped, and `JITDUMPDIR` is global.
+    static JIT_TESTS: Mutex<()> = Mutex::new(());
+
+    /// A JIT with `symbols` that has compiled the function `name`.
+    fn jit_with(symbols: JitSymbols, name: &str) -> Jit {
+        pliron_llvm::llvm_sys::target::initialize_native().unwrap();
+        let jit = Jit::new(symbols, true).unwrap();
+        let ir = format!("define i32 @{name}() {{\n  ret i32 1\n}}\n");
+        jit.add_module(LlvmModule::new(&ir).unwrap()).unwrap();
+        jit.lookup(name).unwrap();
+        jit
+    }
+
+    /// The `RuntimeDyld` layer gives each object to gdb through the JIT event listener.
+    #[test]
+    fn the_listened_jit_registers_with_gdb() {
+        let _guard = JIT_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let name = "cubecl_gdb_rtdyld_probe";
+        let _jit = jit_with(JitSymbols::default(), name);
+        assert!(registered_with_gdb(name));
+    }
 
     /// With the jitdump asked for, the perf support plugin writes `jit-<pid>.dump` under
-    /// `$JITDUMPDIR`.
+    /// `$JITDUMPDIR`, and the debugger plugin of `JITLink` gives each object to gdb.
+    #[cfg(feature = "jitdump")]
     #[test]
     fn the_jitdump_is_written() {
+        let _guard = JIT_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // The plugin opens its file when it is added, so `JITDUMPDIR` is set before it.
         let dir = std::env::temp_dir().join(format!("cubecl-jitdump-{}", std::process::id()));
-        // SAFETY: no other test of this binary reads `JITDUMPDIR`.
+        // SAFETY: the other tests of this binary do not read `JITDUMPDIR`, and `JIT_TESTS` keeps
+        // the JIT tests apart.
         unsafe { std::env::set_var("JITDUMPDIR", &dir) };
         std::fs::create_dir_all(&dir).unwrap();
-        pliron_llvm::llvm_sys::target::initialize_native().unwrap();
 
         let symbols = JitSymbols {
             perf_map: false,
             jitdump: true,
         };
-        let jit = Jit::new(symbols, true).unwrap();
-        jit.add_module(LlvmModule::new("define i32 @f() {\n  ret i32 1\n}\n").unwrap())
-            .unwrap();
-        jit.lookup("f").unwrap();
+        let name = "cubecl_gdb_jitlink_probe";
+        let _jit = jit_with(symbols, name);
+        assert!(
+            registered_with_gdb(name),
+            "the debugger plugin did not register"
+        );
 
-        let name = format!("jit-{}.dump", std::process::id());
-        let found = walk(&dir).iter().any(|path| path.ends_with(&name));
+        let file = format!("jit-{}.dump", std::process::id());
+        let found = walk(&dir).iter().any(|path| path.ends_with(&file));
         std::fs::remove_dir_all(&dir).ok();
-        assert!(found, "no {name} under {}", dir.display());
+        assert!(found, "no {file} under {}", dir.display());
     }
 
+    /// An entry of the GDB JIT interface.
+    #[repr(C)]
+    struct JitCodeEntry {
+        next: *const JitCodeEntry,
+        prev: *const JitCodeEntry,
+        symfile: *const u8,
+        symfile_size: u64,
+    }
+
+    /// The list that gdb reads, as LLVM defines it in `JITLoaderGDB.cpp`.
+    #[repr(C)]
+    struct JitDescriptor {
+        version: u32,
+        action: u32,
+        relevant: *const JitCodeEntry,
+        first: *const JitCodeEntry,
+    }
+
+    unsafe extern "C" {
+        static __jit_debug_descriptor: JitDescriptor;
+    }
+
+    /// Whether an object in the GDB JIT interface has the symbol `name`.
+    fn registered_with_gdb(name: &str) -> bool {
+        // SAFETY: LLVM changes the list only when a JIT adds or removes an object, and
+        // `JIT_TESTS` keeps the JITs of this binary apart. Each entry points to a live object.
+        unsafe {
+            let mut entry = std::ptr::read_volatile(&raw const __jit_debug_descriptor.first);
+            while !entry.is_null() {
+                let object =
+                    std::slice::from_raw_parts((*entry).symfile, (*entry).symfile_size as usize);
+                if object
+                    .windows(name.len())
+                    .any(|window| window == name.as_bytes())
+                {
+                    return true;
+                }
+                entry = (*entry).next;
+            }
+        }
+        false
+    }
+
+    #[cfg(feature = "jitdump")]
     fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return Vec::new();
