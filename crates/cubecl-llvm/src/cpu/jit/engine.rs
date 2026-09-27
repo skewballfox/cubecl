@@ -84,6 +84,8 @@ impl PlironEngine {
         let dump = KernelDump::new(kernel_name);
         dump.write("llvm.ll", || llvm_module.print());
 
+        #[cfg(cubecl_frame_pointers)]
+        llvm_module.add_function_attribute("frame-pointer", "all");
         llvm_module
             .run_passes(PASS_PIPELINE, None)
             .unwrap_or_else(|err| panic!("LLVM optimization failed for '{kernel_name}': {err}"));

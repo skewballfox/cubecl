@@ -34,5 +34,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracel_llvm_bundler::llvm_sys::link()?;
 
+    // JIT code keeps frame pointers when the host code does, so `perf --call-graph fp` can walk
+    // through kernel frames.
+    println!("cargo::rustc-check-cfg=cfg(cubecl_frame_pointers)");
+    println!("cargo::rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
+    if forces_frame_pointers(&std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default()) {
+        println!("cargo:rustc-cfg=cubecl_frame_pointers");
+    }
+
     Ok(())
+}
+
+/// Whether the rustc flags, separated by `0x1f`, turn on `force-frame-pointers`.
+fn forces_frame_pointers(flags: &str) -> bool {
+    let mut flags = flags.split('\x1f').peekable();
+    let mut forced = false;
+    while let Some(flag) = flags.next() {
+        let codegen = match flag {
+            "-C" => flags.next().unwrap_or_default(),
+            flag => flag.strip_prefix("-C").unwrap_or(flag),
+        };
+        if let Some(value) = codegen.strip_prefix("force-frame-pointers") {
+            // The last value wins, as in rustc.
+            forced = matches!(value, "" | "=yes" | "=y" | "=on" | "=true" | "=always");
+        }
+    }
+    forced
 }
