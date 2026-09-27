@@ -226,3 +226,10 @@ cfg_aliases = "0.2.2"
 
 [profile.dev.build-override]
 opt-level = 3
+
+# `pliron-llvm` debug data (D4, option B) is not released yet. A patch also
+# gives `pliron-spirv` the same `pliron`. The revision is on `v0.18.0`, because
+# `pliron` `master` does not compile with cubecl and `pliron-spirv 0.15`.
+[patch.crates-io]
+pliron = { git = "https://github.com/skewballfox/pliron", rev = "d3a31a15d253797f6f90fa2245c53caf800264ad" }
+pliron-llvm = { git = "https://github.com/skewballfox/pliron", rev = "d3a31a15d253797f6f90fa2245c53caf800264ad" }

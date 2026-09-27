@@ -16,7 +16,10 @@ workspace = true
 
 
 [features]
-default = ["std", "cubecl-core/default", "cubecl-runtime/default"]
+default = ["std", "debug-info", "cubecl-core/default", "cubecl-runtime/default"]
+
+# DWARF for kernels that have debug data.
+debug-info = ["pliron-llvm/debug-info"]
 
 pliron-dump = []
 std = ["cubecl-core/std", "cubecl-runtime/std"]

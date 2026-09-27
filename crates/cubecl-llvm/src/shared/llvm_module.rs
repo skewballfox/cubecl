@@ -73,12 +73,9 @@ impl LlvmModule {
         }
     }
 
+    #[cfg(any(feature = "amdgpu", feature = "nvptx"))]
     pub(crate) fn raw(&self) -> LLVMModuleRef {
         self.module
-    }
-
-    pub(crate) fn context(&self) -> LLVMContextRef {
-        self.ctx
     }
 
     /// Adds the string attribute `key=value` to each function that the module defines.
@@ -114,6 +111,7 @@ impl LlvmModule {
 
     /// # Errors
     /// The message of LLVM's verifier, when the module is not valid.
+    #[cfg(feature = "debug-info")]
     pub(crate) fn verify(&self) -> Result<(), String> {
         use llvm_sys::analysis::{LLVMVerifierFailureAction, LLVMVerifyModule};
 
