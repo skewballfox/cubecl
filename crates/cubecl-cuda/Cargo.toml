@@ -18,11 +18,14 @@ workspace = true
 [features]
 default = [
     "std",
+    "debug-info",
     "cubecl-server/default",
     "cubecl-common/default",
     "cubecl-core/default",
 ]
 cpp = []
+# DWARF line directives for LLVM kernels that have debug data.
+debug-info = ["cubecl-llvm/debug-info"]
 pliron-dump = ["cubecl-cpp/pliron-dump", "cubecl-llvm/pliron-dump"]
 ptx-wmma = []
 persistence = ["cubecl-server/persistence"]

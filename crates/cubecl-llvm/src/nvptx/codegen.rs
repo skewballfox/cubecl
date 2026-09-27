@@ -10,6 +10,7 @@ use crate::{
     shared::{
         NvptxModule,
         buffer_params::annotate_buffer_params,
+        debug_info::{check_debug_info, convert_module},
         llvm_module::{EntryFunction, LlvmModule, TargetMachine, TargetSpec},
         llvm_options::set_llvm_option,
         math_library::redirect_intrinsics,
@@ -17,10 +18,13 @@ use crate::{
 };
 use cubecl_core::{
     codegen::KernelDump,
-    ir::{nvidia::SmArch, settings::Dim3},
+    ir::{
+        nvidia::SmArch,
+        settings::{DebugInfo, Dim3},
+    },
 };
 use llvm_sys::target_machine::{LLVMCodeGenFileType, LLVMRelocMode};
-use pliron_llvm::{llvm_sys::core::LLVMContext, to_llvm_ir};
+use pliron_llvm::llvm_sys::core::LLVMContext;
 use std::{ffi::CStr, sync::Once};
 
 const TRIPLE: &CStr = c"nvptx64-nvidia-cuda";
@@ -90,12 +94,14 @@ pub fn emit_ptx(
     arch: &SmArch,
     ptx_version: Option<PtxVersion>,
     entry: NvptxEntry,
+    debug_info: DebugInfo,
 ) -> Result<NvptxModule, String> {
     let llvm_ctx = LLVMContext::default();
     let converted =
-        to_llvm_ir::convert_module(ctx, &llvm_ctx, module).map_err(|err| err.to_string())?;
+        convert_module(ctx, &llvm_ctx, module, debug_info).map_err(|err| err.to_string())?;
 
-    let module = LlvmModule::new(&converted.to_string())?;
+    let module = LlvmModule::new(&directives_only(&converted.to_string()))?;
+    check_debug_info(&module, entrypoint, debug_info);
     finalize(&module, entrypoint, arch, &entry)?;
     let ir = module.print();
     let ptx = compile(module, arch, ptx_version)?;
@@ -111,6 +117,21 @@ pub fn emit_ptx(
         shared_memory_size: entry.shared_memory_size,
         io: entry.io,
     })
+}
+
+/// `ir` with the debug data of each compile unit as `DebugDirectivesOnly`: only the `.file` and
+/// `.loc` directives, as `nvcc -lineinfo` gives. With line tables or full debug data, NVPTX writes
+/// `.target <sm>, debug`, and the driver then compiles the kernel for a debugger, which changes the
+/// optimization. The LLVM C API cannot create this kind, so the IR text is changed.
+fn directives_only(ir: &str) -> String {
+    ir.replace(
+        "emissionKind: LineTablesOnly",
+        "emissionKind: DebugDirectivesOnly",
+    )
+    .replace(
+        "emissionKind: FullDebug",
+        "emissionKind: DebugDirectivesOnly",
+    )
 }
 
 /// Stamps the target and the entry point's calling convention and attributes on `module`.

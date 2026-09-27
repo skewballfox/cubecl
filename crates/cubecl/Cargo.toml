@@ -72,8 +72,9 @@ hip-cpp = ["cubecl-hip?/cpp"]
 hip-rocwmma = ["cubecl-hip?/rocwmma"]
 metal = ["wgpu-msl"]
 metal-native = ["cubecl-metal"]
-# DWARF for CPU kernels that have debug data. The `cpu` runtime has it by default.
-debug-info = ["cubecl-cpu?/debug-info"]
+# DWARF for LLVM kernels that have debug data. The `cpu`, `cuda` and `hip` runtimes have it by
+# default.
+debug-info = ["cubecl-cpu?/debug-info", "cubecl-cuda?/debug-info", "cubecl-hip?/debug-info"]
 # The perf jitdump of the `cpu` runtime, for `CUBECL_JIT_SYMBOLS=perf`. Linux only.
 jitdump = ["cubecl-cpu?/jitdump"]
 # No effect, kept for compatibility: compiler dumps are always built. Set `CUBECL_DEBUG_PLIRON`.

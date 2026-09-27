@@ -3,7 +3,7 @@
 //! `pliron-llvm` converts the `Location` of each op to a `!dbg` location: one `DISubprogram` for
 //! each function, and one for each inlined `#[cube]` function.
 
-use crate::prelude::*;
+use crate::{prelude::*, shared::llvm_module::LlvmModule};
 use cubecl_core::ir::settings::DebugInfo;
 use pliron_llvm::{
     llvm_sys::core::{LLVMContext, LLVMModule},
@@ -35,6 +35,24 @@ pub(crate) fn convert_module(
         return to_llvm_ir::convert_module_with_debug_info(ctx, llvm_ctx, module, options);
     }
     to_llvm_ir::convert_module(ctx, llvm_ctx, module)
+}
+
+/// Runs LLVM's verifier on the debug data of `module`, in a debug build of cubecl only. The test
+/// suites build with debug data, so they check every kernel.
+///
+/// # Panics
+/// When the debug data does not verify: the conversion has a bug.
+#[cfg_attr(
+    not(all(feature = "debug-info", debug_assertions)),
+    allow(unused_variables)
+)]
+pub(crate) fn check_debug_info(module: &LlvmModule, kernel_name: &str, level: DebugInfo) {
+    #[cfg(all(feature = "debug-info", debug_assertions))]
+    if level != DebugInfo::None
+        && let Err(err) = module.verify()
+    {
+        panic!("the debug data of '{kernel_name}' does not verify: {err}");
+    }
 }
 
 #[cfg(test)]

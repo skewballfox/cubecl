@@ -301,6 +301,7 @@ impl PlironCompiler {
                 shared_memory_size,
                 io,
             },
+            kernel.settings.debug_info,
         )
         .map_err(|err| {
             generic(format!(
@@ -354,6 +355,7 @@ impl PlironCompiler {
                 io,
                 metadata,
             },
+            kernel.settings.debug_info,
         )
         .map_err(|err| {
             generic(format!(

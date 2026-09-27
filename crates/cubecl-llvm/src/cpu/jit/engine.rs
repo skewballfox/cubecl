@@ -6,7 +6,10 @@ use super::{
 use crate::{
     cpu::shared_memory::SharedMemories,
     prelude::{Context, ModuleOp},
-    shared::{debug_info::convert_module, llvm_module::LlvmModule},
+    shared::{
+        debug_info::{check_debug_info, convert_module},
+        llvm_module::LlvmModule,
+    },
 };
 use cubecl_core::{codegen::KernelDump, ir::settings::DebugInfo};
 use cubecl_runtime::kernel::BufferIOAttr;
@@ -161,13 +164,7 @@ pub(crate) fn to_llvm_module(
     let llvm_module = convert_module(ctx, &llvm_ctx, module, debug_info)?;
     let llvm_module = LlvmModule::new(&llvm_module.to_string())
         .unwrap_or_else(|err| panic!("LLVM IR does not parse for '{kernel_name}': {err}"));
-    // The test suites build with debug data, so they check every kernel.
-    #[cfg(all(feature = "debug-info", debug_assertions))]
-    if debug_info != DebugInfo::None
-        && let Err(err) = llvm_module.verify()
-    {
-        panic!("the debug data of '{kernel_name}' does not verify: {err}");
-    }
+    check_debug_info(&llvm_module, kernel_name, debug_info);
     Ok(llvm_module)
 }
 
