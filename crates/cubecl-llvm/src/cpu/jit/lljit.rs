@@ -1,7 +1,9 @@
 //! The LLJIT of the CPU target. cubecl owns it, not `pliron-llvm`, so that it can hook the
 //! object layers: the object transform reads the symbol sizes for the perf map, and the JIT event
-//! listeners give the object code and its DWARF to gdb and to `perf`.
+//! listener or the plugins give the object code and its DWARF to gdb and to `perf`.
 
+#[cfg(feature = "jitdump")]
+use super::perf_support::enable_perf_support;
 use super::symbols::{JitSymbols, SymbolSizes};
 use crate::shared::llvm_module::{LlvmModule, error_message};
 use llvm_sys::{
@@ -28,7 +30,7 @@ use llvm_sys::{
             LLVMOrcLLJITRef,
         },
     },
-    prelude::{LLVMJITEventListenerRef, LLVMMemoryBufferRef},
+    prelude::LLVMMemoryBufferRef,
 };
 use std::{
     ffi::{CStr, CString, c_char, c_void},
@@ -49,23 +51,41 @@ impl Jit {
     /// # Errors
     /// The message LLVM gives, when it cannot create the JIT for the host.
     pub(crate) fn new(symbols: JitSymbols, listeners: bool) -> Result<Self, String> {
+        // The perf support plugin needs `JITLink`, which is the default of LLVM. The gdb listener
+        // needs RuntimeDyld.
+        let jitdump = listeners && symbols.jitdump;
+        if jitdump && cfg!(not(feature = "jitdump")) {
+            static WARN: Once = Once::new();
+            WARN.call_once(|| {
+                log::warn!(
+                    "No jitdump is written: cubecl is built without the `jitdump` feature. The \
+                     perf map still names each kernel."
+                )
+            });
+        }
+        let jitlink = jitdump && cfg!(feature = "jitdump");
+
         let mut jit = std::ptr::null_mut();
         // SAFETY: a null builder asks for the default settings. `LLVMOrcCreateLLJIT` takes the
-        // builder. The creator reads `jitdump` only as a flag, never as a pointer.
+        // builder.
         unsafe {
-            let builder = if listeners {
+            let builder = if listeners && !jitlink {
                 let builder = LLVMOrcCreateLLJITBuilder();
-                let jitdump = symbols.jitdump as usize as *mut c_void;
                 LLVMOrcLLJITBuilderSetObjectLinkingLayerCreator(
                     builder,
                     create_listened_layer,
-                    jitdump,
+                    std::ptr::null_mut(),
                 );
                 builder
             } else {
                 std::ptr::null_mut()
             };
             error_message(LLVMOrcCreateLLJIT(&mut jit, builder))?;
+        }
+        #[cfg(feature = "jitdump")]
+        if jitlink {
+            // SAFETY: the JIT is live and has linked no object.
+            unsafe { add_jitlink_plugins(jit) };
         }
 
         let sizes = symbols.perf_map.then(|| {
@@ -133,16 +153,16 @@ impl Drop for Jit {
     }
 }
 
-/// The object layer of a JIT with listeners: `RuntimeDyld`, because the JIT event listeners work only
-/// with it. It reserves one block of memory for each object, so the code and its constants stay
-/// within the reach of 32-bit relocations. `jitdump` is non-null to add the perf listener.
+/// The object layer of a JIT with the gdb listener: `RuntimeDyld`, because the JIT event listeners
+/// work only with it. It reserves one block of memory for each object, so the code and its
+/// constants stay within the reach of 32-bit relocations.
 extern "C" fn create_listened_layer(
-    jitdump: *mut c_void,
+    _ctx: *mut c_void,
     session: LLVMOrcExecutionSessionRef,
     _triple: *const c_char,
 ) -> LLVMOrcObjectLayerRef {
-    // SAFETY: the session is live, and the layer takes no ownership of the listeners, which are
-    // process-wide singletons in LLVM.
+    // SAFETY: the session is live, and the layer takes no ownership of the listener, which is a
+    // process-wide singleton in LLVM.
     unsafe {
         let layer =
             LLVMOrcCreateRTDyldObjectLinkingLayerWithSectionMemoryManagerReserveAlloc(session, 1);
@@ -150,40 +170,31 @@ extern "C" fn create_listened_layer(
             layer,
             LLVMCreateGDBRegistrationListener(),
         );
-        if !jitdump.is_null() {
-            let perf = perf_listener();
-            if perf.is_null() {
-                static WARN: Once = Once::new();
-                WARN.call_once(|| {
-                    let cause = if cfg!(feature = "jitdump") {
-                        "this LLVM has no perf JIT listener (LLVM_USE_PERF)"
-                    } else {
-                        "cubecl is built without the `jitdump` feature"
-                    };
-                    log::warn!(
-                        "No jitdump is written: {cause}. The perf map still names each kernel."
-                    )
-                });
-            } else {
-                LLVMOrcRTDyldObjectLinkingLayerRegisterJITEventListener(layer, perf);
-            }
-        }
         layer
     }
 }
 
-/// The perf JIT listener of LLVM, or null. It is null without the `jitdump` feature, which keeps
-/// the listener and the DWARF reader of LLVM out of the binary. It is also null when LLVM was built
-/// without `LLVM_USE_PERF`. The listener opens its jitdump in `$JITDUMPDIR` on the first call.
-fn perf_listener() -> LLVMJITEventListenerRef {
-    #[cfg(feature = "jitdump")]
-    {
-        // SAFETY: LLVM gives a process-wide listener, or null.
-        unsafe { llvm_sys::execution_engine::LLVMCreatePerfJITEventListener() }
+/// Adds the `JITLink` plugins of a JIT that writes the jitdump: the debugger plugin for gdb, and the
+/// perf support plugin with the line table and the unwind data of each kernel. A plugin that
+/// fails gives one warning, and the JIT continues without it.
+///
+/// # Safety
+/// `jit` must be a live LLJIT that links with `JITLink` and has linked no object.
+#[cfg(feature = "jitdump")]
+unsafe fn add_jitlink_plugins(jit: LLVMOrcLLJITRef) {
+    use llvm_sys::orc2::lljit::LLVMOrcLLJITEnableDebugSupport;
+
+    // SAFETY: the caller's contract.
+    if let Err(err) = error_message(unsafe { LLVMOrcLLJITEnableDebugSupport(jit) }) {
+        static WARN: Once = Once::new();
+        WARN.call_once(|| log::warn!("gdb does not see the kernels: {err}"));
     }
-    #[cfg(not(feature = "jitdump"))]
-    {
-        std::ptr::null_mut()
+    // SAFETY: the caller's contract.
+    if let Err(err) = unsafe { enable_perf_support(jit, true, true) } {
+        static WARN: Once = Once::new();
+        WARN.call_once(|| {
+            log::warn!("No jitdump is written: {err}. The perf map still names each kernel.")
+        });
     }
 }
 
@@ -219,22 +230,18 @@ extern "C" fn record_symbol_sizes(
     std::ptr::null_mut()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "jitdump", target_os = "linux"))]
 mod tests {
     use super::*;
 
-    /// With the jitdump asked for, the perf listener writes `jit-<pid>.dump` under `$JITDUMPDIR`.
-    /// Skipped without the `jitdump` feature, or when this LLVM was built without `LLVM_USE_PERF`.
+    /// With the jitdump asked for, the perf support plugin writes `jit-<pid>.dump` under
+    /// `$JITDUMPDIR`.
     #[test]
     fn the_jitdump_is_written() {
-        // The listener opens its file on the first call, so `JITDUMPDIR` is set before it.
+        // The plugin opens its file when it is added, so `JITDUMPDIR` is set before it.
         let dir = std::env::temp_dir().join(format!("cubecl-jitdump-{}", std::process::id()));
         // SAFETY: no other test of this binary reads `JITDUMPDIR`.
         unsafe { std::env::set_var("JITDUMPDIR", &dir) };
-        if perf_listener().is_null() {
-            eprintln!("skipped: no perf JIT listener");
-            return;
-        }
         std::fs::create_dir_all(&dir).unwrap();
         pliron_llvm::llvm_sys::target::initialize_native().unwrap();
 

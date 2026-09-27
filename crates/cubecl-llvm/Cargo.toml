@@ -21,8 +21,9 @@ default = ["std", "debug-info", "cubecl-core/default", "cubecl-runtime/default"]
 # DWARF for kernels that have debug data.
 debug-info = ["pliron-llvm/debug-info"]
 
-# The perf JIT listener, for `CUBECL_JIT_SYMBOLS=perf` or `jitdump`. It links the DWARF reader of
-# LLVM, which adds approximately 1 MB to the binary. LLVM supports it on Linux only.
+# The perf support plugin of ORC, for `CUBECL_JIT_SYMBOLS=perf` or `jitdump`. It compiles a C++
+# shim, and it links JITLink's DWARF reader: the `gelu` example in release is 1.07 MB larger. LLVM
+# writes the jitdump on Linux only.
 jitdump = []
 
 pliron-dump = []
