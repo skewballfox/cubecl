@@ -1,11 +1,13 @@
 //! The LLJIT of the CPU target. cubecl owns it, not `pliron-llvm`, so that it can hook the
-//! object layer: the object transform reads the symbol sizes for the perf map.
+//! object layers: the object transform reads the symbol sizes for the perf map, and the JIT event
+//! listeners give the object code and its DWARF to gdb and to `perf`.
 
 use super::symbols::{JitSymbols, SymbolSizes};
 use crate::shared::llvm_module::{LlvmModule, error_message};
 use llvm_sys::{
     core::LLVMDisposeMessage,
     error::LLVMErrorRef,
+    execution_engine::{LLVMCreateGDBRegistrationListener, LLVMCreatePerfJITEventListener},
     object::{
         LLVMCreateBinary, LLVMDisposeBinary, LLVMDisposeSymbolIterator, LLVMGetSymbolName,
         LLVMGetSymbolSize, LLVMMoveToNextSymbol, LLVMObjectFileCopySymbolIterator,
@@ -14,16 +16,24 @@ use llvm_sys::{
     orc2::{
         LLVMOrcCreateNewThreadSafeContextFromLLVMContext, LLVMOrcCreateNewThreadSafeModule,
         LLVMOrcDisposeThreadSafeContext, LLVMOrcDisposeThreadSafeModule,
-        LLVMOrcObjectTransformLayerSetTransform,
+        LLVMOrcExecutionSessionRef, LLVMOrcObjectLayerRef, LLVMOrcObjectTransformLayerSetTransform,
+        ee::{
+            LLVMOrcCreateRTDyldObjectLinkingLayerWithSectionMemoryManagerReserveAlloc,
+            LLVMOrcRTDyldObjectLinkingLayerRegisterJITEventListener,
+        },
         lljit::{
-            LLVMOrcCreateLLJIT, LLVMOrcDisposeLLJIT, LLVMOrcLLJITAddLLVMIRModule,
+            LLVMOrcCreateLLJIT, LLVMOrcCreateLLJITBuilder, LLVMOrcDisposeLLJIT,
+            LLVMOrcLLJITAddLLVMIRModule, LLVMOrcLLJITBuilderSetObjectLinkingLayerCreator,
             LLVMOrcLLJITGetMainJITDylib, LLVMOrcLLJITGetObjTransformLayer, LLVMOrcLLJITLookup,
             LLVMOrcLLJITRef,
         },
     },
     prelude::LLVMMemoryBufferRef,
 };
-use std::ffi::{CStr, CString, c_void};
+use std::{
+    ffi::{CStr, CString, c_char, c_void},
+    sync::Once,
+};
 
 /// An LLJIT that owns the modules added to it.
 pub(crate) struct Jit {
@@ -33,12 +43,30 @@ pub(crate) struct Jit {
 }
 
 impl Jit {
+    /// A JIT for kernels. With `listeners`, the object code and its DWARF go to gdb, and to the
+    /// perf jitdump if `symbols` asks for it. Without, the JIT has the default settings of LLVM.
+    ///
     /// # Errors
     /// The message LLVM gives, when it cannot create the JIT for the host.
-    pub(crate) fn new(symbols: JitSymbols) -> Result<Self, String> {
+    pub(crate) fn new(symbols: JitSymbols, listeners: bool) -> Result<Self, String> {
         let mut jit = std::ptr::null_mut();
-        // SAFETY: a null builder asks for the default settings.
-        error_message(unsafe { LLVMOrcCreateLLJIT(&mut jit, std::ptr::null_mut()) })?;
+        // SAFETY: a null builder asks for the default settings. `LLVMOrcCreateLLJIT` takes the
+        // builder. The creator reads `jitdump` only as a flag, never as a pointer.
+        unsafe {
+            let builder = if listeners {
+                let builder = LLVMOrcCreateLLJITBuilder();
+                let jitdump = symbols.jitdump as usize as *mut c_void;
+                LLVMOrcLLJITBuilderSetObjectLinkingLayerCreator(
+                    builder,
+                    create_listened_layer,
+                    jitdump,
+                );
+                builder
+            } else {
+                std::ptr::null_mut()
+            };
+            error_message(LLVMOrcCreateLLJIT(&mut jit, builder))?;
+        }
 
         let sizes = symbols.perf_map.then(|| {
             let sizes = Box::<SymbolSizes>::default();
@@ -105,6 +133,41 @@ impl Drop for Jit {
     }
 }
 
+/// The object layer of a JIT with listeners: `RuntimeDyld`, because the JIT event listeners work only
+/// with it. It reserves one block of memory for each object, so the code and its constants stay
+/// within the reach of 32-bit relocations. `jitdump` is non-null to add the perf listener.
+extern "C" fn create_listened_layer(
+    jitdump: *mut c_void,
+    session: LLVMOrcExecutionSessionRef,
+    _triple: *const c_char,
+) -> LLVMOrcObjectLayerRef {
+    // SAFETY: the session is live, and the layer takes no ownership of the listeners, which are
+    // process-wide singletons in LLVM.
+    unsafe {
+        let layer =
+            LLVMOrcCreateRTDyldObjectLinkingLayerWithSectionMemoryManagerReserveAlloc(session, 1);
+        LLVMOrcRTDyldObjectLinkingLayerRegisterJITEventListener(
+            layer,
+            LLVMCreateGDBRegistrationListener(),
+        );
+        if !jitdump.is_null() {
+            let perf = LLVMCreatePerfJITEventListener();
+            if perf.is_null() {
+                static WARN: Once = Once::new();
+                WARN.call_once(|| {
+                    log::warn!(
+                        "This LLVM has no perf JIT listener (LLVM_USE_PERF), so no jitdump is \
+                         written. The perf map still names each kernel."
+                    )
+                });
+            } else {
+                LLVMOrcRTDyldObjectLinkingLayerRegisterJITEventListener(layer, perf);
+            }
+        }
+        layer
+    }
+}
+
 /// The object transform: it records the size of each symbol and returns the object unchanged.
 extern "C" fn record_symbol_sizes(
     ctx: *mut c_void,
@@ -135,4 +198,56 @@ extern "C" fn record_symbol_sizes(
         LLVMDisposeBinary(binary);
     }
     std::ptr::null_mut()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With the jitdump asked for, the perf listener writes `jit-<pid>.dump` under `$JITDUMPDIR`.
+    /// Skipped when this LLVM was built without `LLVM_USE_PERF`.
+    #[test]
+    fn the_jitdump_is_written() {
+        // SAFETY: LLVM gives a process-wide listener, or null.
+        if unsafe { LLVMCreatePerfJITEventListener() }.is_null() {
+            eprintln!("skipped: this LLVM has no perf JIT listener");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("cubecl-jitdump-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: no other test of this binary reads `JITDUMPDIR`.
+        unsafe { std::env::set_var("JITDUMPDIR", &dir) };
+        pliron_llvm::llvm_sys::target::initialize_native().unwrap();
+
+        let symbols = JitSymbols {
+            perf_map: false,
+            jitdump: true,
+        };
+        let jit = Jit::new(symbols, true).unwrap();
+        jit.add_module(LlvmModule::new("define i32 @f() {\n  ret i32 1\n}\n").unwrap())
+            .unwrap();
+        jit.lookup("f").unwrap();
+
+        let name = format!("jit-{}.dump", std::process::id());
+        let found = walk(&dir).iter().any(|path| path.ends_with(&name));
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(found, "no {name} under {}", dir.display());
+    }
+
+    fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .flat_map(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path)
+                } else {
+                    vec![path]
+                }
+            })
+            .collect()
+    }
 }

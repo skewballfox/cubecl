@@ -93,7 +93,7 @@ impl PlironEngine {
             DebugInfo::None => JitSymbols::default(),
             _ => JitSymbols::from_env(),
         };
-        let jit = Jit::new(symbols).expect("failed to create LLJIT");
+        let jit = Jit::new(symbols, debug_info != DebugInfo::None).expect("failed to create LLJIT");
         jit.add_module(llvm_module)
             .expect("failed to add module to JIT");
         let addr = jit
