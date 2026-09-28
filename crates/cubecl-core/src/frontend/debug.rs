@@ -49,15 +49,17 @@ pub fn debug_source_expand<'a>(
     scope: &'a Scope,
     name: &'static str,
     file: &'static str,
-    _source_text: &'static str,
+    source_text: &'static str,
     line: u32,
     column: u32,
 ) -> DebugFrame<'a> {
     if scope.debug_state().is_none() {
         return DebugFrame { scope: None };
     }
-    let file = Source::new_from_file(scope.ctx_mut(), file.replace('\\', "/"));
+    let path = file.replace('\\', "/");
+    let file = Source::new_from_file(scope.ctx_mut(), path.clone());
     if let Some(debug) = scope.debug_state() {
+        debug.add_source(&path, source_text);
         debug.enter_fn(name, file, line, column);
     }
     DebugFrame { scope: Some(scope) }

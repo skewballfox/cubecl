@@ -1373,6 +1373,7 @@ dependencies = [
  "half",
  "hashbrown 0.17.1",
  "itertools 0.15.0",
+ "log",
  "paste",
  "pliron",
  "pliron-spirv",
@@ -3628,8 +3629,7 @@ dependencies = [
 [[package]]
 name = "pliron-spirv"
 version = "0.15.0+sdk-1.4.357.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e4de33072f8752616fee5dd701fed15eb17a218913d36dde71556f4103cdfc9"
+source = "git+https://github.com/skewballfox/tracel-rspirv?rev=a1810a5d0f7d60e55ec8cd38d5b174723f79eb82#a1810a5d0f7d60e55ec8cd38d5b174723f79eb82"
 dependencies = [
  "derive-new",
  "derive_more",
@@ -5041,8 +5041,7 @@ dependencies = [
 [[package]]
 name = "tracel-rspirv"
 version = "0.15.0+sdk-1.4.357.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe40b56cba6c5d88c88ff8b4d9cdd3d2b2972ac756e06f92fed7f81eb174da93"
+source = "git+https://github.com/skewballfox/tracel-rspirv?rev=a1810a5d0f7d60e55ec8cd38d5b174723f79eb82#a1810a5d0f7d60e55ec8cd38d5b174723f79eb82"
 dependencies = [
  "bitflags 2.13.1",
  "pliron",

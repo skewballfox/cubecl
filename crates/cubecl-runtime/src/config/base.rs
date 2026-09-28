@@ -189,6 +189,19 @@ impl RuntimeConfig for CubeClRuntimeConfig {
             }
         }
 
+        if let Ok(val) = std::env::var("CUBECL_SPIRV_DEBUG_FORMAT") {
+            use super::compilation::SpirvDebugFormat;
+
+            match val.as_str() {
+                "auto" => self.compilation.spirv_debug_format = SpirvDebugFormat::Auto,
+                "op-line" => self.compilation.spirv_debug_format = SpirvDebugFormat::OpLine,
+                "non-semantic" => {
+                    self.compilation.spirv_debug_format = SpirvDebugFormat::NonSemantic
+                }
+                _ => {}
+            }
+        }
+
         if let Some(enabled) = env_bool("CUBECL_THROUGHPUT_CACHE") {
             self.throughput.disable_cache = !enabled;
         }

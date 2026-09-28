@@ -19,6 +19,7 @@
 
 use alloc::{
     boxed::Box,
+    collections::BTreeMap,
     string::{String, ToString},
     vec::Vec,
 };
@@ -41,6 +42,9 @@ use crate::ContextExt;
 pub struct DebugState {
     enabled: bool,
     frames: Vec<Frame>,
+    /// The source text of each file, by the path of its [`Source`]. Only full debug data records
+    /// it.
+    sources: BTreeMap<String, &'static str>,
 }
 
 /// One `#[cube]` function on the call stack.
@@ -57,7 +61,7 @@ impl DebugState {
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
-            frames: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -93,10 +97,24 @@ impl DebugState {
         }
     }
 
+    /// Records `text` as the source text of the file `path`. An empty text records nothing.
+    pub fn add_source(&mut self, path: &str, text: &'static str) {
+        if !text.is_empty() {
+            self.sources.insert(path.into(), text);
+        }
+    }
+
+    /// The source text of each file, by the path of its [`Source`]. It stays after
+    /// [`finish`](Self::finish), for the compiler.
+    pub fn sources(&self) -> &BTreeMap<String, &'static str> {
+        &self.sources
+    }
+
     /// Stops recording, at the end of kernel expansion. Ops that compiler passes insert later get
     /// the location of the op they replace.
     pub fn finish(&mut self) {
-        *self = Self::default();
+        self.enabled = false;
+        self.frames.clear();
     }
 
     /// The location of the current expression, or `None` outside a `#[cube]` function.

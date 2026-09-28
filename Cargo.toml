@@ -233,6 +233,10 @@ opt-level = 3
 [patch.crates-io]
 pliron = { git = "https://github.com/skewballfox/pliron", rev = "d3a31a15d253797f6f90fa2245c53caf800264ad" }
 pliron-llvm = { git = "https://github.com/skewballfox/pliron", rev = "d3a31a15d253797f6f90fa2245c53caf800264ad" }
+# `pliron-spirv` debug data (`debug-info`, `NonSemantic.Shader.DebugInfo.100`)
+# is not released yet.
+pliron-spirv = { git = "https://github.com/skewballfox/tracel-rspirv", rev = "a1810a5d0f7d60e55ec8cd38d5b174723f79eb82" }
+tracel-rspirv = { git = "https://github.com/skewballfox/tracel-rspirv", rev = "a1810a5d0f7d60e55ec8cd38d5b174723f79eb82" }
 # The Linux bundles of `23.1.0-4` have the perf JIT listener (`jitdump`). This
 # release is not published yet.
 tracel-llvm-bundler = { git = "https://github.com/skewballfox/tracel-llvm", branch = "cubecl-patch" }

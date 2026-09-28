@@ -67,7 +67,7 @@ use pliron::{
     printable::Printable,
 };
 use pliron_spirv::{
-    PlironBuilder, ToSpirvOp,
+    ToSpirvOp,
     attrs::VerCapExtAttr,
     decorations::{DecoratableOp, set_decoration_uniform, set_decoration_uniform_id},
     ops::{EntryPointOp, ExecutionModeOp, SpirvModuleOp},
@@ -293,8 +293,7 @@ impl SpirvCompiler {
         passes.add_pass(ConvertArgsPass);
         passes.add_pass(NestedOpsPass::new(func_passes));
         // Some passes insert ops without a location. They get the location of the op before them.
-        let lines = settings.debug_info != DebugInfo::None;
-        if lines {
+        if settings.debug_info != DebugInfo::None {
             passes.add_pass(InheritLocationPass);
         }
 
@@ -305,9 +304,6 @@ impl SpirvCompiler {
 
         let (shared_size, shared_args) = lower_shared(ctx, spirv_module);
         declare_entry_point(ctx, spirv_module, shared_args);
-        if lines {
-            crate::lines::insert_line_ops(ctx, spirv_module_op);
-        }
 
         // Make sure this is the last pass so it catches all ops
         OpPass::<SpirvModuleOp, CollectVerCapExtPass>::default()
@@ -318,7 +314,7 @@ impl SpirvCompiler {
         // Try to figure this out later.
         // verify_operation(module_op, ctx).expect("Failed to verify after passes");
 
-        let mut builder = PlironBuilder::default();
+        let mut builder = crate::debug_info::builder(ctx, settings.debug_info);
         spirv_module.to_spirv(ctx, &mut builder)?;
         let module = builder.module();
 

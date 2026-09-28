@@ -118,6 +118,14 @@ compilation time without debug data.
 - `line-tables`: source lines, with each inlined `#[cube]` function as its own frame.
 - `full`: line tables and the embedded source text.
 
+**SPIR-V debug format** (`spirv_debug_format`, Vulkan only): the format of the debug data in a
+SPIR-V kernel. A kernel without debug data ignores it.
+
+- `auto` (default): `non-semantic` when the device supports it, else `op-line`.
+- `op-line`: core `OpLine`. It gives the line of the innermost `#[cube]` function only.
+- `non-semantic`: `NonSemantic.Shader.DebugInfo.100`. Each inlined `#[cube]` function is a
+  separate frame. A device without support gets `op-line`.
+
 **Pass timing** (`time_passes`): log how long each compiler pass takes, at the `info` level. Use
 it to find where kernel compilation time goes.
 
@@ -222,6 +230,8 @@ CubeCL supports several environment variables to override configuration at runti
 - `CUBECL_DEBUG_PLIRON`: Sets `compilation.dump_dir` to the given directory.
 - `CUBECL_DEBUG_INFO`: Sets `compilation.debug_info`.
   - `"none"`, `"line-tables"`, `"full"`
+- `CUBECL_SPIRV_DEBUG_FORMAT`: Sets `compilation.spirv_debug_format`.
+  - `"auto"`, `"op-line"`, `"non-semantic"`
 - `CUBECL_TIME_PASSES`: Sets `compilation.time_passes`.
   - `"1"`/`"true"`/`"on"`, `"0"`/`"false"`/`"off"`
 - `CUBECL_JIT_SYMBOLS`: The profiler symbol files of the `cpu` runtime (see

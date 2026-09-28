@@ -40,6 +40,9 @@ spirv = ["cubecl-spirv", "ash", "tracel-ash", "cubecl-common/hash"]
 
 
 deny-validation-errors = ["wgpu-hal/validation_canary"]
+# Source locations in SPIR-V kernels that have debug data. `cubecl-spirv` has it
+# by default.
+debug-info = ["cubecl-spirv?/debug-info"]
 pliron-dump = ["std", "cubecl-cpp/pliron-dump", "cubecl-spirv?/pliron-dump"]
 vulkan-validate = []
 
