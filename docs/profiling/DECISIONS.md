@@ -13,7 +13,7 @@ This file lists only the open choices. The plan contains the result of each clos
 |---|---|---|---|
 | D4 | LLVM debug data: cubecl bridge or pliron-llvm change | B (on a `pliron` fork revision, not released) | upstream review of B |
 | D10 | Trigger for perf symbol files | A + B | P3 step 3 |
-| D11 | Configuration surface for the SPIR-V debug format | A + B | P4 step 4 |
+| D11 | Configuration surface for the SPIR-V debug format | A + B (done) | maintainer confirmation |
 
 ---
 
@@ -72,3 +72,5 @@ The format is decided: `Auto` selects `NonSemantic.Shader.DebugInfo.100` when th
 | F. Per kernel: `KernelSettings` or `#[cube(...)]`. | [`cubecl-ir/src/settings.rs#L79-L92`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-ir/src/settings.rs#L79-L92) | Maximum control. | The format is a property of the device and the tool, not of the kernel. It adds noise to the kernel API. |
 
 Provisional: A as the default, B as the override. Add D only if a user needs different formats on two devices in one process.
+
+**Status:** A and B are done in [`7f10c05`](https://github.com/skewballfox/cubecl/commit/7f10c05fdd42a033df4cc13ea88a2b667a84ed62) (PLAN §8 step 4). The Vulkan backend sets `supports_non_semantic_info`. `compilation.spirv_debug_format` and `CUBECL_SPIRV_DEBUG_FORMAT` take `auto`, `op-line` or `non-semantic`. The choice stays open until a maintainer confirms it.
