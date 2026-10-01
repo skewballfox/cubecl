@@ -80,6 +80,9 @@ impl KernelBuilder {
 
     /// Build the [kernel definition](KernelDefinition).
     pub fn build(self) -> KernelDefinition {
+        for warning in self.scope.pop_warnings() {
+            log::warn!("[{}] {warning}", self.settings.kernel_name);
+        }
         if let Some(debug) = self.scope.debug_state() {
             debug.finish();
         }

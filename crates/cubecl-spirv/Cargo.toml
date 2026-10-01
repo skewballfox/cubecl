@@ -27,7 +27,7 @@ default = [
 # `NonSemantic.Shader.DebugInfo.100` with inlined frames. Without it, kernels get
 # no debug data. The cost is small: the `dev` unit-test binary of this crate
 # grows from 38.60 MB to 38.74 MB of text (+0.4%), with the same tests.
-debug-info = ["pliron-spirv/debug-info"]
+debug-info = []
 pliron-dump = ["std"]
 std = [
     "cubecl-common/std",
