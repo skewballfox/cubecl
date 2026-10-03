@@ -1,67 +1,56 @@
 //! Debug data in the SPIR-V of a kernel.
 //!
-//! `pliron-spirv` converts the location of each op to debug data (feature `debug-info`). The
-//! format is core `OpLine`, or `NonSemantic.Shader.DebugInfo.100` with each inlined `#[cube]`
-//! function as a separate frame. [`debug_format`] selects the format from the configuration and
-//! the device. `pliron-spirv` owns the placement rules, for example no instruction between a merge
+//! `pliron-spirv` converts the location of each op to debug data. The format is core `OpLine`, or
+//! `NonSemantic.Shader.DebugInfo.100` with each inlined `#[cube]` function as a separate frame.
+//! [`debug_format`] selects the format from the configuration and the device. `pliron-spirv` owns the placement rules, for example no instruction between a merge
 //! instruction and its branch.
 
-use cubecl_ir::settings::DebugInfo;
+use cubecl_core::WgpuCompilationOptions;
+use cubecl_ir::{ContextExt, debug::DebugState, settings::DebugInfo};
+use cubecl_runtime::config::{CubeClRuntimeConfig, RuntimeConfig, compilation::SpirvDebugFormat};
 use pliron::context::Context;
-use pliron_spirv::PlironBuilder;
+use pliron_spirv::{
+    PlironBuilder,
+    debug_info::{DebugInfoFormat, DebugInfoOptions},
+};
+use rspirv::spirv::SourceLanguage;
 
-/// The builder of the module of a kernel with the debug data `level`. Without the feature
-/// `debug-info`, or at [`DebugInfo::None`], the module has no debug data.
-#[cfg_attr(not(feature = "debug-info"), allow(unused_variables))]
+/// The builder of the module of a kernel with the debug data `level`. At [`DebugInfo::None`], the
+/// module has no debug data.
 pub(crate) fn builder(ctx: &Context, level: DebugInfo) -> PlironBuilder {
-    #[cfg(feature = "debug-info")]
-    if level != DebugInfo::None {
-        use cubecl_core::WgpuCompilationOptions;
-        use cubecl_ir::{ContextExt, debug::DebugState};
-        use cubecl_runtime::config::{CubeClRuntimeConfig, RuntimeConfig};
-        use pliron_spirv::debug_info::DebugInfoOptions;
-        use rspirv::spirv::SourceLanguage;
-
-        let supported = ctx
-            .aux_ty::<WgpuCompilationOptions>()
-            .vulkan
-            .supports_non_semantic_info;
-        let configured = CubeClRuntimeConfig::get().compilation.spirv_debug_format;
-        let mut options = DebugInfoOptions::default();
-        options.format = debug_format(configured, supported);
-        options.language = SourceLanguage::Rust;
-        options.producer = "cubecl".to_string();
-        // Only `Full` embeds the source text, as the macro records it only then.
-        if level == DebugInfo::Full
-            && let Some(debug) = ctx.try_aux_ty::<DebugState>()
-        {
-            options.source_text = debug
-                .sources()
-                .iter()
-                .map(|(path, text)| (path.clone(), text.to_string()))
-                .collect();
-        }
-        return PlironBuilder::with_debug_info(options);
+    if level == DebugInfo::None {
+        return PlironBuilder::default();
     }
-    PlironBuilder::default()
+    let supported = ctx
+        .aux_ty::<WgpuCompilationOptions>()
+        .vulkan
+        .supports_non_semantic_info;
+    let configured = CubeClRuntimeConfig::get().compilation.spirv_debug_format;
+    let mut options = DebugInfoOptions::default();
+    options.format = debug_format(configured, supported);
+    options.language = SourceLanguage::Rust;
+    options.producer = "cubecl".to_string();
+    // Only `Full` embeds the source text, as the macro records it only then.
+    if level == DebugInfo::Full
+        && let Some(debug) = ctx.try_aux_ty::<DebugState>()
+    {
+        options.source_text = debug
+            .sources()
+            .iter()
+            .map(|(path, text)| (path.clone(), text.to_string()))
+            .collect();
+    }
+    PlironBuilder::with_debug_info(options)
 }
 
 /// The format for the configured format `configured`, on a device that `supported`
 /// `NonSemantic.Shader.DebugInfo.100` or not. A device without support gets `OpLine`.
-#[cfg(feature = "debug-info")]
-fn debug_format(
-    configured: cubecl_runtime::config::compilation::SpirvDebugFormat,
-    supported: bool,
-) -> pliron_spirv::debug_info::DebugInfoFormat {
-    use cubecl_runtime::config::compilation::SpirvDebugFormat;
-    use pliron_spirv::debug_info::DebugInfoFormat;
-
+fn debug_format(configured: SpirvDebugFormat, supported: bool) -> DebugInfoFormat {
     match configured {
-        SpirvDebugFormat::OpLine => DebugInfoFormat::OpLine,
         SpirvDebugFormat::Auto | SpirvDebugFormat::NonSemantic if supported => {
             DebugInfoFormat::NonSemantic
         }
-        SpirvDebugFormat::Auto => DebugInfoFormat::OpLine,
+        SpirvDebugFormat::Auto | SpirvDebugFormat::OpLine => DebugInfoFormat::OpLine,
         SpirvDebugFormat::NonSemantic => {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
@@ -75,7 +64,7 @@ fn debug_format(
     }
 }
 
-#[cfg(all(test, feature = "debug-info"))]
+#[cfg(test)]
 // A `#[cube]` kernel loops over a range, not over an iterator.
 #[allow(clippy::needless_range_loop)]
 mod tests {

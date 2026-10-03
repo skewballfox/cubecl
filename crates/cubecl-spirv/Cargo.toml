@@ -18,16 +18,10 @@ workspace = true
 [features]
 default = [
     "std",
-    "debug-info",
     "cubecl-common/default",
     "cubecl-core/default",
     "cubecl-runtime/default",
 ]
-# Source locations in kernels that have debug data: core `OpLine`, or
-# `NonSemantic.Shader.DebugInfo.100` with inlined frames. Without it, kernels get
-# no debug data. `pliron-spirv` always compiles the emitter, so the feature
-# gates only the selection of the builder.
-debug-info = []
 pliron-dump = ["std"]
 std = [
     "cubecl-common/std",

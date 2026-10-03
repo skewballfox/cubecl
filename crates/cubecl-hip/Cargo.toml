@@ -18,13 +18,10 @@ workspace = true
 [features]
 default = [
     "std",
-    "debug-info",
     "cubecl-server/default",
     "cubecl-common/default",
     "cubecl-core/default",
 ]
-# DWARF for LLVM kernels that have debug data.
-debug-info = ["cubecl-llvm/debug-info"]
 
 persistence = ["cubecl-server/persistence"]
 std = [

@@ -6,35 +6,30 @@
 use crate::{prelude::*, shared::llvm_module::LlvmModule};
 use cubecl_core::ir::settings::DebugInfo;
 use pliron_llvm::{
+    debug_info_conversions::to_llvm_ir::{DebugInfoOptions, EmissionKind, LLVMDWARFSourceLanguage},
     llvm_sys::core::{LLVMContext, LLVMModule},
     to_llvm_ir,
 };
 
 /// Converts `module` to LLVM IR, with the debug data of `level`.
-#[cfg_attr(not(feature = "debug-info"), allow(unused_variables))]
 pub(crate) fn convert_module(
     ctx: &Context,
     llvm_ctx: &LLVMContext,
     module: ModuleOp,
     level: DebugInfo,
 ) -> pliron::result::Result<LLVMModule> {
-    #[cfg(feature = "debug-info")]
-    if level != DebugInfo::None {
-        use pliron_llvm::debug_info_conversions::to_llvm_ir::{
-            DebugInfoOptions, EmissionKind, LLVMDWARFSourceLanguage,
-        };
-
-        let mut options = DebugInfoOptions::default();
-        options.emission_kind = match level {
-            DebugInfo::Full => EmissionKind::Full,
-            _ => EmissionKind::LineTablesOnly,
-        };
-        options.language = LLVMDWARFSourceLanguage::LLVMDWARFSourceLanguageRust;
-        options.producer = "cubecl".to_string();
-        options.optimized = true;
-        return to_llvm_ir::convert_module_with_debug_info(ctx, llvm_ctx, module, options);
+    if level == DebugInfo::None {
+        return to_llvm_ir::convert_module(ctx, llvm_ctx, module);
     }
-    to_llvm_ir::convert_module(ctx, llvm_ctx, module)
+    let mut options = DebugInfoOptions::default();
+    options.emission_kind = match level {
+        DebugInfo::Full => EmissionKind::Full,
+        _ => EmissionKind::LineTablesOnly,
+    };
+    options.language = LLVMDWARFSourceLanguage::LLVMDWARFSourceLanguageRust;
+    options.producer = "cubecl".to_string();
+    options.optimized = true;
+    to_llvm_ir::convert_module_with_debug_info(ctx, llvm_ctx, module, options)
 }
 
 /// Runs LLVM's verifier on the debug data of `module`, in a debug build of cubecl only. The test
@@ -42,12 +37,9 @@ pub(crate) fn convert_module(
 ///
 /// # Panics
 /// When the debug data does not verify: the conversion has a bug.
-#[cfg_attr(
-    not(all(feature = "debug-info", debug_assertions)),
-    allow(unused_variables)
-)]
+#[cfg_attr(not(debug_assertions), allow(unused_variables))]
 pub(crate) fn check_debug_info(module: &LlvmModule, kernel_name: &str, level: DebugInfo) {
-    #[cfg(all(feature = "debug-info", debug_assertions))]
+    #[cfg(debug_assertions)]
     if level != DebugInfo::None
         && let Err(err) = module.verify()
     {
@@ -179,7 +171,6 @@ mod tests {
         assert!(positions.len() >= 2, "positions in `inner`: {positions:?}");
     }
 
-    #[cfg(feature = "debug-info")]
     #[test]
     fn inlined_functions_are_dwarf_frames() {
         let lowered = lowered(DebugInfo::LineTables);
