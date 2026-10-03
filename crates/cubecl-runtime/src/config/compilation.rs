@@ -28,12 +28,19 @@ pub fn effective_debug_info(requested: DebugInfo) -> DebugInfo {
             .map_or(NO_LIMIT, |level| level as u8);
         LIMIT.store(limit, Ordering::Relaxed);
     }
+    let limit = match limit {
+        0 => Some(DebugInfo::None),
+        1 => Some(DebugInfo::LineTables),
+        2 => Some(DebugInfo::Full),
+        _ => None,
+    };
+    resolve_debug_info(requested, limit)
+}
+
+/// At least [`PROFILE_DEBUG_INFO`], at most `limit`.
+fn resolve_debug_info(requested: DebugInfo, limit: Option<DebugInfo>) -> DebugInfo {
     let level = requested.max(PROFILE_DEBUG_INFO);
-    match limit {
-        0 => DebugInfo::None,
-        1 => level.min(DebugInfo::LineTables),
-        _ => level,
-    }
+    limit.map_or(level, |limit| level.min(limit))
 }
 
 /// Configuration for compilation settings in `CubeCL`.
@@ -73,9 +80,9 @@ pub struct CompilationConfig {
 impl CompilationConfig {
     /// The debug data of a kernel that asks for `requested`: at least [`PROFILE_DEBUG_INFO`], at
     /// most [`debug_info`](Self::debug_info).
+    #[must_use]
     pub fn resolve_debug_info(&self, requested: DebugInfo) -> DebugInfo {
-        let level = requested.max(PROFILE_DEBUG_INFO);
-        self.debug_info.map_or(level, |limit| level.min(limit))
+        resolve_debug_info(requested, self.debug_info)
     }
 }
 
