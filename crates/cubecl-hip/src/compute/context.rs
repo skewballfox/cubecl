@@ -576,14 +576,15 @@ fn compile_to_binary(source: &str, line_tables: bool) -> Result<Vec<i8>, Compila
     // needed for rocWMMA extension to compile
     let cpp_std_option = c"--std=c++17";
     let optimization_level = c"-O3";
-    let mut options = vec![
+    let mut all_options = [
         cpp_std_option.as_ptr(),
         include_option.as_ptr(),
         optimization_level.as_ptr(),
+        c"-gline-tables-only".as_ptr(),
     ];
-    if line_tables {
-        options.push(c"-gline-tables-only".as_ptr());
-    }
+    // The last option is the line tables.
+    let count = all_options.len() - usize::from(!line_tables);
+    let options = &mut all_options[..count];
 
     // SAFETY: `program.0` is the handle created above, and `options` holds
     // null-terminated pointers that outlive the call.

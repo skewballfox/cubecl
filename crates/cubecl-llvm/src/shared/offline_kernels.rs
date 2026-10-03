@@ -3,43 +3,13 @@
 #![cfg_attr(not(any(feature = "amdgpu", feature = "nvptx")), allow(dead_code))]
 
 use cubecl_core as cubecl;
-use cubecl_core::ir::{
-    DeviceIdentity, HardwareProperties, MemoryDeviceProperties, features::Features,
-};
 use cubecl_core::prelude::*;
+use cubecl_core::runtime_tests::offline::offline_device_properties;
 use cubecl_runtime::kernel::CubeKernel;
 use std::sync::Arc;
 
 pub(crate) fn device_properties(plane_dim: u32) -> Arc<DeviceProperties> {
-    let hardware = HardwareProperties {
-        load_width: 128,
-        vector_register_count: None,
-        plane_size_min: plane_dim,
-        plane_size_max: plane_dim,
-        max_bindings: 32,
-        max_shared_memory_size: 65536,
-        max_cube_count: (u32::MAX, u16::MAX as u32, u16::MAX as u32),
-        max_units_per_cube: 1024,
-        max_cube_dim: (1024, 1024, 1024),
-        num_streaming_multiprocessors: None,
-        num_tensor_cores: None,
-        min_tensor_cores_dim: None,
-        num_cpu_cores: None,
-        last_level_cache_size: None,
-        max_vector_size: VectorSize::MAX,
-        cube_mma_reserved_shared_memory: 0,
-    };
-    Arc::new(DeviceProperties::new(
-        Features::default(),
-        MemoryDeviceProperties::new(u64::MAX, 256),
-        hardware,
-        cubecl_core::profile::TimingMethod::Device,
-        DeviceIdentity {
-            name: "offline".to_string(),
-            fingerprint: "offline".to_string(),
-            physical: None,
-        },
-    ))
+    Arc::new(offline_device_properties(plane_dim))
 }
 
 #[cube(launch)]

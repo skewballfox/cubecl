@@ -564,8 +564,6 @@ impl Drop for TargetMachine {
     }
 }
 
-/// # Safety
-/// `message` must be a NUL-terminated string LLVM allocated for the caller to dispose.
 /// `Ok` for a null `error`, else its message. The error is consumed.
 pub(crate) fn error_message(error: LLVMErrorRef) -> Result<(), String> {
     if error.is_null() {
@@ -580,6 +578,8 @@ pub(crate) fn error_message(error: LLVMErrorRef) -> Result<(), String> {
     }
 }
 
+/// # Safety
+/// `message` must be a NUL-terminated string LLVM allocated for the caller to dispose.
 unsafe fn take_message(message: *mut std::ffi::c_char) -> String {
     // SAFETY: the caller's contract.
     unsafe {

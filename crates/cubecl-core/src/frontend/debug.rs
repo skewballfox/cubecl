@@ -53,13 +53,13 @@ pub fn debug_source_expand<'a>(
     line: u32,
     column: u32,
 ) -> DebugFrame<'a> {
-    if scope.debug_state().is_none() {
+    let Some(debug) = scope.debug_state() else {
         return DebugFrame { scope: None };
-    }
+    };
     let path = file.replace('\\', "/");
-    let file = Source::new_from_file(scope.ctx_mut(), path.clone());
+    debug.add_source(&path, source_text);
+    let file = Source::new_from_file(scope.ctx_mut(), path);
     if let Some(debug) = scope.debug_state() {
-        debug.add_source(&path, source_text);
         debug.enter_fn(name, file, line, column);
     }
     DebugFrame { scope: Some(scope) }

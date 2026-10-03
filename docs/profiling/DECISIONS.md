@@ -37,6 +37,8 @@ The rule does not apply. The user-visible behavior is the same.
 - `Unknown`: line 0 in the function scope.
 - No `DI*` metadata nodes are modelled. The conversion uses the LLVM `DIBuilder` directly.
 
+**Update** ([`c68f831`](https://github.com/skewballfox/cubecl/commit/c68f83128de6edbe23944ae8c5c1468cb622d8c2), merge of `main`): `main` takes `pliron` from git, at `master`. The patch is now `[patch."https://github.com/pliron-org/pliron.git"]`, at the fork commit [`8b27b0e`](https://github.com/skewballfox/pliron/tree/8b27b0e7271b0c84f49f7f8afad6d7fc0c904144) on `cubecl-patch`. That branch merges a newer `master`, and cubecl compiles with it. The fork has no feature `debug-info` any more (PLAN §6).
+
 The choice stays open until the pliron maintainers accept B or ask for changes.
 
 ## D10. Trigger for perf symbol files

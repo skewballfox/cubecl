@@ -100,7 +100,7 @@ pub fn emit_ptx(
     let converted =
         convert_module(ctx, &llvm_ctx, module, debug_info).map_err(|err| err.to_string())?;
 
-    let module = LlvmModule::new(&directives_only(&converted.to_string()))?;
+    let module = LlvmModule::new(&directives_only(converted.to_string(), debug_info))?;
     check_debug_info(&module, entrypoint, debug_info);
     finalize(&module, entrypoint, arch, &entry)?;
     let ir = module.print();
@@ -123,15 +123,13 @@ pub fn emit_ptx(
 /// `.loc` directives, as `nvcc -lineinfo` gives. With line tables or full debug data, NVPTX writes
 /// `.target <sm>, debug`, and the driver then compiles the kernel for a debugger, which changes the
 /// optimization. The LLVM C API cannot create this kind, so the IR text is changed.
-fn directives_only(ir: &str) -> String {
-    ir.replace(
-        "emissionKind: LineTablesOnly",
-        "emissionKind: DebugDirectivesOnly",
-    )
-    .replace(
-        "emissionKind: FullDebug",
-        "emissionKind: DebugDirectivesOnly",
-    )
+fn directives_only(ir: String, level: DebugInfo) -> String {
+    let kind = match level {
+        DebugInfo::None => return ir,
+        DebugInfo::LineTables => "emissionKind: LineTablesOnly",
+        DebugInfo::Full => "emissionKind: FullDebug",
+    };
+    ir.replace(kind, "emissionKind: DebugDirectivesOnly")
 }
 
 /// Stamps the target and the entry point's calling convention and attributes on `module`.

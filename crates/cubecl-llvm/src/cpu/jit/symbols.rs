@@ -69,7 +69,7 @@ impl SymbolSizes {
 pub(crate) fn write_perf_map(addr: u64, size: u64, name: &str) {
     static PERF_MAP: OnceLock<Option<Mutex<File>>> = OnceLock::new();
     let file = PERF_MAP.get_or_init(|| {
-        let path = perf_map_path(std::process::id());
+        let path = format!("/tmp/perf-{}.map", std::process::id());
         match File::options().create(true).append(true).open(&path) {
             Ok(file) => Some(Mutex::new(file)),
             Err(err) => {
@@ -86,10 +86,6 @@ pub(crate) fn write_perf_map(addr: u64, size: u64, name: &str) {
     if let Err(err) = file.write_all(line.as_bytes()) {
         log::warn!("Can't write the perf map: {err}");
     }
-}
-
-pub(crate) fn perf_map_path(pid: u32) -> String {
-    format!("/tmp/perf-{pid}.map")
 }
 
 #[cfg(test)]

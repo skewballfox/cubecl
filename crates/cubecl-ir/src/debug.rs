@@ -17,12 +17,7 @@
 //! }
 //! ```
 
-use alloc::{
-    boxed::Box,
-    collections::BTreeMap,
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
 use pliron::{
     basic_block::BasicBlock,
     combine::stream::position::SourcePosition,
@@ -30,6 +25,7 @@ use pliron::{
     irbuild::listener::InsertionListener,
     location::{Located, Location, Source},
     operation::Operation,
+    std_deps::path::PathBuf,
 };
 
 use crate::ContextExt;
@@ -50,7 +46,7 @@ pub struct DebugState {
 /// One `#[cube]` function on the call stack.
 #[derive(Debug)]
 struct Frame {
-    name: String,
+    name: &'static str,
     file: Source,
     /// The expression the function is at: the call site, while a callee runs.
     pos: SourcePosition,
@@ -71,9 +67,9 @@ impl DebugState {
     }
 
     /// Opens the frame of function `name`, defined at `line` and `column` of `file`.
-    pub fn enter_fn(&mut self, name: &str, file: Source, line: u32, column: u32) {
+    pub fn enter_fn(&mut self, name: &'static str, file: Source, line: u32, column: u32) {
         self.frames.push(Frame {
-            name: name.into(),
+            name,
             file,
             pos: position(line, column),
         });
@@ -99,7 +95,7 @@ impl DebugState {
 
     /// Records `text` as the source text of the file `path`. An empty text records nothing.
     pub fn add_source(&mut self, path: &str, text: &'static str) {
-        if !text.is_empty() {
+        if !text.is_empty() && !self.sources.contains_key(path) {
             self.sources.insert(path.into(), text);
         }
     }
@@ -134,7 +130,7 @@ impl DebugState {
 impl Frame {
     fn location(&self) -> Location {
         Location::Named {
-            name: self.name.clone(),
+            name: self.name.into(),
             child_loc: Box::new(Location::SrcPos {
                 src: self.file,
                 pos: self.pos,
@@ -172,7 +168,7 @@ impl InsertionListener for LocationListener {
 /// The source line of an op: the file and the line of the innermost frame of `loc`. A target that
 /// cannot show inlined frames, such as a `#line` directive, uses it. `None` for an unknown
 /// location, or for a position in memory.
-pub fn leaf_line(ctx: &Context, loc: &Location) -> Option<(String, u32)> {
+pub fn leaf_line<'c>(ctx: &'c Context, loc: &Location) -> Option<(&'c PathBuf, u32)> {
     match loc {
         Location::CallSite { callee, .. } => leaf_line(ctx, callee),
         Location::Named { child_loc, .. } => leaf_line(ctx, child_loc),
@@ -180,8 +176,8 @@ pub fn leaf_line(ctx: &Context, loc: &Location) -> Option<(String, u32)> {
             src: Source::File(key),
             pos,
         } => Some((
-            pliron::uniqued_any::get(ctx, *key).display().to_string(),
-            pos.line.max(0) as u32,
+            pliron::uniqued_any::get(ctx, *key),
+            u32::try_from(pos.line).unwrap_or(0),
         )),
         Location::Fused { locations, .. } => locations.iter().find_map(|loc| leaf_line(ctx, loc)),
         Location::SrcPos {

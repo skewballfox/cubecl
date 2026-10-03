@@ -174,8 +174,8 @@ fn keep_location(
 }
 
 /// Gives each op without a location the location of the op before it in its block. The first op
-/// of a block takes the location of the op that holds the block. Run it last before export, for the ops that passes outside [`KeepLocation`]
-/// insert.
+/// of a block takes the location of the op that holds the block. Run it last before export, for
+/// the ops that passes outside [`KeepLocation`] insert.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InheritLocationPass;
 
@@ -200,13 +200,11 @@ impl Pass for InheritLocationPass {
 /// an op changed.
 fn inherit_locations(ctx: &Context, op: Ptr<Operation>, loc: &Location) -> bool {
     let mut changed = false;
-    let regions = op.deref(ctx).regions().collect::<Vec<_>>();
-    for region in regions {
-        let blocks = region.deref(ctx).iter(ctx).collect::<Vec<_>>();
-        for block in blocks {
+    // The iterators borrow each node only to step to the next one, so a child op can change.
+    for region in op.deref(ctx).regions() {
+        for block in region.deref(ctx).iter(ctx) {
             let mut previous = loc.clone();
-            let ops = block.deref(ctx).iter(ctx).collect::<Vec<_>>();
-            for child in ops {
+            for child in block.deref(ctx).iter(ctx) {
                 let child_loc = child.deref(ctx).loc();
                 if child_loc.is_unknown() {
                     if !previous.is_unknown() {

@@ -1,10 +1,11 @@
+use core::fmt::Write;
 use cubecl_core::ir::{
     ContextExt,
     debug::leaf_line,
     dialect::{branch::*, general::SelectOp},
     prelude::*,
 };
-use pliron::{basic_block::BasicBlock, linked_list::ContainsLinkedList};
+use pliron::{basic_block::BasicBlock, linked_list::ContainsLinkedList, std_deps::path::PathBuf};
 
 use crate::{
     error::EmissionErrors,
@@ -22,7 +23,7 @@ pub fn block_to_cpp(ctx: &Context, block: Ptr<BasicBlock>) -> String {
     let lines = ctx.try_aux_ty::<LineDirectives>().is_some();
     let mut out = String::new();
     // The file and line that the C++ compiler gives to the next line of `out`, if known.
-    let mut next_line: Option<(String, u32)> = None;
+    let mut next_line: Option<(&PathBuf, u32)> = None;
     let ops = block.deref(ctx).iter(ctx);
     for op in ops {
         // `Display` can't fail, so record the error and let `compile_ir` fail the compilation.
@@ -53,16 +54,16 @@ pub fn block_to_cpp(ctx: &Context, block: Ptr<BasicBlock>) -> String {
 /// Writes `#line` for `op` into `out`, unless the next line of `out` already has the source line
 /// of `op`. Returns the source line of the next line of `out`. C++ cannot show inlined frames, so
 /// the directive has the innermost frame of the location.
-fn line_directive(
-    ctx: &Context,
+fn line_directive<'c>(
+    ctx: &'c Context,
     op: Ptr<Operation>,
-    next_line: Option<(String, u32)>,
+    next_line: Option<(&'c PathBuf, u32)>,
     out: &mut String,
-) -> Option<(String, u32)> {
+) -> Option<(&'c PathBuf, u32)> {
     let Some(source) = leaf_line(ctx, &op.deref(ctx).loc()) else {
         return next_line;
     };
-    if next_line.as_ref() == Some(&source) {
+    if next_line == Some(source) {
         return next_line;
     }
     // A directive must start a line. The caller can put a block after other text on its line, as
@@ -70,8 +71,16 @@ fn line_directive(
     if !out.ends_with('\n') {
         out.push('\n');
     }
-    let file = source.0.replace('\\', "\\\\").replace('"', "\\\"");
-    out.push_str(&format!("#line {} \"{file}\"\n", source.1));
+    let (file, line) = source;
+    let _ = write!(out, "#line {line} \"");
+    // The file name is a C string literal.
+    let file = file.display().to_string();
+    let escaped = file.chars().flat_map(|c| {
+        let backslash = matches!(c, '\\' | '"').then_some('\\');
+        backslash.into_iter().chain([c])
+    });
+    out.extend(escaped);
+    out.push_str("\"\n");
     Some(source)
 }
 
@@ -157,11 +166,9 @@ mod tests {
     use cubecl_core as cubecl;
     use cubecl_core::{
         Compiler,
-        ir::{
-            DeviceIdentity, DeviceProperties, HardwareProperties, MemoryDeviceProperties,
-            features::Features, settings::DebugInfo,
-        },
+        ir::{DeviceProperties, settings::DebugInfo},
         prelude::*,
+        runtime_tests::offline::offline_device_properties,
     };
     use cubecl_runtime::kernel::CubeKernel;
     use std::sync::Arc;
@@ -185,35 +192,7 @@ mod tests {
     }
 
     fn properties() -> Arc<DeviceProperties> {
-        let hardware = HardwareProperties {
-            load_width: 128,
-            plane_size_min: 32,
-            plane_size_max: 32,
-            max_bindings: 32,
-            max_shared_memory_size: 65536,
-            max_cube_count: (u32::MAX, u16::MAX as u32, u16::MAX as u32),
-            max_units_per_cube: 1024,
-            max_cube_dim: (1024, 1024, 1024),
-            num_streaming_multiprocessors: None,
-            num_tensor_cores: None,
-            min_tensor_cores_dim: None,
-            num_cpu_cores: None,
-            last_level_cache_size: None,
-            vector_register_count: None,
-            max_vector_size: VectorSize::MAX,
-            cube_mma_reserved_shared_memory: 0,
-        };
-        let mut properties = DeviceProperties::new(
-            Features::default(),
-            MemoryDeviceProperties::new(u64::MAX, 256),
-            hardware,
-            cubecl_core::profile::TimingMethod::Device,
-            DeviceIdentity {
-                name: "offline".to_string(),
-                fingerprint: "offline".to_string(),
-                physical: None,
-            },
-        );
+        let mut properties = offline_device_properties(32);
         register_supported_types(&mut properties);
         Arc::new(properties)
     }
@@ -262,7 +241,10 @@ mod tests {
         let starts_a_line = source
             .match_indices("#line")
             .all(|(at, _)| at == 0 || source.as_bytes()[at - 1] == b'\n');
-        assert!(starts_a_line, "a directive is not at the start of a line:\n{source}");
+        assert!(
+            starts_a_line,
+            "a directive is not at the start of a line:\n{source}"
+        );
         let mut lines = directive_lines(&source);
         lines.sort();
         lines.dedup();

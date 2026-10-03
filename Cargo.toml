@@ -236,14 +236,9 @@ cfg_aliases = "0.2.2"
 [profile.dev.build-override]
 opt-level = 3
 
-# `pliron-llvm` debug data (D4, option B) and the perf JIT listener are not
-# merged into `pliron` yet. The `cubecl-patch` branch has them on top of the
-# `pliron` revision above. A patch also gives `pliron-spirv` the same `pliron`.
+# `pliron-llvm` debug data (D4, option B) is not merged into `pliron` yet. The
+# `cubecl-patch` branch has it on top of `pliron` `master`. A patch also gives
+# `pliron-spirv` the same `pliron`.
 [patch."https://github.com/pliron-org/pliron.git"]
 pliron = { git = "https://github.com/skewballfox/pliron", rev = "8b27b0e7271b0c84f49f7f8afad6d7fc0c904144" }
 pliron-llvm = { git = "https://github.com/skewballfox/pliron", rev = "8b27b0e7271b0c84f49f7f8afad6d7fc0c904144" }
-
-[patch.crates-io]
-# The Linux bundles of `23.1.0-4` have the perf JIT listener (`jitdump`). This
-# release is not published yet.
-tracel-llvm-bundler = { git = "https://github.com/skewballfox/tracel-llvm", branch = "cubecl-patch" }
