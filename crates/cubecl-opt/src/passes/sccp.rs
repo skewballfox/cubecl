@@ -124,7 +124,12 @@ impl Pass for SCCPPass {
     ) -> Result<PassResult> {
         let mut res = PassResult::default();
         res.ir_changed |= sccp(op, ctx)?;
-        res.ir_changed |= apply_match_rewrite(ctx, &mut Canonicalize, Default::default(), op)?;
+        res.ir_changed |= apply_match_rewrite(
+            ctx,
+            &mut KeepLocation(&mut Canonicalize),
+            Default::default(),
+            op,
+        )?;
         Ok(res)
     }
 }

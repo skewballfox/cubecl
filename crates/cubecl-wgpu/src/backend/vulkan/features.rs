@@ -1,5 +1,8 @@
 use std::{ffi::CStr, ptr::null_mut};
 
+use cubecl_core::ir::settings::DebugInfo;
+use cubecl_server::config::compilation::effective_debug_info;
+
 use tracel_ash::vk::*;
 use wgpu::{Features, hal::vulkan};
 
@@ -35,6 +38,9 @@ pub struct ExtendedFeatures<'a> {
     pub maintenance_8: Option<PhysicalDeviceMaintenance8FeaturesKHR<'a>>,
     pub maintenance_9: Option<PhysicalDeviceMaintenance9FeaturesKHR<'a>>,
     pub long_vector: Option<PhysicalDeviceShaderLongVectorFeaturesEXT<'a>>,
+    /// `VK_KHR_shader_non_semantic_info` has no feature struct. `Some` when the device accepts
+    /// non-semantic instructions. Only a build with kernel debug data requests it.
+    pub non_semantic_info: Option<()>,
 
     // Nvidia
     pub nv_atomic_float_vector: Option<PhysicalDeviceShaderAtomicFloat16VectorFeaturesNV<'a>>,
@@ -123,6 +129,14 @@ impl<'a> ExtendedFeatures<'a> {
             KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_NAME; API_VERSION_1_2 => uniform_standard_layout,
             KHR_SHADER_INTEGER_DOT_PRODUCT_NAME; API_VERSION_1_3 => shader_integer_dot_product,
         );
+
+        if effective_debug_info(DebugInfo::None) != DebugInfo::None {
+            fill_core!(
+                self,
+                phys_caps,
+                KHR_SHADER_NON_SEMANTIC_INFO_NAME; API_VERSION_1_3 => non_semantic_info,
+            );
+        }
 
         fill_opt!(self,
             phys_caps,

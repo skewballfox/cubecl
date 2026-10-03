@@ -170,6 +170,38 @@ impl RuntimeConfig for CubeClRuntimeConfig {
             }
         }
 
+        if let Ok(dir) = std::env::var("CUBECL_DEBUG_PLIRON") {
+            self.compilation.dump_dir = Some(dir.into());
+        }
+
+        if let Some(enabled) = env_bool("CUBECL_TIME_PASSES") {
+            self.compilation.time_passes = enabled;
+        }
+
+        if let Ok(val) = std::env::var("CUBECL_DEBUG_INFO") {
+            use cubecl_ir::settings::DebugInfo;
+
+            match val.as_str() {
+                "none" => self.compilation.debug_info = Some(DebugInfo::None),
+                "line-tables" => self.compilation.debug_info = Some(DebugInfo::LineTables),
+                "full" => self.compilation.debug_info = Some(DebugInfo::Full),
+                _ => {}
+            }
+        }
+
+        if let Ok(val) = std::env::var("CUBECL_SPIRV_DEBUG_FORMAT") {
+            use super::compilation::SpirvDebugFormat;
+
+            match val.as_str() {
+                "auto" => self.compilation.spirv_debug_format = SpirvDebugFormat::Auto,
+                "op-line" => self.compilation.spirv_debug_format = SpirvDebugFormat::OpLine,
+                "non-semantic" => {
+                    self.compilation.spirv_debug_format = SpirvDebugFormat::NonSemantic
+                }
+                _ => {}
+            }
+        }
+
         if let Some(enabled) = env_bool("CUBECL_THROUGHPUT_CACHE") {
             self.throughput.disable_cache = !enabled;
         }

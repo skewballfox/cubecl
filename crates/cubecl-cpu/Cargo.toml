@@ -24,6 +24,8 @@ default = [
     "cubecl-llvm/default",
 ]
 
+debug-info = ["cubecl-llvm/debug-info"]
+jitdump = ["cubecl-llvm/jitdump"]
 pliron-dump = ["cubecl-llvm/pliron-dump"]
 persistence = ["cubecl-server/persistence"]
 std = [

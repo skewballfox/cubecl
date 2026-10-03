@@ -213,8 +213,8 @@ cudarc = { version = "0.19.6", features = [
 # rspirv = { version = "0.15.0", package = "tracel-rspirv" }
 # pliron-spirv = { package = "pliron-spirv", path = "../tracel-rspirv/pliron-spirv" }
 # rspirv = { package = "tracel-rspirv", path = "../tracel-rspirv/rspirv" }
-pliron-spirv = { git = "https://github.com/tracel-ai/tracel-rspirv.git", rev = "77996f97565f9a980d10d8fae9a56a60cb149614" }
-rspirv = { git = "https://github.com/tracel-ai/tracel-rspirv.git", rev = "77996f97565f9a980d10d8fae9a56a60cb149614", package = "tracel-rspirv" }
+pliron-spirv = { git = "https://github.com/tracel-ai/tracel-rspirv.git", rev = "7c597f04c8dca21ad619383ae5f33fa886b2c5d4" }
+rspirv = { git = "https://github.com/tracel-ai/tracel-rspirv.git", rev = "7c597f04c8dca21ad619383ae5f33fa886b2c5d4", package = "tracel-rspirv" }
 rustc_apfloat = "0.2"
 
 # CubeCL-WGPU
@@ -235,3 +235,15 @@ cfg_aliases = "0.2.2"
 
 [profile.dev.build-override]
 opt-level = 3
+
+# `pliron-llvm` debug data (D4, option B) and the perf JIT listener are not
+# merged into `pliron` yet. The `cubecl-patch` branch has them on top of the
+# `pliron` revision above. A patch also gives `pliron-spirv` the same `pliron`.
+[patch."https://github.com/pliron-org/pliron.git"]
+pliron = { git = "https://github.com/skewballfox/pliron", rev = "8b27b0e7271b0c84f49f7f8afad6d7fc0c904144" }
+pliron-llvm = { git = "https://github.com/skewballfox/pliron", rev = "8b27b0e7271b0c84f49f7f8afad6d7fc0c904144" }
+
+[patch.crates-io]
+# The Linux bundles of `23.1.0-4` have the perf JIT listener (`jitdump`). This
+# release is not published yet.
+tracel-llvm-bundler = { git = "https://github.com/skewballfox/tracel-llvm", branch = "cubecl-patch" }

@@ -1007,6 +1007,7 @@ dependencies = [
  "num-traits",
  "paste",
  "pliron",
+ "sanitize-filename",
  "serde",
  "serde_json",
  "tempfile",
@@ -1034,7 +1035,6 @@ dependencies = [
  "num-traits",
  "paste",
  "pliron",
- "sanitize-filename",
  "thiserror 2.0.20",
 ]
 
@@ -1211,6 +1211,7 @@ dependencies = [
  "derive-new",
  "half",
  "llvm-sys",
+ "log",
  "pliron",
  "pliron-llvm",
  "thiserror 2.0.20",
@@ -1389,10 +1390,10 @@ dependencies = [
  "half",
  "hashbrown 0.17.1",
  "itertools 0.15.0",
+ "log",
  "paste",
  "pliron",
  "pliron-spirv",
- "sanitize-filename",
  "serde",
  "tracel-rspirv",
 ]
@@ -1444,7 +1445,6 @@ dependencies = [
  "paste",
  "pliron",
  "renderdoc",
- "sanitize-filename",
  "test-log",
  "thiserror 2.0.20",
  "tracel-ash",
@@ -3659,7 +3659,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 [[package]]
 name = "pliron"
 version = "0.18.0"
-source = "git+https://github.com/pliron-org/pliron.git?rev=81155d96b8797d149de1d88219c431a68a75ef33#81155d96b8797d149de1d88219c431a68a75ef33"
+source = "git+https://github.com/skewballfox/pliron?rev=8b27b0e7271b0c84f49f7f8afad6d7fc0c904144#8b27b0e7271b0c84f49f7f8afad6d7fc0c904144"
 dependencies = [
  "awint",
  "combine",
@@ -3686,7 +3686,7 @@ dependencies = [
 [[package]]
 name = "pliron-derive"
 version = "0.18.0"
-source = "git+https://github.com/pliron-org/pliron.git?rev=81155d96b8797d149de1d88219c431a68a75ef33#81155d96b8797d149de1d88219c431a68a75ef33"
+source = "git+https://github.com/skewballfox/pliron?rev=8b27b0e7271b0c84f49f7f8afad6d7fc0c904144#8b27b0e7271b0c84f49f7f8afad6d7fc0c904144"
 dependencies = [
  "combine",
  "convert_case 0.11.0",
@@ -3700,7 +3700,7 @@ dependencies = [
 [[package]]
 name = "pliron-llvm"
 version = "0.18.0"
-source = "git+https://github.com/pliron-org/pliron.git?rev=81155d96b8797d149de1d88219c431a68a75ef33#81155d96b8797d149de1d88219c431a68a75ef33"
+source = "git+https://github.com/skewballfox/pliron?rev=8b27b0e7271b0c84f49f7f8afad6d7fc0c904144#8b27b0e7271b0c84f49f7f8afad6d7fc0c904144"
 dependencies = [
  "bitflags 2.13.1",
  "llvm-sys",
@@ -3712,7 +3712,7 @@ dependencies = [
 [[package]]
 name = "pliron-spirv"
 version = "0.15.0+sdk-1.4.357.0"
-source = "git+https://github.com/tracel-ai/tracel-rspirv.git?rev=77996f97565f9a980d10d8fae9a56a60cb149614#77996f97565f9a980d10d8fae9a56a60cb149614"
+source = "git+https://github.com/tracel-ai/tracel-rspirv.git?rev=7c597f04c8dca21ad619383ae5f33fa886b2c5d4#7c597f04c8dca21ad619383ae5f33fa886b2c5d4"
 dependencies = [
  "derive-new",
  "derive_more",
@@ -4770,7 +4770,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -5124,9 +5124,8 @@ dependencies = [
 
 [[package]]
 name = "tracel-llvm-bundler"
-version = "23.1.0-3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b92bf4d931518615c8de15c52954d1cf7bd0e4d4d07f4cfe63146e10c0963960"
+version = "23.1.0-4"
+source = "git+https://github.com/skewballfox/tracel-llvm?branch=cubecl-patch#d6d9146ed7ad2ba557a6df14e195c3e313dc6c24"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5145,7 +5144,7 @@ dependencies = [
 [[package]]
 name = "tracel-rspirv"
 version = "0.15.0+sdk-1.4.357.0"
-source = "git+https://github.com/tracel-ai/tracel-rspirv.git?rev=77996f97565f9a980d10d8fae9a56a60cb149614#77996f97565f9a980d10d8fae9a56a60cb149614"
+source = "git+https://github.com/tracel-ai/tracel-rspirv.git?rev=7c597f04c8dca21ad619383ae5f33fa886b2c5d4#7c597f04c8dca21ad619383ae5f33fa886b2c5d4"
 dependencies = [
  "bitflags 2.13.1",
  "pliron",

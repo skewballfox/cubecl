@@ -17,8 +17,7 @@ use crate::{
     },
     prelude::{
         AnalysisManager, Context, ContextExt, CtxTarget, FuncOp, LlvmTarget, ModuleOp,
-        NestedOpsPass, Op, OpPass, Operation, PMConfig, Pass, Passes, Printable, Ptr,
-        TargetLowering,
+        NestedOpsPass, Op, OpPass, Operation, Pass, Passes, Printable, Ptr, TargetLowering,
     },
     shared::{
         branch::SCFToLlvmCf,
@@ -33,7 +32,13 @@ use core::cell::RefCell;
 use cubecl_core::ir::nvidia::SmArch;
 use cubecl_core::{
     Compiler,
-    ir::{amd::GfxArch, dialect::scf::BranchToSCFPass, metadata::Info, rewrite::SimplifyOpsPass},
+    codegen::KernelDump,
+    ir::{
+        amd::GfxArch,
+        dialect::scf::BranchToSCFPass,
+        metadata::Info,
+        rewrite::{InheritLocationPass, SimplifyOpsPass},
+    },
     post_processing::{
         bitwise::PromoteBitwisePass,
         minifloat::{LowerMinifloatCastPass, LowerMinifloatComparePass},
@@ -56,8 +61,6 @@ use pliron::{
 };
 use pliron_llvm::builtin_to_llvm::builtin_to_llvm_pass;
 use std::rc::Rc;
-#[cfg(feature = "pliron-dump")]
-use std::{path::PathBuf, str::FromStr};
 
 #[derive(Clone, Debug, Default)]
 pub struct PlironCompiler {
@@ -249,31 +252,16 @@ impl PlironCompiler {
         kernel: KernelDefinition,
         options: &PlironOptions,
     ) -> Result<PlironEngine, CompilationError> {
-        let module = kernel.body.state().module;
-        let module_op = module.get_operation();
-        let ir = KernelIr::of(&kernel);
-        let mut ctx = kernel.body.into_context().expect("Should be owned scope");
-
-        ctx.set_target(LlvmTarget::Cpu);
-        let alignment = options.cpu_buffer_alignment.unwrap_or(1);
-        assert!(alignment.is_power_of_two());
-        ctx.set_aux_ty(crate::target::CpuBufferAlignment(alignment));
-        ctx.set_grid_constants(false);
-
-        let needs_parallelism = kernel.settings.cube_dim.num_elems() > 1
-            && (uses_cube_barrier(&ctx, module_op) || declares_shared_memory(&ctx, module_op));
-        let shared_memories = Rc::new(RefCell::new(SharedMemories::default()));
-
-        let lowering = CpuLowering::new(shared_memories.clone(), options.f16_evaluation);
-        let io = lower(&mut ctx, &ir, &lowering)?;
-
-        let requirements = KernelRequirements {
-            needs_parallelism,
-            shared_memories: shared_memories.take(),
-        };
-
-        PlironEngine::compile(&ctx, module, &kernel.settings.kernel_name, requirements, io)
-            .map_err(|err| generic(format!("converting to LLVM IR: {err}")))
+        let lowered = lower_cpu(kernel, options)?;
+        PlironEngine::compile_with_debug_info(
+            &lowered.ctx,
+            lowered.module,
+            &lowered.kernel_name,
+            lowered.requirements,
+            lowered.io,
+            lowered.debug_info,
+        )
+        .map_err(|err| generic(format!("converting to LLVM IR: {err}")))
     }
 
     #[cfg(feature = "amdgpu")]
@@ -313,6 +301,7 @@ impl PlironCompiler {
                 shared_memory_size,
                 io,
             },
+            kernel.settings.debug_info,
         )
         .map_err(|err| {
             generic(format!(
@@ -366,6 +355,7 @@ impl PlironCompiler {
                 io,
                 metadata,
             },
+            kernel.settings.debug_info,
         )
         .map_err(|err| {
             generic(format!(
@@ -381,7 +371,6 @@ struct KernelIr {
     module_op: Ptr<Operation>,
     entry_func: FuncOp,
     info: Info,
-    #[cfg_attr(not(feature = "pliron-dump"), allow(dead_code))]
     name: String,
 }
 
@@ -397,6 +386,53 @@ impl KernelIr {
     }
 }
 
+/// A kernel lowered to the LLVM dialect for the CPU target.
+pub(crate) struct LoweredCpu {
+    pub ctx: Context,
+    pub module: ModuleOp,
+    pub kernel_name: String,
+    pub requirements: KernelRequirements,
+    pub io: Vec<BufferIOAttr>,
+    pub debug_info: cubecl_core::ir::settings::DebugInfo,
+}
+
+pub(crate) fn lower_cpu(
+    kernel: KernelDefinition,
+    options: &PlironOptions,
+) -> Result<LoweredCpu, CompilationError> {
+    let module = kernel.body.state().module;
+    let module_op = module.get_operation();
+    let ir = KernelIr::of(&kernel);
+    let mut ctx = kernel.body.into_context().expect("Should be owned scope");
+
+    ctx.set_target(LlvmTarget::Cpu);
+    let alignment = options.cpu_buffer_alignment.unwrap_or(1);
+    assert!(alignment.is_power_of_two());
+    ctx.set_aux_ty(crate::target::CpuBufferAlignment(alignment));
+    ctx.set_grid_constants(false);
+
+    let needs_parallelism = kernel.settings.cube_dim.num_elems() > 1
+        && (uses_cube_barrier(&ctx, module_op) || declares_shared_memory(&ctx, module_op));
+    let shared_memories = Rc::new(RefCell::new(SharedMemories::default()));
+
+    let lowering = CpuLowering::new(shared_memories.clone(), options.f16_evaluation);
+    let io = lower(&mut ctx, &ir, &lowering)?;
+
+    let requirements = KernelRequirements {
+        needs_parallelism,
+        shared_memories: shared_memories.take(),
+    };
+
+    Ok(LoweredCpu {
+        ctx,
+        module,
+        kernel_name: kernel.settings.kernel_name,
+        requirements,
+        io,
+        debug_info: kernel.settings.debug_info,
+    })
+}
+
 fn lower(
     ctx: &mut Context,
     kernel: &KernelIr,
@@ -404,18 +440,8 @@ fn lower(
 ) -> Result<Vec<BufferIOAttr>, CompilationError> {
     let (module_op, entry_func) = (kernel.module_op, kernel.entry_func);
 
-    #[cfg(not(feature = "pliron-dump"))]
-    let ir_printing_dir = None;
-    #[cfg(feature = "pliron-dump")]
-    let ir_printing_dir = pliron_path(&kernel.name);
-    let config = PMConfig {
-        print_after_all: true,
-        ir_printing_dir,
-        ..Default::default()
-    };
-
     let mut analyses = AnalysisManager::default();
-    analyses.set_config(config);
+    analyses.set_config(KernelDump::new(&kernel.name).pass_config());
 
     let mut func_passes = OpPass::<FuncOp, Passes>::default();
     target.prologue(&mut func_passes);
@@ -455,6 +481,8 @@ fn lower(
     let mut passes = OpPass::<ModuleOp, Passes>::default();
     passes.add_pass(NestedOpsPass::new(lowering_passes));
     passes.add_pass(builtin_to_llvm_pass());
+    // Last, for the ops that pliron's own passes insert without a location.
+    passes.add_pass(InheritLocationPass);
     run(&mut passes, module_op, ctx, &mut analyses)?;
 
     verify_operation(module_op, ctx).map_err(|err| {
@@ -483,17 +511,5 @@ fn generic(reason: String) -> CompilationError {
     CompilationError::Generic {
         reason,
         backtrace: BackTrace::capture(),
-    }
-}
-
-#[cfg(feature = "pliron-dump")]
-fn pliron_path(name: &str) -> Option<PathBuf> {
-    use std::fs;
-    if let Ok(dir) = std::env::var("CUBECL_DEBUG_PLIRON") {
-        let path = PathBuf::from_str(&dir).unwrap().join(name);
-        let _ = fs::create_dir_all(&path);
-        Some(path)
-    } else {
-        None
     }
 }

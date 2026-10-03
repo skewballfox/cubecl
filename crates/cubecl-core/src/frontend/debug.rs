@@ -1,52 +1,88 @@
 use alloc::{string::String, vec::Vec};
-use cubecl_ir::{dialect::general::PrintfOp, pliron::value::Value};
+use cubecl_ir::{
+    dialect::general::PrintfOp,
+    pliron::{combine::stream::position::SourcePosition, location::Source, value::Value},
+};
 
 use crate::ir::Scope;
 
 use super::CubeDebug;
 
-/// Calls a function and inserts debug symbols if debug is enabled.
-#[track_caller]
+/// Moves the current `#[cube]` function to `line` and `column` until the returned guard drops.
+pub fn debug_span_expand(scope: &Scope, line: u32, column: u32) -> DebugSpan<'_> {
+    let previous = scope
+        .debug_state()
+        .and_then(|debug| debug.set_pos(line, column));
+    DebugSpan { scope, previous }
+}
+
+/// Restores the position that [`debug_span_expand`] replaced.
+pub struct DebugSpan<'a> {
+    scope: &'a Scope,
+    previous: Option<SourcePosition>,
+}
+
+impl Drop for DebugSpan<'_> {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous
+            && let Some(debug) = self.scope.debug_state()
+        {
+            debug.restore_pos(previous);
+        }
+    }
+}
+
+/// Calls a function from `line` and `column` of the current `#[cube]` function.
 pub fn debug_call_expand<C>(
     scope: &Scope,
-    _line: u32,
-    _col: u32,
+    line: u32,
+    column: u32,
     call: impl FnOnce(&Scope) -> C,
 ) -> C {
-    // Save source_loc before the call so it can be restored once the call returns
-    // let source_loc = scope.debug.source_loc.take();
-    // scope.update_span(line, col);
-    // scope.register(NonSemantic::EnterDebugScope);
-    let ret = call(scope);
-    // scope.register(NonSemantic::ExitDebugScope);
-    // *scope.debug.source_loc.borrow_mut() = source_loc;
-    ret
+    let _span = debug_span_expand(scope, line, column);
+    call(scope)
 }
 
-/// Adds source instruction if debug is enabled
-#[track_caller]
-pub fn debug_source_expand(
-    _scope: &Scope,
-    _name: &'static str,
-    _file: &'static str,
-    _source_text: &'static str,
-    _line: u32,
-    _column: u32,
-) {
-    // let file = file.replace("\\", "/");
-    // scope.update_source(CubeFnSource {
-    //     function_name: name.into(),
-    //     file: file.into(),
-    //     source_text: source_text.into(),
-    //     line,
-    //     column,
-    // });
+/// Opens the frame of the `#[cube]` function `name`, defined at `line` and `column` of `file`.
+/// The frame closes when the returned guard drops.
+pub fn debug_source_expand<'a>(
+    scope: &'a Scope,
+    name: &'static str,
+    file: &'static str,
+    source_text: &'static str,
+    line: u32,
+    column: u32,
+) -> DebugFrame<'a> {
+    if scope.debug_state().is_none() {
+        return DebugFrame { scope: None };
+    }
+    let path = file.replace('\\', "/");
+    let file = Source::new_from_file(scope.ctx_mut(), path.clone());
+    if let Some(debug) = scope.debug_state() {
+        debug.add_source(&path, source_text);
+        debug.enter_fn(name, file, line, column);
+    }
+    DebugFrame { scope: Some(scope) }
 }
 
-/// Registers name for an expand if possible
-#[track_caller]
+/// Closes the frame that [`debug_source_expand`] opened.
+pub struct DebugFrame<'a> {
+    scope: Option<&'a Scope>,
+}
+
+impl Drop for DebugFrame<'_> {
+    fn drop(&mut self) {
+        if let Some(debug) = self.scope.and_then(Scope::debug_state) {
+            debug.exit_fn();
+        }
+    }
+}
+
+/// Names the value of variable `name`, when the kernel records debug data.
 pub fn debug_var_expand<E: CubeDebug>(scope: &Scope, name: &'static str, expand: E) -> E {
-    expand.set_debug_name(scope, name);
+    if scope.debug_state().is_some() {
+        expand.set_debug_name(scope, name);
+    }
     expand
 }
 
@@ -92,5 +128,98 @@ pub mod cube_comment {
 
     pub fn expand(scope: &Scope, content: &str) {
         scope.register(&CommentOp::new(scope.ctx_mut(), content.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate as cubecl;
+    use crate::prelude::*;
+    use alloc::vec::Vec;
+    use cubecl_ir::{
+        pliron::{
+            linked_list::ContainsLinkedList,
+            location::{Located, Location},
+        },
+        settings::{DebugInfo, Dim3, ExecutionMode, KernelSettings},
+    };
+
+    const FIRST_LINE: u32 = line!() + 1;
+    #[cube]
+    fn double(x: u32) -> u32 {
+        x + x
+    }
+
+    #[cube]
+    fn quadruple(x: u32) -> u32 {
+        double(x) + double(x)
+    }
+
+    /// Runs `expand` on a new kernel scope and returns the location of each op it inserted.
+    fn locations(
+        debug_info: DebugInfo,
+        expand: impl FnOnce(&Scope, NativeExpand<u32>),
+    ) -> Vec<Location> {
+        let settings =
+            KernelSettings::new(Dim3::new_single(), ExecutionMode::Checked, AddressType::U32)
+                .debug_info(debug_info);
+        let scope = &Scope::root(settings);
+        let x = NativeExpand::<u32>::from_lit(scope, 2);
+        expand(scope, x);
+
+        let ctx = scope.ctx();
+        let block = scope.state().entry_func.get_entry_block(ctx);
+        let ops = block.deref(ctx).iter(ctx).collect::<Vec<_>>();
+        ops.into_iter().map(|op| op.deref(ctx).loc()).collect()
+    }
+
+    #[test]
+    fn ops_get_the_line_of_their_expression() {
+        let named = locations(DebugInfo::LineTables, |scope, x| {
+            double::expand(scope, x);
+        })
+        .into_iter()
+        .filter_map(|loc| match loc {
+            Location::Named { name, child_loc } => Some((name, *child_loc)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+        assert!(!named.is_empty());
+        for (name, loc) in named {
+            assert_eq!(name, "double");
+            let Location::SrcPos { pos, .. } = loc else {
+                panic!("expected a source position, got {loc:?}");
+            };
+            assert!((FIRST_LINE..FIRST_LINE + 4).contains(&(pos.line as u32)));
+        }
+    }
+
+    #[test]
+    fn inlined_calls_keep_their_call_site() {
+        let call_sites = locations(DebugInfo::LineTables, |scope, x| {
+            quadruple::expand(scope, x);
+        })
+        .into_iter()
+        .filter_map(|loc| match loc {
+            Location::CallSite { callee, caller } => Some((*callee, *caller)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+        // Every op of the two `double` calls records that `quadruple` called it.
+        assert!(!call_sites.is_empty());
+        for (callee, caller) in call_sites {
+            assert!(matches!(callee, Location::Named { name, .. } if name == "double"));
+            assert!(matches!(caller, Location::Named { name, .. } if name == "quadruple"));
+        }
+    }
+
+    #[test]
+    fn no_locations_without_debug_info() {
+        let locations = locations(DebugInfo::None, |scope, x| {
+            double::expand(scope, x);
+        });
+        assert!(locations.iter().all(Location::is_unknown));
     }
 }

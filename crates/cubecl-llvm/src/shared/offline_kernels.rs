@@ -1,5 +1,6 @@
 //! Real kernels for the offline tests of both GPU targets: compiled from `#[cube]` without a
 //! device, so a test can assert on the instructions a lowering produces.
+#![cfg_attr(not(any(feature = "amdgpu", feature = "nvptx")), allow(dead_code))]
 
 use cubecl_core as cubecl;
 use cubecl_core::ir::{
