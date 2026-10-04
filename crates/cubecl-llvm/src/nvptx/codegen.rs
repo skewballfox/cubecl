@@ -25,7 +25,7 @@ use cubecl_core::{
 };
 use llvm_sys::target_machine::{LLVMCodeGenFileType, LLVMRelocMode};
 use pliron_llvm::llvm_sys::core::LLVMContext;
-use std::{ffi::CStr, sync::Once};
+use std::{ffi::CStr, fmt::Write, sync::Once};
 
 const TRIPLE: &CStr = c"nvptx64-nvidia-cuda";
 
@@ -100,7 +100,8 @@ pub fn emit_ptx(
     let converted =
         convert_module(ctx, &llvm_ctx, module, debug_info, false).map_err(|err| err.to_string())?;
 
-    let module = LlvmModule::new(&directives_only(converted.to_string(), debug_info))?;
+    let ir = name_inlined_functions(directives_only(converted.to_string(), debug_info));
+    let module = LlvmModule::new(&ir)?;
     check_debug_info(&module, entrypoint, debug_info);
     finalize(&module, entrypoint, arch, &entry)?;
     let ir = module.print();
@@ -130,6 +131,36 @@ fn directives_only(ir: String, level: DebugInfo) -> String {
         DebugInfo::Full => "emissionKind: FullDebug",
     };
     ir.replace(kind, "emissionKind: DebugDirectivesOnly")
+}
+
+/// `ir` with a linkage name on each `DISubprogram` that has none: the inlined `#[cube]`
+/// functions. NVPTX gives each `.loc` with `inlined_at` the linkage name of its function as
+/// `function_name`, and `ptxas` copies it to the cubin. Without a linkage name, the name is
+/// empty, and the inline frames in Nsight Compute have no name. The linkage name is the name,
+/// because an inlined function has no symbol.
+fn name_inlined_functions(ir: String) -> String {
+    const NAME: &str = "DISubprogram(name: \"";
+    if !ir.contains(NAME) {
+        return ir;
+    }
+    let mut named = String::with_capacity(ir.len());
+    for line in ir.split_inclusive('\n') {
+        // The end of `name: "<name>"`, and the name.
+        let name = line.find(NAME).and_then(|start| {
+            let start = start + NAME.len();
+            let len = line[start..].find('"')?;
+            Some((start + len + 1, &line[start..start + len]))
+        });
+        match name {
+            Some((end, name)) if !line.contains("linkageName:") => {
+                named.push_str(&line[..end]);
+                let _ = write!(named, ", linkageName: \"{name}\"");
+                named.push_str(&line[end..]);
+            }
+            _ => named.push_str(line),
+        }
+    }
+    named
 }
 
 /// Stamps the target and the entry point's calling convention and attributes on `module`.
@@ -288,6 +319,21 @@ entry:
         assert!(
             ptx.contains(".version 9.3"),
             "an unknown version is ignored, not refused:\n{ptx}"
+        );
+    }
+
+    #[test]
+    fn inlined_functions_get_their_name_as_linkage_name() {
+        let ir = concat!(
+            "!4 = distinct !DISubprogram(name: \"k\", linkageName: \"k_1f\", scope: !1)\n",
+            "!13 = distinct !DISubprogram(name: \"inner\", scope: !1, file: !1)\n",
+        );
+        assert_eq!(
+            name_inlined_functions(ir.to_string()),
+            concat!(
+                "!4 = distinct !DISubprogram(name: \"k\", linkageName: \"k_1f\", scope: !1)\n",
+                "!13 = distinct !DISubprogram(name: \"inner\", linkageName: \"inner\", scope: !1, file: !1)\n",
+            )
         );
     }
 

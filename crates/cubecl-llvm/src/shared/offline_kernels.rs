@@ -159,3 +159,38 @@ pub(crate) fn strided_walk_kernel() -> impl CubeKernel {
         (),
     )
 }
+
+#[cube]
+fn square_third(x: f32) -> f32 {
+    let y = x * x;
+    y / 3.0
+}
+
+#[cube]
+fn doubled(x: f32) -> f32 {
+    square_third(x) * 2.0
+}
+
+#[cube(launch)]
+fn nested_calls(input: &[f32], output: &mut [f32]) {
+    if ABSOLUTE_POS < input.len() {
+        output[ABSOLUTE_POS] = doubled(input[ABSOLUTE_POS]);
+    }
+}
+
+/// `nested_calls → doubled → square_third` at `level`: two inlined `#[cube]` functions.
+pub(crate) fn nested_calls_kernel(level: DebugInfo) -> impl CubeKernel {
+    let settings = KernelSettings::new(
+        *CubeDim::new_1d(64),
+        ExecutionMode::Checked,
+        AddressType::U32,
+    )
+    .debug_info(level);
+    nested_calls::NestedCalls::new(
+        settings,
+        device_properties(32),
+        Arc::new(TargetProperties::default()),
+        BufferCompilationArg { inplace: None },
+        BufferCompilationArg { inplace: None },
+    )
+}

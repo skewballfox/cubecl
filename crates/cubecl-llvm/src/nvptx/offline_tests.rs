@@ -1,13 +1,13 @@
 //! Real kernels compiled to PTX without a device, checked on the assembly.
 
 use crate::shared::offline_kernels::{
-    keep_largest_kernel, plane_moves_kernel, scale_kernel, scale_with_source_kernel,
-    strided_walk_kernel,
+    keep_largest_kernel, nested_calls_kernel, plane_moves_kernel, scale_kernel,
+    scale_with_source_kernel, strided_walk_kernel,
 };
 use crate::target::LlvmTarget;
 use crate::{PlironArtifact, PlironCompiler, PlironOptions, nvptx::ptx_version::PtxVersion};
 use cubecl_core::Compiler;
-use cubecl_core::ir::{AddressType, nvidia::SmArch};
+use cubecl_core::ir::{AddressType, nvidia::SmArch, settings::DebugInfo};
 use cubecl_runtime::kernel::CubeKernel;
 use std::ffi::CStr;
 
@@ -89,6 +89,50 @@ fn full_debug_info_embeds_no_source_text() {
             .all(|line| !line.contains(" source ")),
         "{ptx}"
     );
+}
+
+/// Each inlined `#[cube]` function is a `.loc` with `inlined_at` and the name of the function.
+/// `ptxas` copies the name to the cubin, and Nsight Compute shows it in the inline frames.
+#[test]
+fn inlined_functions_are_named_inline_frames() {
+    let ptx = ptx_of(nested_calls_kernel(DebugInfo::LineTables), 60);
+    let labels: Vec<&str> = ptx
+        .lines()
+        .filter_map(|line| line.split_once("function_name ")?.1.split_once(','))
+        .map(|(label, _)| label)
+        .collect();
+    assert!(!labels.is_empty(), "no inline frame:\n{ptx}");
+    for name in ["doubled", "square_third"] {
+        let label = ptx_string_label(&ptx, name).unwrap_or_else(|| panic!("no `{name}`:\n{ptx}"));
+        assert!(
+            labels.contains(&label.as_str()),
+            "`{name}` is not a frame:\n{ptx}"
+        );
+    }
+}
+
+/// The label of the `.debug_str` string `text` in `ptx`. NVPTX writes each string as one
+/// `.b8` line for each byte, after its label.
+fn ptx_string_label(ptx: &str, text: &str) -> Option<String> {
+    let mut lines = ptx.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some(label) = line.strip_suffix(':') else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        while let Some(byte) = lines
+            .peek()
+            .and_then(|line| line.trim_start().strip_prefix(".b8 "))
+            .and_then(|rest| rest.split_whitespace().next()?.parse::<u8>().ok())
+        {
+            bytes.push(byte);
+            lines.next();
+        }
+        if bytes.last() == Some(&0) && bytes[..bytes.len() - 1] == *text.as_bytes() {
+            return Some(label.to_string());
+        }
+    }
+    None
 }
 
 /// The PTX `kernel` compiles to for `sm_{arch}`.
