@@ -3659,13 +3659,13 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 [[package]]
 name = "pliron"
 version = "0.18.0"
-source = "git+https://github.com/skewballfox/pliron?rev=8b27b0e7271b0c84f49f7f8afad6d7fc0c904144#8b27b0e7271b0c84f49f7f8afad6d7fc0c904144"
+source = "git+https://github.com/skewballfox/pliron?rev=bb5544bd4494617081a8e287b17fac0a4950dbe6#bb5544bd4494617081a8e287b17fac0a4950dbe6"
 dependencies = [
  "awint",
  "combine",
  "downcast-rs",
  "dyn-clone",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
  "hi_sparse_bitset",
  "indexmap",
  "inventory",
@@ -3686,7 +3686,7 @@ dependencies = [
 [[package]]
 name = "pliron-derive"
 version = "0.18.0"
-source = "git+https://github.com/skewballfox/pliron?rev=8b27b0e7271b0c84f49f7f8afad6d7fc0c904144#8b27b0e7271b0c84f49f7f8afad6d7fc0c904144"
+source = "git+https://github.com/skewballfox/pliron?rev=bb5544bd4494617081a8e287b17fac0a4950dbe6#bb5544bd4494617081a8e287b17fac0a4950dbe6"
 dependencies = [
  "combine",
  "convert_case 0.11.0",
@@ -3700,7 +3700,7 @@ dependencies = [
 [[package]]
 name = "pliron-llvm"
 version = "0.18.0"
-source = "git+https://github.com/skewballfox/pliron?rev=8b27b0e7271b0c84f49f7f8afad6d7fc0c904144#8b27b0e7271b0c84f49f7f8afad6d7fc0c904144"
+source = "git+https://github.com/skewballfox/pliron?rev=bb5544bd4494617081a8e287b17fac0a4950dbe6#bb5544bd4494617081a8e287b17fac0a4950dbe6"
 dependencies = [
  "bitflags 2.13.1",
  "llvm-sys",
@@ -4770,7 +4770,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",

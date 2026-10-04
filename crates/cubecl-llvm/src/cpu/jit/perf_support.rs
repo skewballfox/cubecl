@@ -1,7 +1,7 @@
 //! The perf support plugin of ORC, through the C++ shim `cpu/cpp_shims/perf_support.cpp`.
 //!
-//! The LLVM C API has no binding for the plugin. This module is the only user of the shim. If
-//! `pliron-llvm` gets the binding, replace the body of this module with a re-export of it.
+//! The LLVM C API has no binding for the plugin, and `pliron-llvm` does not add one. This module
+//! is the only user of the shim.
 
 use crate::shared::llvm_module::error_message;
 use llvm_sys::{error::LLVMErrorRef, orc2::lljit::LLVMOrcLLJITRef};
