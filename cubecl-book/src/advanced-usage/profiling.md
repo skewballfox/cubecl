@@ -17,9 +17,12 @@ inherits = "release"
 debug = "line-tables-only"
 ```
 
-Then each kernel has line tables. Each inlined `#[cube]` function is a frame of its own, so a
-flamegraph shows the call chain inside a kernel. Line tables do not change the machine code.
-They add only compile time.
+Then each kernel has line tables. Line tables do not change the machine code. They add only
+compile time.
+
+In gdb, each inlined `#[cube]` function is a frame of its own, so a backtrace shows the call chain
+inside a kernel. `perf` and `samply` show a kernel as one frame. The perf jitdump gives them the
+source line of each sample, but it has no inlined frames.
 
 If you override the profile for one package, put the same override on `cubecl-runtime`. CubeCL
 reads the `debug` value of `cubecl-runtime`.
@@ -42,7 +45,7 @@ you must ask for them at run time with `CUBECL_JIT_SYMBOLS`:
   `perf report`, `perf script` and `samply` read it with no extra step.
 - The **perf jitdump** (`jit-<pid>.dump` in a directory under `$JITDUMPDIR/.debug/jit`, or under
   `~/.debug/jit`) also gives the source lines and the unwind data of each kernel.
-  `perf inject --jit` reads it. It needs the `jitdump` feature and Linux:
+  `perf inject --jit` and `samply` read it. It needs the `jitdump` feature and Linux:
 
   ```toml
   cubecl = { version = "...", features = ["cpu", "jitdump"] }
@@ -50,8 +53,13 @@ you must ask for them at run time with `CUBECL_JIT_SYMBOLS`:
 
   Without the feature, CubeCL logs one warning and writes only the perf map.
 
-If `CUBECL_JIT_SYMBOLS` is not set, CubeCL reads `DOTNET_PerfMapEnabled`, which `samply` sets:
-`1` gives both files, `2` the jitdump, and `3` the perf map.
+If `CUBECL_JIT_SYMBOLS` is not set, CubeCL reads `DOTNET_PerfMapEnabled`, the .NET variable for
+the same files: `1` gives both files, `2` the jitdump, and `3` the perf map.
+
+perf 5.8 and later put the line addresses of a jitdump in a different place than older perf. When
+CubeCL writes the jitdump, it runs `perf --version` one time to select the layout. If `perf` is not
+on the `PATH`, CubeCL uses the layout of perf 5.8. Run `perf inject` with the same perf, or with
+perf 5.8 or later.
 
 A kernel without debug data writes no symbols.
 
@@ -62,8 +70,13 @@ A kernel without debug data writes no symbols.
 
 ## Commands
 
-`cargo flamegraph` does not run `perf inject --jit`, so it uses the perf map. It must record with
-frame pointers, because `perf` cannot unwind JIT code with DWARF before `perf inject`:
+`perf` cannot unwind JIT code with DWARF. The jitdump has the unwind data, but `perf` uses it only
+for files with a path that starts with `/tmp/jitted-`. `perf inject` writes its files next to the
+jitdump, in `.debug/jit`. Thus record with frame pointers (`--call-graph fp`) for all `perf`
+commands.
+
+`cargo flamegraph` does not run `perf inject --jit`, so it uses the perf map. It names each kernel,
+but it gives no source lines in the kernel:
 
 ```sh
 RUSTFLAGS="-C force-frame-pointers=yes" CUBECL_JIT_SYMBOLS=perf \
@@ -73,16 +86,32 @@ RUSTFLAGS="-C force-frame-pointers=yes" CUBECL_JIT_SYMBOLS=perf \
 `perf` with the jitdump gives source lines in JIT code:
 
 ```sh
-cargo build --profile profiling --features jitdump
-CUBECL_JIT_SYMBOLS=perf perf record -k 1 --call-graph dwarf ./target/profiling/app
+RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling --features jitdump
+CUBECL_JIT_SYMBOLS=perf perf record -k 1 --call-graph fp ./target/profiling/app
 perf inject --jit -i perf.data -o perf.jit.data
-perf report -i perf.jit.data
+perf report -i perf.jit.data --sort sym,srcline
 ```
 
-`samply` sets `DOTNET_PerfMapEnabled`, so it needs no other setting:
+The same data makes a flamegraph with [inferno](https://github.com/jonhoo/inferno):
 
 ```sh
-samply record ./target/profiling/app
+perf script -i perf.jit.data | inferno-collapse-perf | inferno-flamegraph > flamegraph.svg
+```
+
+Some `perf` builds read the source lines with libdw or LLVM. These libraries cannot read the line
+table in the files that `perf inject` writes, and `perf report` then shows `<kernel>+<offset>` in
+place of a line. To use `addr2line` of binutils, set the style in `~/.perfconfig`:
+
+```ini
+[addr2line]
+    style = addr2line
+```
+
+`samply` reads the perf map and the jitdump. It asks for the jitdump only with its .NET option
+(`--coreclr`), so set `CUBECL_JIT_SYMBOLS`:
+
+```sh
+CUBECL_JIT_SYMBOLS=perf samply record ./target/profiling/app
 ```
 
 gdb and lldb see each kernel through the GDB JIT interface. This is automatic when the kernel has
