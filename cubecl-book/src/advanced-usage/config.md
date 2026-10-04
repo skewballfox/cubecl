@@ -237,6 +237,9 @@ CubeCL supports several environment variables to override configuration at runti
 - `CUBECL_JIT_SYMBOLS`: The profiler symbol files of the `cpu` runtime (see
   [Profiling Kernels](./profiling.md)).
   - `"perf"`, `"perfmap"`, `"jitdump"`
+- `CUBECL_SOURCE_ROOT`: The directory that the relative paths of the kernel source files start
+  from (see [Profiling Kernels](./profiling.md#source-files)). CubeCL searches it first, then the
+  working directory and its parents.
 - `CUBECL_ENVIRONMENT`: Sets `environment.name`, the environment to activate.
 - `CUBECL_ENVIRONMENT_RECORDS`: Sets `environment.records.level`, how much the
   environment records of its own build.

@@ -4,7 +4,8 @@ CubeCL gives kernel debug data to the usual profilers and debuggers: `perf`, `sa
 `cargo flamegraph` and gdb. It uses only open formats: DWARF, the perf jitdump, the perf map and
 the GDB JIT interface. CubeCL adds no profiler of its own.
 
-At this time, only the `cpu` runtime gives kernel source lines to these tools.
+The `cpu` runtime gives kernel source lines to these tools. The `cuda` runtime gives them to the
+NVIDIA tools (see [CUDA](#cuda)).
 
 ## Enable Debug Data
 
@@ -29,6 +30,19 @@ reads the `debug` value of `cubecl-runtime`.
 
 To remove the debug data from a build that has it, set `CUBECL_DEBUG_INFO=none` (see
 [Configuration](./config.md)).
+
+## Source Files
+
+The kernel debug data has the path of each source file that `file!()` gives. This path is relative
+to the directory where cargo compiled the crate, usually the workspace root. The binary keeps only
+the relative path, so `--remap-path-prefix` and cargo `trim-paths` apply to it.
+
+When a kernel compiles, CubeCL looks for each file. It searches `CUBECL_SOURCE_ROOT`, then the
+working directory and its parents. It puts the first directory that has the file into the kernel
+debug data. Then a debugger or a profiler opens the file from any directory. With `Full` debug
+data, the file must also have the text that the kernel was compiled from.
+
+If you run the binary outside of its source tree, set `CUBECL_SOURCE_ROOT` to the workspace root.
 
 ## Profiler Symbol Files
 
@@ -117,6 +131,18 @@ CUBECL_JIT_SYMBOLS=perf samply record ./target/profiling/app
 gdb and lldb see each kernel through the GDB JIT interface. This is automatic when the kernel has
 debug data, and it writes no files. A breakpoint in a `#[cube]` function or an interrupt shows the
 kernel frames with their source lines.
+
+## CUDA
+
+The `cuda` runtime with the LLVM compiler gives the PTX of each kernel a `.loc` directive for each
+source line. CubeCL loads the PTX with `CU_JIT_GENERATE_LINE_INFO`. Thus the machine code (SASS)
+has the line table. Each inlined `#[cube]` function is an inline frame with its name. The
+optimization level does not change.
+
+The PTX cannot contain the source text, because `ptxas` does not accept it. Thus the tools read the
+source from the file (see [Source Files](#source-files)).
+
+The NVRTC compiler (C++) gives the source lines through `#line` directives, but no inline frames.
 
 ## Worker Threads
 

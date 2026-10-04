@@ -52,3 +52,5 @@ The type is `HMap`, not `BTreeMap` as in `pliron-spirv`. `pliron` does not use `
 ## 4. Not in this follow-up
 
 The compile directory (`DebugInfoOptions::directory`) is still not set. §6 step 5 gives the reason: a proc macro cannot see `--remap-path-prefix` or `trim-paths`.
+
+**Update:** [`45d48d0`](https://github.com/skewballfox/cubecl/commit/45d48d0e8da8f5b7b1b40d3ff80f283ddef00574) sets the compile directory when a kernel compiles, not in the macro ([cuda-parity.md §3](cuda-parity.md#3-the-compile-directory)).
