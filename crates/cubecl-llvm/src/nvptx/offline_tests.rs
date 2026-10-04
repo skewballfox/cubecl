@@ -91,6 +91,24 @@ fn full_debug_info_embeds_no_source_text() {
     );
 }
 
+/// `ptxas` cannot take the source text, so the `.file` directive gives the absolute path of the
+/// file on this computer: Nsight Compute and `cuda-gdb` then find it from any directory.
+#[test]
+fn the_file_directive_is_the_absolute_path() {
+    let ptx = ptx_of(nested_calls_kernel(DebugInfo::LineTables), 60);
+    let path = ptx
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix(".file\t1 \""))
+        .and_then(|rest| rest.split_once('"'))
+        .map_or_else(|| panic!("no `.file 1`:\n{ptx}"), |(path, _)| path);
+    assert!(
+        path.ends_with("crates/cubecl-llvm/src/shared/offline_kernels.rs"),
+        "{path}"
+    );
+    assert!(std::path::Path::new(path).is_absolute(), "{path}");
+    assert!(std::path::Path::new(path).is_file(), "{path}");
+}
+
 /// Each inlined `#[cube]` function is a `.loc` with `inlined_at` and the name of the function.
 /// `ptxas` copies the name to the cubin, and Nsight Compute shows it in the inline frames.
 #[test]

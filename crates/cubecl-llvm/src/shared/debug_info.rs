@@ -3,7 +3,10 @@
 //! `pliron-llvm` converts the `Location` of each op to a `!dbg` location: one `DISubprogram` for
 //! each function, and one for each inlined `#[cube]` function.
 
-use crate::{prelude::*, shared::llvm_module::LlvmModule};
+use crate::{
+    prelude::*,
+    shared::{llvm_module::LlvmModule, source_root::source_root},
+};
 use core::fmt::Write;
 use cubecl_core::ir::{ContextExt, debug::DebugState, settings::DebugInfo};
 use md5::{Digest, Md5};
@@ -14,11 +17,18 @@ use pliron_llvm::{
     llvm_sys::core::{LLVMContext, LLVMModule},
     to_llvm_ir,
 };
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock, PoisonError},
+};
 
 /// Converts `module` to LLVM IR, with the debug data of `level`.
 ///
 /// At `Full`, the `DIFile` of each file embeds its source text if `embed_source` is set. NVPTX
 /// must not set it: `ptxas` rejects the `.file` directive with a source text.
+///
+/// The compile directory is the directory that has the relative source files on this computer,
+/// if one does ([`source_root`]). At `Full`, the file must have the compiled text.
 pub(crate) fn convert_module(
     ctx: &Context,
     llvm_ctx: &LLVMContext,
@@ -37,20 +47,31 @@ pub(crate) fn convert_module(
     options.language = LLVMDWARFSourceLanguage::LLVMDWARFSourceLanguageRust;
     options.producer = "cubecl".to_string();
     options.optimized = true;
+    let Some(debug) = ctx.try_aux_ty::<DebugState>() else {
+        return to_llvm_ir::convert_module_with_debug_info(ctx, llvm_ctx, module, options);
+    };
     // Only `Full` has the source text, as the macro records it only then.
-    if level == DebugInfo::Full
-        && embed_source
-        && let Some(debug) = ctx.try_aux_ty::<DebugState>()
-        && !debug.sources().is_empty()
-    {
+    let md5s: HashMap<&str, Arc<str>> = match level {
+        DebugInfo::Full => debug
+            .sources()
+            .iter()
+            .map(|(path, text)| (path.as_str(), source_md5(text)))
+            .collect(),
+        _ => HashMap::new(),
+    };
+    let files = debug
+        .files()
+        .iter()
+        .map(|path| (path.as_str(), md5s.get(path.as_str()).map(AsRef::as_ref)));
+    if let Some(root) = source_root(files) {
+        options.directory = root;
+    }
+    if embed_source && !md5s.is_empty() {
         for (path, text) in debug.sources() {
-            options.source_text.insert(
-                path.clone(),
-                SourceText {
-                    text,
-                    md5: md5_hex(text),
-                },
-            );
+            let md5 = md5s[path.as_str()].to_string();
+            options
+                .source_text
+                .insert(path.clone(), SourceText { text, md5 });
         }
         // LLVM writes the source text into the object only with DWARF 5.
         options.dwarf_version = 5;
@@ -58,12 +79,25 @@ pub(crate) fn convert_module(
     to_llvm_ir::convert_module_with_debug_info(ctx, llvm_ctx, module, options)
 }
 
-/// The MD5 of `text`, in lowercase hexadecimal.
+/// The MD5 of the source text `text`, calculated one time for each text in each process.
 ///
-/// It runs for each file of each kernel compiled at `Full`: approximately 25 µs for a text of
-/// 20 KB. If this cost is too high, `cubecl-macros` can calculate the MD5 at build time and give
-/// it to `debug_source_expand` with the text.
-fn md5_hex(text: &str) -> String {
+/// The text is a `&'static str` from `include_str!`, so its address identifies it. One MD5 takes
+/// approximately 25 µs for a text of 20 KB. If the first compile is too slow, `cubecl-macros` can
+/// calculate the MD5 at build time and give it to `debug_source_expand` with the text.
+fn source_md5(text: &'static str) -> Arc<str> {
+    /// The MD5 of each text, by its address and length.
+    type Md5s = HashMap<(usize, usize), Arc<str>>;
+    static MD5S: OnceLock<Mutex<Md5s>> = OnceLock::new();
+    MD5S.get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry((text.as_ptr().addr(), text.len()))
+        .or_insert_with(|| md5_hex(text).into())
+        .clone()
+}
+
+/// The MD5 of `text`, in lowercase hexadecimal.
+pub(crate) fn md5_hex(text: impl AsRef<[u8]>) -> String {
     Md5::digest(text)
         .iter()
         .fold(String::with_capacity(32), |mut hex, byte| {
@@ -278,6 +312,43 @@ mod tests {
         let ir = module.print();
         assert!(!ir.contains("source: \""), "{ir}");
         assert!(ir.contains("!\"Dwarf Version\", i32 4"), "{ir}");
+    }
+
+    /// The directory of a `DIFile` line of `ir`.
+    fn file_directory<'a>(ir: &'a str, file: &str) -> &'a str {
+        let line = ir
+            .lines()
+            .find(|line| line.contains("DIFile(") && line.contains(file))
+            .unwrap_or_else(|| panic!("no `DIFile` of {file}:\n{ir}"));
+        line.split_once("directory: \"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map_or("", |(directory, _)| directory)
+    }
+
+    /// The tests run in the crate directory, and the workspace root, which `file!()` is relative
+    /// to, is a parent. At both levels, the compile directory is that root.
+    #[test]
+    fn the_compile_directory_has_the_source_files() {
+        let full = cpu_ir(&scale_with_source_kernel());
+        let lowered = lowered(DebugInfo::LineTables);
+        let line_tables = to_llvm_module(
+            &lowered.ctx,
+            lowered.module,
+            &lowered.kernel_name,
+            lowered.debug_info,
+        )
+        .unwrap()
+        .print();
+        for (ir, file) in [
+            (&full, "crates/cubecl-llvm/src/shared/offline_kernels.rs"),
+            (&line_tables, "crates/cubecl-llvm/src/shared/debug_info.rs"),
+        ] {
+            let directory = file_directory(ir, file);
+            assert!(
+                std::path::Path::new(directory).join(file).is_file(),
+                "`{directory}` does not have {file}"
+            );
+        }
     }
 
     #[test]

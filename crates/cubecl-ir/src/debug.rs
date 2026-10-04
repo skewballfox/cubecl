@@ -17,7 +17,12 @@
 //! }
 //! ```
 
-use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    vec::Vec,
+};
 use pliron::{
     basic_block::BasicBlock,
     combine::stream::position::SourcePosition,
@@ -41,6 +46,8 @@ pub struct DebugState {
     /// The source text of each file, by the path of its [`Source`]. Only full debug data records
     /// it.
     sources: BTreeMap<String, &'static str>,
+    /// The path of each file, at all levels.
+    files: BTreeSet<String>,
 }
 
 /// One `#[cube]` function on the call stack.
@@ -93,8 +100,12 @@ impl DebugState {
         }
     }
 
-    /// Records `text` as the source text of the file `path`. An empty text records nothing.
+    /// Records the file `path`, and `text` as its source text. An empty text records only the
+    /// path.
     pub fn add_source(&mut self, path: &str, text: &'static str) {
+        if !self.files.contains(path) {
+            self.files.insert(path.into());
+        }
         if !text.is_empty() && !self.sources.contains_key(path) {
             self.sources.insert(path.into(), text);
         }
@@ -104,6 +115,13 @@ impl DebugState {
     /// [`finish`](Self::finish), for the compiler.
     pub fn sources(&self) -> &BTreeMap<String, &'static str> {
         &self.sources
+    }
+
+    /// The path of each file, with or without its source text. It stays after
+    /// [`finish`](Self::finish), for the compiler.
+    #[must_use]
+    pub fn files(&self) -> &BTreeSet<String> {
+        &self.files
     }
 
     /// Stops recording, at the end of kernel expansion. Ops that compiler passes insert later get
