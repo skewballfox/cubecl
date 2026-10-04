@@ -42,7 +42,21 @@ working directory and its parents. It puts the first directory that has the file
 debug data. Then a debugger or a profiler opens the file from any directory. With `Full` debug
 data, the file must also have the text that the kernel was compiled from.
 
+This applies to the LLVM compilers (CPU, CUDA and HIP), to SPIR-V, and to the `#line` directives
+of the C++ compilers.
+
 If you run the binary outside of its source tree, set `CUBECL_SOURCE_ROOT` to the workspace root.
+
+If the source tree is not on the computer, a kernel with `Full` debug data can write its source
+files into a directory that you select:
+
+```sh
+CUBECL_SOURCE_CACHE=~/.cache/cubecl/sources ./app
+```
+
+CubeCL writes the files only when it does not find the source tree, and only for kernels that have
+the source text. Each set of files goes into a subdirectory with a name from the MD5 of the files.
+CubeCL does not remove the files. A kernel with line tables only keeps the relative path.
 
 ## Profiler Symbol Files
 
@@ -142,7 +156,8 @@ optimization level does not change.
 The PTX cannot contain the source text, because `ptxas` does not accept it. Thus the tools read the
 source from the file (see [Source Files](#source-files)).
 
-The NVRTC compiler (C++) gives the source lines through `#line` directives, but no inline frames.
+The NVRTC compiler (C++) gives the source lines through `#line` directives, with the path from the
+same search, but no inline frames.
 
 The example `profiling_kernels` has two kernels with nested `#[cube]` functions. Use it to try the
 commands below. The `dev` profile gives line tables:

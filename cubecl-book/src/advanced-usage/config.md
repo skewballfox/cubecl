@@ -126,6 +126,11 @@ SPIR-V kernel. A kernel without debug data ignores it.
 - `non-semantic`: `NonSemantic.Shader.DebugInfo.100`. Each inlined `#[cube]` function is a
   separate frame. A device without support gets `op-line`.
 
+**Source cache** (`source_cache`): a directory for the source files of kernels with `full` debug
+data. When CubeCL does not find the source tree of a kernel, it writes the source text into this
+directory, and the debug data points to it (see
+[Profiling Kernels](./profiling.md#source-files)). Unset, nothing is written.
+
 **Pass timing** (`time_passes`): log how long each compiler pass takes, at the `info` level. Use
 it to find where kernel compilation time goes.
 
@@ -240,6 +245,7 @@ CubeCL supports several environment variables to override configuration at runti
 - `CUBECL_SOURCE_ROOT`: The directory that the relative paths of the kernel source files start
   from (see [Profiling Kernels](./profiling.md#source-files)). CubeCL searches it first, then the
   working directory and its parents.
+- `CUBECL_SOURCE_CACHE`: Sets `compilation.source_cache` to the given directory.
 - `CUBECL_ENVIRONMENT`: Sets `environment.name`, the environment to activate.
 - `CUBECL_ENVIRONMENT_RECORDS`: Sets `environment.records.level`, how much the
   environment records of its own build.

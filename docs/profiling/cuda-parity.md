@@ -3,7 +3,7 @@
 | Item | Value |
 |---|---|
 | Plan step | [PLAN.md §6, step 9](PLAN.md#6-phase-2-keep-locations-through-passes-and-emit-dwarf-llvm-paths--cpu-and-gpu-done) |
-| Status | Named inline frames: done ([`9da8f0b`](https://github.com/skewballfox/cubecl/commit/9da8f0b36ba23ce9baa4cac68514e8054815130c)). Compile directory: done ([`45d48d0`](https://github.com/skewballfox/cubecl/commit/45d48d0e8da8f5b7b1b40d3ff80f283ddef00574)). Nsight Compute, cuda-gdb and gdb checks: done, with the example [`profiling_kernels`](https://github.com/skewballfox/cubecl/commit/bcbe4e1ea363ca27d6b17fe34de20086a10f9b7a) (§5). |
+| Status | Named inline frames: done ([`9da8f0b`](https://github.com/skewballfox/cubecl/commit/9da8f0b36ba23ce9baa4cac68514e8054815130c)). Compile directory: done ([`45d48d0`](https://github.com/skewballfox/cubecl/commit/45d48d0e8da8f5b7b1b40d3ff80f283ddef00574)). Nsight Compute, cuda-gdb and gdb checks: done, with the example [`profiling_kernels`](https://github.com/skewballfox/cubecl/commit/bcbe4e1ea363ca27d6b17fe34de20086a10f9b7a) (§5). SPIR-V and C++ source directory: done ([`e571785`](https://github.com/skewballfox/cubecl/commit/e571785bcc38441613a619186a3fb7f1e7ff1ced)). Source cache: done ([`f07f139`](https://github.com/skewballfox/cubecl/commit/f07f139cc4edfdf9bfc90d538b97c132b88b90a9)) (§7). |
 | Language | ASD-STE100 / Attempto Controlled English. Domain terms are permitted. |
 
 ## 1. Parity
@@ -16,7 +16,7 @@ The CPU path gives each tool the kernel name, the source lines, the inlined `#[c
 | Source lines | DWARF | `.loc` in the PTX, `CU_JIT_GENERATE_LINE_INFO` | `#line`, `-lineinfo` |
 | Inlined frames, with names | DWARF | `.loc … function_name …, inlined_at …` (this work) | No. The C++ has one function body. |
 | Source text | DWARF 5 at `Full` | No. `ptxas` rejects it. | No |
-| Path that a tool can open | Absolute, at run time (this work) | Absolute, at run time (this work) | Relative (`file!()`) |
+| Path that a tool can open | Absolute, at run time (this work) | Absolute, at run time (this work) | Absolute, at run time (§7) |
 
 ## 2. Inline frames had no name
 
@@ -46,7 +46,7 @@ The CPU path gives each tool the kernel name, the source lines, the inlined `#[c
 
 - A persistent PTX cache entry keeps the directory of the process that wrote it. If the source moves, the tool does not find it. The machine code is the same.
 - At `LineTables`, there is no text, so a changed file is not detected.
-- The SPIR-V path does not use `source_root` yet.
+- The SPIR-V path and the C++ `#line` directives use the search since [`e571785`](https://github.com/skewballfox/cubecl/commit/e571785bcc38441613a619186a3fb7f1e7ff1ced) (§7).
 
 **Checked:** the tests [`the_compile_directory_has_the_source_files`](https://github.com/skewballfox/cubecl/blob/45d48d0e8da8f5b7b1b40d3ff80f283ddef00574/crates/cubecl-llvm/src/shared/debug_info.rs#L317-L352) (CPU IR at `Full` and `LineTables`), [`the_file_directive_is_the_absolute_path`](https://github.com/skewballfox/cubecl/blob/45d48d0e8da8f5b7b1b40d3ff80f283ddef00574/crates/cubecl-llvm/src/nvptx/offline_tests.rs#L94-L110) (NVPTX), and the [`source_root` tests](https://github.com/skewballfox/cubecl/blob/45d48d0e8da8f5b7b1b40d3ff80f283ddef00574/crates/cubecl-llvm/src/shared/source_root.rs#L82-L124). The driver JIT keeps the absolute path in the cubin. Nsight Compute, cuda-gdb and gdb on the CPU find the file (§5).
 
@@ -60,6 +60,10 @@ The CPU path gives each tool the kernel name, the source lines, the inlined `#[c
 ## 5. Checks on the device
 
 **Kernel:** the example [`profiling_kernels`](https://github.com/skewballfox/cubecl/blob/bcbe4e1ea363ca27d6b17fe34de20086a10f9b7a/examples/profiling_kernels/src/main.rs#L9-L32) has two kernels with the chain `kernel → doubled → square_third`. `nested_lines` has line tables from the cargo profile. `nested_full` has `debug_symbols`, thus `Full`. All checks used the `dev` profile. Nsight Compute also ran on a release profile with `debug = "line-tables-only"`, with the same result.
+
+**Nsight Compute user interface:** the report opens in `ncu-ui` 2025.3.1, in a container on a different computer. The two kernels have 16 registers for each thread, thus `Full` does not change the register count. The screenshot shows the Summary page, not the Inline Functions table.
+
+![The Summary page of the report: nested_lines and nested_full, 16 registers each](ncu-summary-nested-lines-vs-full.png)
 
 **Tools:** `ncu` 2025.3.1 and cuda-gdb 13.0, from the NVIDIA CUDA RPM repository for Fedora 42 (`nsight-compute-2025.3.1`, `cuda-gdb-13-0`). `rpmkeys --checksig` accepts both packages with the NVIDIA key `610C7B14…D42D0685`. The packages were unpacked, not installed. The image `nvcr.io/nvidia/cuda` was not used: NVIDIA signs only the manifest list, not the amd64 image, and a policy that requires signatures rejects the image. The driver has `RmProfilingAdminOnly: 0`, thus `ncu` ran without root.
 
@@ -94,4 +98,24 @@ The CPU path gives each tool the kernel name, the source lines, the inlined `#[c
 
 - **The Inline Functions table of the Nsight Compute user interface.** The command line does not show it, and the check had no display.
 - **NVRTC inline frames.** The C++ backend puts all `#[cube]` calls into one function body. Inline frames need a device function for each `#[cube]` function.
-- **Source text in the PTX.** `ptxas` rejects it (step-5-followup.md, fact 2). `ncu --import-source yes` copies the files into the report.
+- **Source text in the PTX.** `ptxas` rejects it (step-5-followup.md, fact 2). `ncu --import-source yes` copies the files into the report. The source cache (§7) gives a file when the source tree is not on the computer.
+
+## 7. Follow-up: the source directory on all paths, and the source cache
+
+**SPIR-V and C++** ([`e571785`](https://github.com/skewballfox/cubecl/commit/e571785bcc38441613a619186a3fb7f1e7ff1ced)): the search moves from `cubecl-llvm` to [`cubecl_runtime::debug_source`](https://github.com/skewballfox/cubecl/blob/e571785bcc38441613a619186a3fb7f1e7ff1ced/crates/cubecl-runtime/src/debug_source.rs#L29-L59), because `cubecl-llvm`, `cubecl-spirv` and `cubecl-cpp` all depend on `cubecl-runtime`. `kernel_source_root` gives the directory for a kernel, and `source_md5s` gives the MD5s of its texts at `Full`.
+
+- The SPIR-V builder sets `DebugInfoOptions::directory` ([`debug_info.rs#L33-L51`](https://github.com/skewballfox/cubecl/blob/e571785bcc38441613a619186a3fb7f1e7ff1ced/crates/cubecl-spirv/src/debug_info.rs#L33-L51)). `pliron-spirv` already joined the directory to each relative path.
+- The C++ `#line` directives join the directory to each relative path ([`branch.rs#L80-L86`](https://github.com/skewballfox/cubecl/blob/e571785bcc38441613a619186a3fb7f1e7ff1ced/crates/cubecl-cpp/src/shared/branch.rs#L80-L86), [`base.rs#L363-L370`](https://github.com/skewballfox/cubecl/blob/e571785bcc38441613a619186a3fb7f1e7ff1ced/crates/cubecl-cpp/src/shared/base.rs#L363-L370)). Thus Nsight Compute finds the file on the NVRTC path too.
+- `md-5` moves to the `std` feature of `cubecl-runtime` (approximately 2 KB). `cubecl-cpp` enables `std` of `cubecl-runtime`, because the crate uses `std` itself.
+- **Checked:** the tests [`the_file_name_is_the_absolute_path`](https://github.com/skewballfox/cubecl/blob/e571785bcc38441613a619186a3fb7f1e7ff1ced/crates/cubecl-spirv/src/debug_info.rs#L242-L258) (SPIR-V) and `source_lines_are_line_directives` (C++, each `#line` has an absolute path to a file that exists).
+
+**Source cache** ([`f07f139`](https://github.com/skewballfox/cubecl/commit/f07f139cc4edfdf9bfc90d538b97c132b88b90a9)): at `Full`, the binary has the text of each file. When the search finds no directory, and `CUBECL_SOURCE_CACHE` (or `compilation.source_cache`) names a directory, [`cached_root`](https://github.com/skewballfox/cubecl/blob/f07f139cc4edfdf9bfc90d538b97c132b88b90a9/crates/cubecl-runtime/src/debug_source.rs#L137-L203) writes the texts to `<cache>/<tree>/<path>`. The debug data gets `<cache>/<tree>`.
+
+- `<tree>` is the MD5 of the paths and the MD5s of the texts. A changed text gets a different directory, and the kernels with the same files share one.
+- A path that leaves its directory (`../k.rs`, `/k.rs`) is not written. Thus the cache writes only under its directory.
+- Each file goes to a temporary file, then `rename`, because other processes can write the same tree. The write occurs one time for each tree in each process.
+- **Decision:** the cache is off by default, because it writes files that stay after the process stops. Without the variable, the cost is one read of the configuration. It adds no dependency, thus it has no cargo feature.
+- **Limits:** only `Full` has texts, so a `LineTables` kernel keeps the relative path. The cache directory is not cleaned. A file that a kernel at `Full` has without its text (a function without `debug_symbols`) is not in the cache.
+- **Checked:** the tests [`the_cache_has_the_texts_under_one_directory` and `the_cache_writes_only_under_itself`](https://github.com/skewballfox/cubecl/blob/f07f139cc4edfdf9bfc90d538b97c132b88b90a9/crates/cubecl-runtime/src/debug_source.rs#L291-L325). On the RTX 4070, from a directory outside the workspace, with `CUBECL_SOURCE_CACHE`: Nsight Compute imports the text of `nested_full` from the cache (1930 bytes), and `nested_lines` keeps the relative path. cuda-gdb stops at `…/<tree>/examples/profiling_kernels/src/main.rs:11 in square_third inlined from main.rs:17`, and `list` shows the source.
+
+**Regression checks:** the `cubecl-cpu` suite (812) passes. The `cubecl-cuda` suite has 746 passes and the same 52 failures as `3afcdce`. The `cubecl-llvm` tests with `nvptx` and `amdgpu` (65) pass: four tests moved to `cubecl-runtime` with the search. The `cubecl-runtime`, `cubecl-cpp` and `cubecl-spirv` tests pass. Clippy with `-W clippy::pedantic` gives no warning on the changed lines.
