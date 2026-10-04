@@ -1,7 +1,8 @@
 //! Real kernels compiled to PTX without a device, checked on the assembly.
 
 use crate::shared::offline_kernels::{
-    keep_largest_kernel, plane_moves_kernel, scale_kernel, strided_walk_kernel,
+    keep_largest_kernel, plane_moves_kernel, scale_kernel, scale_with_source_kernel,
+    strided_walk_kernel,
 };
 use crate::target::LlvmTarget;
 use crate::{PlironArtifact, PlironCompiler, PlironOptions, nvptx::ptx_version::PtxVersion};
@@ -74,6 +75,20 @@ fn loop_body(ptx: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// `ptxas` rejects a `.file` directive with a source text, so full debug data gives NVPTX only the
+/// line table.
+#[test]
+fn full_debug_info_embeds_no_source_text() {
+    let ptx = ptx_of(scale_with_source_kernel(), 60);
+    assert!(ptx.contains(".loc"), "the line table stays:\n{ptx}");
+    assert!(
+        ptx.lines()
+            .filter(|line| line.trim_start().starts_with(".file"))
+            .all(|line| !line.contains(" source ")),
+        "{ptx}"
+    );
 }
 
 /// The PTX `kernel` compiles to for `sm_{arch}`.

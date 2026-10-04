@@ -161,7 +161,7 @@ pub(crate) fn to_llvm_module(
     debug_info: DebugInfo,
 ) -> pliron::result::Result<LlvmModule> {
     let llvm_ctx = LLVMContext::default();
-    let llvm_module = convert_module(ctx, &llvm_ctx, module, debug_info)?;
+    let llvm_module = convert_module(ctx, &llvm_ctx, module, debug_info, true)?;
     let llvm_module = LlvmModule::new(&llvm_module.to_string())
         .unwrap_or_else(|err| panic!("LLVM IR does not parse for '{kernel_name}': {err}"));
     check_debug_info(&llvm_module, kernel_name, debug_info);

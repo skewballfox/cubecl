@@ -98,7 +98,7 @@ pub fn emit_ptx(
 ) -> Result<NvptxModule, String> {
     let llvm_ctx = LLVMContext::default();
     let converted =
-        convert_module(ctx, &llvm_ctx, module, debug_info).map_err(|err| err.to_string())?;
+        convert_module(ctx, &llvm_ctx, module, debug_info, false).map_err(|err| err.to_string())?;
 
     let module = LlvmModule::new(&directives_only(converted.to_string(), debug_info))?;
     check_debug_info(&module, entrypoint, debug_info);

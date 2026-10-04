@@ -89,7 +89,7 @@ pub fn emit_code_object(
 
     set_data_layout(ctx, module, DATA_LAYOUT.to_string());
     let converted =
-        convert_module(ctx, &llvm_ctx, module, debug_info).map_err(|err| err.to_string())?;
+        convert_module(ctx, &llvm_ctx, module, debug_info, true).map_err(|err| err.to_string())?;
 
     let module = LlvmModule::new(&converted.to_string())?;
     check_debug_info(&module, entrypoint, debug_info);

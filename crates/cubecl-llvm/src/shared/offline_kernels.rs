@@ -3,6 +3,7 @@
 #![cfg_attr(not(any(feature = "amdgpu", feature = "nvptx")), allow(dead_code))]
 
 use cubecl_core as cubecl;
+use cubecl_core::ir::settings::DebugInfo;
 use cubecl_core::prelude::*;
 use cubecl_core::runtime_tests::offline::offline_device_properties;
 use cubecl_runtime::kernel::CubeKernel;
@@ -22,6 +23,30 @@ fn scale(input: &[f32], output: &mut [f32]) {
 pub(crate) fn scale_kernel(address_type: AddressType) -> impl CubeKernel {
     let settings = KernelSettings::new(*CubeDim::new_1d(64), ExecutionMode::Checked, address_type);
     scale::Scale::new(
+        settings,
+        device_properties(32),
+        Arc::new(TargetProperties::default()),
+        BufferCompilationArg { inplace: None },
+        BufferCompilationArg { inplace: None },
+    )
+}
+
+#[cube(launch, debug_symbols)]
+fn scale_with_source(input: &[f32], output: &mut [f32]) {
+    if ABSOLUTE_POS < input.len() {
+        output[ABSOLUTE_POS] = input[ABSOLUTE_POS] * 2.0;
+    }
+}
+
+/// `scale` with full debug data: the macro embeds the text of this file.
+pub(crate) fn scale_with_source_kernel() -> impl CubeKernel {
+    let settings = KernelSettings::new(
+        *CubeDim::new_1d(64),
+        ExecutionMode::Checked,
+        AddressType::U32,
+    )
+    .debug_info(DebugInfo::Full);
+    scale_with_source::ScaleWithSource::new(
         settings,
         device_properties(32),
         Arc::new(TargetProperties::default()),
