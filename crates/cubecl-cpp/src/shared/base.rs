@@ -187,7 +187,9 @@ where
 
         let line_directives = kernel.settings.debug_info != DebugInfo::None;
         if line_directives {
-            ctx.set_aux_ty(super::branch::LineDirectives);
+            ctx.set_aux_ty(super::branch::LineDirectives {
+                directory: source_directory(&ctx, kernel.settings.debug_info),
+            });
         }
         ctx.set_aux_ty(compilation_options);
         ctx.set_aux_ty(state);
@@ -356,6 +358,15 @@ where
 
         Ok(compute_kernel)
     }
+}
+
+/// The directory that has the relative source files of the kernel in `ctx` on this computer, if
+/// one does. At [`DebugInfo::Full`], the file must have the compiled text.
+fn source_directory(ctx: &Context, level: DebugInfo) -> Option<std::path::PathBuf> {
+    use cubecl_core::ir::debug::DebugState;
+    use cubecl_runtime::debug_source::{kernel_source_root, source_md5s};
+    let debug = ctx.try_aux_ty::<DebugState>()?;
+    kernel_source_root(debug, &source_md5s(debug, level)).map(Into::into)
 }
 
 pub fn register_supported_types(props: &mut DeviceProperties) {

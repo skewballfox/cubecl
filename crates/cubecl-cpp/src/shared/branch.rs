@@ -16,8 +16,12 @@ use crate::{
 };
 
 /// Marks a kernel with debug data: [`block_to_cpp`] then gives each op the `#line` of its source.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LineDirectives;
+#[derive(Clone, Debug, Default)]
+pub struct LineDirectives {
+    /// The directory of the relative source files, if one has them on this computer. The
+    /// directives join it to each relative path, so a tool finds the file from any directory.
+    pub directory: Option<PathBuf>,
+}
 
 pub fn block_to_cpp(ctx: &Context, block: Ptr<BasicBlock>) -> String {
     let lines = ctx.try_aux_ty::<LineDirectives>().is_some();
@@ -73,6 +77,13 @@ fn line_directive<'c>(
     }
     let (file, line) = source;
     let _ = write!(out, "#line {line} \"");
+    let directory = ctx
+        .try_aux_ty::<LineDirectives>()
+        .and_then(|lines| lines.directory.as_ref());
+    let file = match directory {
+        Some(directory) if file.is_relative() => directory.join(file),
+        _ => file.clone(),
+    };
     // The file name is a C string literal.
     let file = file.display().to_string();
     let escaped = file.chars().flat_map(|c| {
@@ -228,6 +239,9 @@ mod tests {
             .map(|rest| {
                 let (line, file) = rest.split_once(' ').unwrap();
                 assert!(file.ends_with("branch.rs\""), "{rest}");
+                // The search finds the workspace root, a parent of the working directory.
+                let path = std::path::Path::new(file.trim_matches('"'));
+                assert!(path.is_absolute() && path.is_file(), "{rest}");
                 line.parse().unwrap()
             })
             .collect()

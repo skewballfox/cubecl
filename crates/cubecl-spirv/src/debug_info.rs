@@ -30,15 +30,24 @@ pub(crate) fn builder(ctx: &Context, level: DebugInfo) -> PlironBuilder {
     options.format = debug_format(configured, supported);
     options.language = SourceLanguage::Rust;
     options.producer = "cubecl".to_string();
-    // Only `Full` embeds the source text, as the macro records it only then.
-    if level == DebugInfo::Full
-        && let Some(debug) = ctx.try_aux_ty::<DebugState>()
-    {
-        options.source_text = debug
-            .sources()
-            .iter()
-            .map(|(path, text)| (path.clone(), text.to_string()))
-            .collect();
+    if let Some(debug) = ctx.try_aux_ty::<DebugState>() {
+        // The directory that has the relative source files on this computer, if one does. At
+        // `Full`, the file must have the compiled text.
+        #[cfg(feature = "std")]
+        {
+            use cubecl_runtime::debug_source::{kernel_source_root, source_md5s};
+            if let Some(root) = kernel_source_root(debug, &source_md5s(debug, level)) {
+                options.directory = root;
+            }
+        }
+        // Only `Full` embeds the source text, as the macro records it only then.
+        if level == DebugInfo::Full {
+            options.source_text = debug
+                .sources()
+                .iter()
+                .map(|(path, text)| (path.clone(), text.to_string()))
+                .collect();
+        }
     }
     PlironBuilder::with_debug_info(options)
 }
@@ -228,6 +237,24 @@ mod tests {
         assert!(lines.len() >= 4, "lines {lines:?} in:\n{module}");
         assert!(module.contains("debug_info.rs\""), "{module}");
         assert!(!module.contains("NonSemantic"), "{module}");
+    }
+
+    /// The file name of the debug data is the absolute path of this file: the search finds the
+    /// workspace root, a parent of the working directory of the test.
+    #[test]
+    fn the_file_name_is_the_absolute_path() {
+        let module = compile_outer(DebugInfo::LineTables, false);
+        let file = module
+            .debug_string_source
+            .iter()
+            .filter_map(|inst| match inst.operands.first() {
+                Some(Operand::LiteralString(text)) => Some(text.as_str()),
+                _ => None,
+            })
+            .find(|text| text.ends_with("debug_info.rs"))
+            .expect("the file name of this file");
+        assert!(std::path::Path::new(file).is_absolute(), "{file}");
+        assert!(std::path::Path::new(file).is_file(), "{file}");
     }
 
     /// The extended instructions `op` of `NonSemantic.Shader.DebugInfo.100` in `module`.
