@@ -239,9 +239,12 @@ mod tests {
             .map(|rest| {
                 let (line, file) = rest.split_once(' ').unwrap();
                 assert!(file.ends_with("branch.rs\""), "{rest}");
-                // The search finds the workspace root, a parent of the working directory.
+                // With `std`, the search finds the workspace root, a parent of the working
+                // directory.
                 let path = std::path::Path::new(file.trim_matches('"'));
-                assert!(path.is_absolute() && path.is_file(), "{rest}");
+                if cfg!(feature = "std") {
+                    assert!(path.is_absolute() && path.is_file(), "{rest}");
+                }
                 line.parse().unwrap()
             })
             .collect()
