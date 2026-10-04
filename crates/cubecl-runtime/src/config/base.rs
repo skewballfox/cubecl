@@ -186,6 +186,10 @@ impl RuntimeConfig for CubeClRuntimeConfig {
             self.compilation.spirv_debug_format = format;
         }
 
+        if let Ok(dir) = std::env::var("CUBECL_SOURCE_CACHE") {
+            self.compilation.source_cache = Some(dir.into());
+        }
+
         if let Some(enabled) = env_bool("CUBECL_THROUGHPUT_CACHE") {
             self.throughput.disable_cache = !enabled;
         }

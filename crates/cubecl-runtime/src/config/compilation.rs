@@ -75,6 +75,12 @@ pub struct CompilationConfig {
     /// The format of the debug data in SPIR-V kernels. Set by `CUBECL_SPIRV_DEBUG_FORMAT`.
     #[serde(default)]
     pub spirv_debug_format: SpirvDebugFormat,
+    /// A directory for the source text of kernels with full debug data. When no directory on this
+    /// computer has the source files of a kernel, cubecl writes the texts into this directory, and
+    /// the debug data points to them. `None` writes no files. Set by `CUBECL_SOURCE_CACHE`.
+    #[serde(default)]
+    #[cfg(feature = "std")]
+    pub source_cache: Option<std::path::PathBuf>,
 }
 
 impl CompilationConfig {
