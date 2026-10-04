@@ -3,7 +3,7 @@
 | Item | Value |
 |---|---|
 | Plan step | [PLAN.md §6, step 9](PLAN.md#6-phase-2-keep-locations-through-passes-and-emit-dwarf-llvm-paths--cpu-and-gpu-done) |
-| Status | Named inline frames: done ([`9da8f0b`](https://github.com/skewballfox/cubecl/commit/9da8f0b36ba23ce9baa4cac68514e8054815130c)). Compile directory: done ([`45d48d0`](https://github.com/skewballfox/cubecl/commit/45d48d0e8da8f5b7b1b40d3ff80f283ddef00574)). Nsight Compute check: not done. |
+| Status | Named inline frames: done ([`9da8f0b`](https://github.com/skewballfox/cubecl/commit/9da8f0b36ba23ce9baa4cac68514e8054815130c)). Compile directory: done ([`45d48d0`](https://github.com/skewballfox/cubecl/commit/45d48d0e8da8f5b7b1b40d3ff80f283ddef00574)). Nsight Compute, cuda-gdb and gdb checks: done, with the example [`profiling_kernels`](https://github.com/skewballfox/cubecl/commit/bcbe4e1ea363ca27d6b17fe34de20086a10f9b7a) (§5). |
 | Language | ASD-STE100 / Attempto Controlled English. Domain terms are permitted. |
 
 ## 1. Parity
@@ -48,7 +48,7 @@ The CPU path gives each tool the kernel name, the source lines, the inlined `#[c
 - At `LineTables`, there is no text, so a changed file is not detected.
 - The SPIR-V path does not use `source_root` yet.
 
-**Checked:** the tests [`the_compile_directory_has_the_source_files`](https://github.com/skewballfox/cubecl/blob/45d48d0e8da8f5b7b1b40d3ff80f283ddef00574/crates/cubecl-llvm/src/shared/debug_info.rs#L317-L352) (CPU IR at `Full` and `LineTables`), [`the_file_directive_is_the_absolute_path`](https://github.com/skewballfox/cubecl/blob/45d48d0e8da8f5b7b1b40d3ff80f283ddef00574/crates/cubecl-llvm/src/nvptx/offline_tests.rs#L94-L110) (NVPTX), and the [`source_root` tests](https://github.com/skewballfox/cubecl/blob/45d48d0e8da8f5b7b1b40d3ff80f283ddef00574/crates/cubecl-llvm/src/shared/source_root.rs#L82-L124). The driver JIT keeps the absolute path in the cubin. gdb was not run on the CPU with the new directory.
+**Checked:** the tests [`the_compile_directory_has_the_source_files`](https://github.com/skewballfox/cubecl/blob/45d48d0e8da8f5b7b1b40d3ff80f283ddef00574/crates/cubecl-llvm/src/shared/debug_info.rs#L317-L352) (CPU IR at `Full` and `LineTables`), [`the_file_directive_is_the_absolute_path`](https://github.com/skewballfox/cubecl/blob/45d48d0e8da8f5b7b1b40d3ff80f283ddef00574/crates/cubecl-llvm/src/nvptx/offline_tests.rs#L94-L110) (NVPTX), and the [`source_root` tests](https://github.com/skewballfox/cubecl/blob/45d48d0e8da8f5b7b1b40d3ff80f283ddef00574/crates/cubecl-llvm/src/shared/source_root.rs#L82-L124). The driver JIT keeps the absolute path in the cubin. Nsight Compute, cuda-gdb and gdb on the CPU find the file (§5).
 
 ## 4. Regression checks
 
@@ -57,8 +57,41 @@ The CPU path gives each tool the kernel name, the source lines, the inlined `#[c
 - The `cubecl-cuda` suite on the RTX 4070: 746 pass, 52 fail. The same 52 tests fail on `3afcdce`, before this work.
 - Clippy with `-W clippy::pedantic` gives no warning on the changed lines.
 
-## 5. Not done
+## 5. Checks on the device
 
-- **Nsight Compute on a device.** It needs `ncu` from `nvcr.io/nvidia/cuda:13.0.3-devel-ubuntu24.04`, and root, because the driver has `RmProfilingAdminOnly: 1`.
+**Kernel:** the example [`profiling_kernels`](https://github.com/skewballfox/cubecl/blob/bcbe4e1ea363ca27d6b17fe34de20086a10f9b7a/examples/profiling_kernels/src/main.rs#L9-L32) has two kernels with the chain `kernel → doubled → square_third`. `nested_lines` has line tables from the cargo profile. `nested_full` has `debug_symbols`, thus `Full`. All checks used the `dev` profile. Nsight Compute also ran on a release profile with `debug = "line-tables-only"`, with the same result.
+
+**Tools:** `ncu` 2025.3.1 and cuda-gdb 13.0, from the NVIDIA CUDA RPM repository for Fedora 42 (`nsight-compute-2025.3.1`, `cuda-gdb-13-0`). `rpmkeys --checksig` accepts both packages with the NVIDIA key `610C7B14…D42D0685`. The packages were unpacked, not installed. The image `nvcr.io/nvidia/cuda` was not used: NVIDIA signs only the manifest list, not the amd64 image, and a policy that requires signatures rejects the image. The driver has `RmProfilingAdminOnly: 0`, thus `ncu` ran without root.
+
+**Nsight Compute** (`ncu --import-source yes --set full`, then `--page source --print-source cuda,sass --csv`):
+
+- The source view shows the `#[cube]` lines from the absolute path `…/examples/profiling_kernels/src/main.rs`, for the two kernels.
+- The report contains the file text (1894 bytes, the size of the file). The Python report interface (`IAction.source_files`) gives it.
+- `ncu` uses the inline chain. The metrics of line 12 (`square_third`) are also added to its call sites, line 17 (`doubled`) and line 23 or 30 (the kernel). The NVIDIA documentation describes this aggregation for inline functions.
+- The command line and the Python report interface do not show the inline function names. Only the "Inline Functions" table of the user interface shows them. The table was not examined. The names are in the cubin (§2).
+- The slow path of the `f32` division is a subroutine (`CALL.REL.NOINC`). Its instructions have the line of the `#[cube(launch)]` attribute (line 20 or 27), not the line of the division.
+
+**The search for the compile directory:**
+
+| Working directory | `CUBECL_SOURCE_ROOT` | Path in the report | Text in the report |
+|---|---|---|---|
+| Workspace root | Not set | Absolute | Yes |
+| `examples/profiling_kernels` | Not set | Absolute (a parent directory has the file) | Yes |
+| A directory outside the workspace | Not set | Relative. `ncu` writes "Failed to import". | No |
+| A directory outside the workspace | Workspace root | Absolute | Yes |
+| Workspace root, file changed after the build | Not set | Absolute at `LineTables`. Relative at `Full`, because the MD5 is different. | Yes. `ncu` opens a relative path from its own working directory, thus it imports the changed text. |
+
+**cuda-gdb** (no `-G`, thus the optimization level does not change):
+
+- A breakpoint on line 11 stops at `main.rs:11 in square_third inlined from main.rs:17`. A breakpoint on line 12 stops at `main.rs:17 in doubled inlined from main.rs:23`. The path is absolute, and `list` shows the source. The `Full` kernel gives the same result.
+- `bt` shows one device frame. cuda-gdb gives the innermost inline function and its call site in that frame. It does not show each inline frame as a frame of its own.
+- `x/i` needs `cuobjdump` on the `PATH`.
+- Before the first kernel launch, `break main.rs:11` binds to the host code that the macro generates (`doubled::expand`, line 15). Set the breakpoint after the launch, for example after `set cuda break_on_launch application`.
+
+**gdb on the CPU** (gdb 17.2, the `cpu` runtime, `dev` profile): a breakpoint on line 11 gives `square_third () at …:11`, `doubled () at …:17`, `nested_lines () at …:23`, then `run_kernel`. gdb shows the source from the workspace root, and from a directory outside the workspace with `CUBECL_SOURCE_ROOT`. Without the variable, gdb writes "No such file or directory", but the frames and the lines are correct. This closes "Not checked with gdb" of PLAN §3.4.
+
+## 6. Not done
+
+- **The Inline Functions table of the Nsight Compute user interface.** The command line does not show it, and the check had no display.
 - **NVRTC inline frames.** The C++ backend puts all `#[cube]` calls into one function body. Inline frames need a device function for each `#[cube]` function.
 - **Source text in the PTX.** `ptxas` rejects it (step-5-followup.md, fact 2). `ncu --import-source yes` copies the files into the report.

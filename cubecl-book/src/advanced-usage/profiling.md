@@ -144,6 +144,38 @@ source from the file (see [Source Files](#source-files)).
 
 The NVRTC compiler (C++) gives the source lines through `#line` directives, but no inline frames.
 
+The example `profiling_kernels` has two kernels with nested `#[cube]` functions. Use it to try the
+commands below. The `dev` profile gives line tables:
+
+```sh
+cargo build -p profiling_kernels --no-default-features --features cuda
+```
+
+Nsight Compute shows the source lines of each kernel. `--import-source yes` copies the source files
+into the report, so the report shows the source on a different computer:
+
+```sh
+ncu --import-source yes --set full -o kernels ./target/debug/profiling_kernels
+ncu --import kernels.ncu-rep --page source --print-source cuda,sass
+```
+
+The metrics of a line in an inlined `#[cube]` function include all of its call sites. The Inline
+Functions table of the Nsight Compute user interface gives each call site.
+
+cuda-gdb stops in an inlined `#[cube]` function. It shows the function name and the call site, for
+example `main.rs:11 in square_third inlined from main.rs:17`. Do not compile with `-G`: CubeCL does
+not need it, and it changes the machine code. Set the breakpoint after the first kernel launch.
+Before the launch, cuda-gdb puts a breakpoint on a `#[cube]` line into the host code that the macro
+generates.
+
+```sh
+cuda-gdb -ex 'set cuda break_on_launch application' -ex run \
+    -ex 'break main.rs:11' -ex continue ./target/debug/profiling_kernels
+```
+
+If a tool does not find the source, run the program from the workspace, or set
+`CUBECL_SOURCE_ROOT` (see [Source Files](#source-files)).
+
 ## Worker Threads
 
 The `cpu` runtime runs kernels on its worker threads. Thus a kernel stack does not start at the
