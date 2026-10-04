@@ -1,7 +1,7 @@
 //! Symbol files for the profilers, in the open formats that `perf` and `samply` read.
 //!
 //! The files stay after the process stops, so a run-time switch must ask for them:
-//! `CUBECL_JIT_SYMBOLS`, or `DOTNET_PerfMapEnabled`, which `samply` sets.
+//! `CUBECL_JIT_SYMBOLS`, or `DOTNET_PerfMapEnabled`, the .NET variable for the same files.
 
 use std::{
     fs::File,
@@ -111,7 +111,7 @@ mod tests {
             JitSymbols::parse(Some("none"), Some("1")),
             JitSymbols::default()
         );
-        // `samply record` sets `2` on Linux.
+        // `samply record --coreclr` sets `2` on Linux.
         let samply = JitSymbols::parse(None, Some("2"));
         assert!(samply.jitdump && !samply.perf_map);
         assert!(JitSymbols::parse(None, Some("3")).perf_map);

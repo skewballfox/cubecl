@@ -261,13 +261,15 @@ mod tests {
     }
 
     /// With the jitdump asked for, the perf support plugin writes `jit-<pid>.dump` under
-    /// `$JITDUMPDIR`, and the debugger plugin of `JITLink` gives each object to gdb.
+    /// `$JITDUMPDIR`, and the debugger plugin of `JITLink` gives each object to gdb. The shim
+    /// fixes the records for perf: each code record comes after its own line and unwind records,
+    /// the lines start at the code, and the `.eh_frame_hdr` finds the code where perf puts it.
     #[cfg(feature = "jitdump")]
     #[test]
     fn the_jitdump_is_written() {
         let _guard = JIT_TESTS
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // The plugin opens its file when it is added, so `JITDUMPDIR` is set before it.
         let dir = std::env::temp_dir().join(format!("cubecl-jitdump-{}", std::process::id()));
         // SAFETY: the other tests of this binary do not read `JITDUMPDIR`, and `JIT_TESTS` keeps
@@ -279,17 +281,131 @@ mod tests {
             perf_map: false,
             jitdump: true,
         };
-        let name = "cubecl_gdb_jitlink_probe";
-        let _jit = jit_with(symbols, name);
+        let names = ["cubecl_gdb_jitlink_probe", "cubecl_perf_second_probe"];
+        pliron_llvm::llvm_sys::target::initialize_native().unwrap();
+        let jit = Jit::new(symbols, true).unwrap();
+        jit.add_module(LlvmModule::new(&probe_with_debug_info(&names)).unwrap())
+            .unwrap();
+        for name in names {
+            jit.lookup(name).unwrap();
+        }
         assert!(
-            registered_with_gdb(name),
+            registered_with_gdb(names[0]),
             "the debugger plugin did not register"
         );
 
         let file = format!("jit-{}.dump", std::process::id());
-        let found = walk(&dir).iter().any(|path| path.ends_with(&file));
+        let path = walk(&dir).into_iter().find(|path| path.ends_with(&file));
+        let dump = path.as_ref().map(|path| std::fs::read(path).unwrap());
         std::fs::remove_dir_all(&dir).ok();
-        assert!(found, "no {file} under {}", dir.display());
+        let dump = dump.unwrap_or_else(|| panic!("no {file} under {}", dir.display()));
+        drop(jit);
+
+        let offset = if super::super::perf_support::perf_adds_header_offset() {
+            0
+        } else {
+            0x40
+        };
+        let loads = check_jitdump_records(&dump, offset);
+        assert_eq!(loads, names.len(), "one code record for each function");
+    }
+
+    /// A module with the functions `names`, with a line table and unwind data.
+    #[cfg(feature = "jitdump")]
+    fn probe_with_debug_info(names: &[&str]) -> String {
+        use std::fmt::Write;
+
+        let mut ir = String::new();
+        let mut metadata = String::new();
+        for (i, name) in names.iter().enumerate() {
+            let (program, location) = (10 + 2 * i, 11 + 2 * i);
+            writeln!(
+                ir,
+                "define i32 @{name}() uwtable !dbg !{program} {{\n  ret i32 1, !dbg !{location}\n}}"
+            )
+            .unwrap();
+            writeln!(
+                metadata,
+                "!{program} = distinct !DISubprogram(name: \"{name}\", scope: !1, file: !1, \
+                 line: {program}, type: !4, scopeLine: {program}, spFlags: DISPFlagDefinition, \
+                 unit: !0)\n!{location} = !DILocation(line: {location}, scope: !{program})"
+            )
+            .unwrap();
+        }
+        format!(
+            "{ir}\n!llvm.dbg.cu = !{{!0}}\n!llvm.module.flags = !{{!2, !3}}\n\
+             !0 = distinct !DICompileUnit(language: DW_LANG_Rust, file: !1, producer: \"test\", \
+             isOptimized: false, runtimeVersion: 0, emissionKind: LineTablesOnly)\n\
+             !1 = !DIFile(filename: \"probe.rs\", directory: \"/\")\n\
+             !2 = !{{i32 2, !\"Debug Info Version\", i32 3}}\n\
+             !3 = !{{i32 7, !\"Dwarf Version\", i32 5}}\n\
+             !4 = !DISubroutineType(types: !{{}})\n{metadata}"
+        )
+    }
+
+    /// Checks the records of a jitdump as `perf inject --jit` reads them, and returns the number
+    /// of code records. perf gives the last line record and unwind record before a code record to
+    /// that code record. `offset` is what the first line address of a function must be past its
+    /// code.
+    #[cfg(feature = "jitdump")]
+    fn check_jitdump_records(dump: &[u8], offset: u64) -> usize {
+        let u32_at = |at: usize| u32::from_le_bytes(dump[at..at + 4].try_into().unwrap());
+        let u64_at = |at: usize| u64::from_le_bytes(dump[at..at + 8].try_into().unwrap());
+        let i32_in = |bytes: &[u8], at: usize| {
+            i64::from(i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()))
+        };
+
+        let mut at = u32_at(8) as usize; // the size of the file header
+        let mut lines = None;
+        let mut unwinding: Option<(Vec<u8>, Vec<u8>)> = None;
+        let mut loads = 0;
+        while at + 16 <= dump.len() {
+            let (id, size) = (u32_at(at), u32_at(at + 4) as usize);
+            let body = at + 16;
+            match id {
+                0 => {
+                    let (code, code_size) = (u64_at(body + 16), u64_at(body + 24));
+                    let first = lines.take().expect("no line record before the code record");
+                    assert_eq!(first, (code, code + offset), "the lines start at the code");
+
+                    let (frame, header) = unwinding
+                        .take()
+                        .expect("no unwind record before the code record");
+                    // perf puts the `.eh_frame` at `align8(T + code_size)` and the header after
+                    // it. The distances do not depend on `T`.
+                    let header_start = i64::try_from(frame.len()).unwrap();
+                    let code_start = i64::try_from(code_size.next_multiple_of(8)).unwrap();
+                    assert_eq!(header[0], 1, "the version of the `.eh_frame_hdr`");
+                    assert_eq!(i32_in(&header, 4), -(header_start + 4), "`eh_frame_ptr`");
+                    assert_eq!(i32_in(&header, 8), 1, "one FDE for the code");
+                    let location = i32_in(&header, 12);
+                    assert_eq!(location, -(code_start + header_start), "the FDE location");
+                    let fde = usize::try_from(i32_in(&header, 16) + header_start).unwrap();
+                    let pc_begin = i32_in(&frame, fde + 8);
+                    assert_eq!(
+                        pc_begin,
+                        -(code_start + i64::try_from(fde).unwrap() + 8),
+                        "the FDE `pc_begin`"
+                    );
+                    loads += 1;
+                }
+                2 => {
+                    let code = u64_at(body);
+                    assert!(u64_at(body + 8) > 0, "a line record without lines");
+                    lines = Some((code, u64_at(body + 16)));
+                }
+                4 => {
+                    let data_size = usize::try_from(u64_at(body)).unwrap();
+                    let header_size = usize::try_from(u64_at(body + 8)).unwrap();
+                    let data = &dump[body + 24..body + 24 + data_size];
+                    let (frame, header) = data.split_at(data_size - header_size);
+                    unwinding = Some((frame.to_vec(), header.to_vec()));
+                }
+                _ => {}
+            }
+            at += size;
+        }
+        loads
     }
 
     /// An entry of the GDB JIT interface.
