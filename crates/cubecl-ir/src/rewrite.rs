@@ -574,3 +574,172 @@ macro_rules! small_set {
         out
     }};
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        AddressType,
+        attributes::BoolAttr,
+        dialect::branch::IfOp,
+        scope::Scope,
+        settings::{Dim3, ExecutionMode, KernelSettings},
+    };
+    use alloc::{boxed::Box, vec};
+    use pliron::{
+        basic_block::BasicBlock,
+        builtin::op_interfaces::OneResultInterface,
+        combine::stream::position::SourcePosition,
+        location::{Located, Source},
+    };
+
+    /// A kernel scope without debug data, so that only the test gives locations.
+    fn kernel() -> Scope {
+        Scope::root(KernelSettings::new(
+            Dim3::new_single(),
+            ExecutionMode::Checked,
+            AddressType::U32,
+        ))
+    }
+
+    fn entry_block(scope: &Scope) -> Ptr<BasicBlock> {
+        scope.state().entry_func.get_entry_block(scope.ctx())
+    }
+
+    /// Line `line` of the file `k.rs`.
+    fn at(ctx: &mut Context, line: i32) -> Location {
+        Location::SrcPos {
+            src: Source::new_from_file(ctx, "k.rs"),
+            pos: SourcePosition { line, column: 1 },
+        }
+    }
+
+    /// A new constant at the end of `block`, at `loc`.
+    fn constant(ctx: &mut Context, block: Ptr<BasicBlock>, loc: Location) -> Ptr<Operation> {
+        let op = ConstantOp::new(ctx, Box::new(BoolAttr::new(true))).get_operation();
+        op.deref_mut(ctx).set_loc(loc);
+        op.insert_at_back(block, ctx);
+        op
+    }
+
+    /// An op without a location gets the location of the op before it. The first op of a block
+    /// gets the location of the op that holds the block. Without a location before it, an op
+    /// keeps none.
+    #[test]
+    fn ops_inherit_the_location_before_them() {
+        let scope = kernel();
+        let ctx = scope.ctx_mut();
+        let block = entry_block(&scope);
+        let leading = block
+            .deref(ctx)
+            .iter(ctx)
+            .next()
+            .expect("the flag of the kernel");
+        let (one, two, three) = (at(ctx, 1), at(ctx, 2), at(ctx, 3));
+
+        let located = constant(ctx, block, one.clone());
+        let after = constant(ctx, block, Location::Unknown);
+        let cond = ConstantOp::new(ctx, Box::new(BoolAttr::new(true))).get_result(ctx);
+        let if_op = IfOp::new(ctx, cond);
+        if_op.get_operation().insert_at_back(block, ctx);
+        let first_then = constant(ctx, if_op.then_block(ctx), Location::Unknown);
+        let own = constant(ctx, if_op.then_block(ctx), two.clone());
+        let after_own = constant(ctx, if_op.then_block(ctx), Location::Unknown);
+        let first_else = constant(ctx, if_op.else_block(ctx), Location::Unknown);
+        let last = constant(ctx, block, three.clone());
+
+        let module = scope.state().module.get_operation();
+        let mut analyses = AnalysisManager::default();
+        let result = InheritLocationPass.run(module, ctx, &mut analyses).unwrap();
+        assert!(matches!(result.ir_changed, IRStatus::Changed));
+
+        assert!(leading.deref(ctx).loc().is_unknown());
+        for (op, loc) in [
+            (located, &one),
+            (after, &one),
+            (if_op.get_operation(), &one),
+            (first_then, &one),
+            (own, &two),
+            (after_own, &two),
+            (first_else, &one),
+            (last, &three),
+        ] {
+            assert_eq!(op.deref(ctx).loc(), *loc);
+        }
+
+        let again = InheritLocationPass.run(module, ctx, &mut analyses).unwrap();
+        assert!(matches!(again.ir_changed, IRStatus::Unchanged));
+    }
+
+    /// Replaces `target` with a new constant. It also inserts one more constant, a constant at
+    /// its own location, and a constant that it erases again.
+    struct SplitConstant {
+        target: Ptr<Operation>,
+        own: Location,
+        inserted: Vec<Ptr<Operation>>,
+    }
+
+    /// A new constant at the insertion point of `rewriter`, without a location.
+    fn insert(ctx: &mut Context, rewriter: &mut MatchRewriter) -> Ptr<Operation> {
+        let op = ConstantOp::new(ctx, Box::new(BoolAttr::new(false))).get_operation();
+        rewriter.insert_operation(ctx, op);
+        op
+    }
+
+    impl MatchRewrite for SplitConstant {
+        fn r#match(&mut self, _ctx: &Context, op: Ptr<Operation>) -> bool {
+            op == self.target
+        }
+
+        fn rewrite(
+            &mut self,
+            ctx: &mut Context,
+            rewriter: &mut MatchRewriter,
+            op: Ptr<Operation>,
+        ) -> Result<()> {
+            let extra = insert(ctx, rewriter);
+            let own = insert(ctx, rewriter);
+            own.deref_mut(ctx).set_loc(self.own.clone());
+            let erased = insert(ctx, rewriter);
+            let replacement = insert(ctx, rewriter);
+            let value = replacement.deref(ctx).get_result(0);
+            rewriter.replace_operation_with_values(ctx, op, vec![value]);
+            rewriter.erase_operation(ctx, erased);
+            self.inserted = vec![extra, own, replacement];
+            Ok(())
+        }
+    }
+
+    /// Each op that a rewrite inserts without a location gets the location of the op it
+    /// rewrites, not only the op that replaces it. An op with its own location keeps it, and an
+    /// op that the rewrite erased is skipped.
+    #[test]
+    fn rewrites_keep_the_location_of_the_op() {
+        let scope = kernel();
+        let ctx = scope.ctx_mut();
+        let block = entry_block(&scope);
+        let (one, two) = (at(ctx, 1), at(ctx, 2));
+        let target = constant(ctx, block, one.clone());
+
+        let mut rewrite = SplitConstant {
+            target,
+            own: two.clone(),
+            inserted: Vec::new(),
+        };
+        let module = scope.state().module.get_operation();
+        apply_match_rewrite(
+            ctx,
+            &mut KeepLocation(&mut rewrite),
+            RewriterOrder::default(),
+            module,
+        )
+        .unwrap();
+
+        let locations = rewrite
+            .inserted
+            .iter()
+            .map(|op| op.deref(ctx).loc())
+            .collect::<Vec<_>>();
+        assert_eq!(locations, [one.clone(), two, one]);
+    }
+}

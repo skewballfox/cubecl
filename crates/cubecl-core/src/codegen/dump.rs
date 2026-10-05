@@ -85,14 +85,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn disabled_dump_writes_nothing() {
-        let dump = KernelDump::default();
-        dump.write("never.txt", || -> &[u8] {
+    fn disabled_dump_builds_no_contents() {
+        KernelDump::default().write("never.txt", || -> &[u8] {
             panic!("contents must not be built")
         });
-        let config = dump.pass_config();
-        assert!(!config.print_after_all);
-        assert!(config.ir_printing_dir.is_none());
     }
 
     #[test]

@@ -92,28 +92,27 @@ pub(crate) fn write_perf_map(addr: u64, size: u64, name: &str) {
 mod tests {
     use super::*;
 
+    /// `CUBECL_JIT_SYMBOLS` decides when it is set. Else `DOTNET_PerfMapEnabled` has its .NET
+    /// meanings: `samply record --coreclr` sets `2` on Linux.
     #[test]
-    fn cubecl_variable_selects_the_files() {
-        let both = JitSymbols {
-            perf_map: true,
-            jitdump: true,
-        };
-        assert_eq!(JitSymbols::parse(Some("perf"), None), both);
-        assert!(JitSymbols::parse(Some("perfmap"), None).perf_map);
-        assert!(!JitSymbols::parse(Some("perfmap"), None).jitdump);
-        assert!(JitSymbols::parse(Some("jitdump"), None).jitdump);
-        assert_eq!(JitSymbols::parse(None, None), JitSymbols::default());
-    }
-
-    #[test]
-    fn cubecl_variable_overrides_dotnet() {
-        assert_eq!(
-            JitSymbols::parse(Some("none"), Some("1")),
-            JitSymbols::default()
-        );
-        // `samply record --coreclr` sets `2` on Linux.
-        let samply = JitSymbols::parse(None, Some("2"));
-        assert!(samply.jitdump && !samply.perf_map);
-        assert!(JitSymbols::parse(None, Some("3")).perf_map);
+    fn the_variables_select_the_files() {
+        let cases = [
+            (Some("perf"), Some("0"), true, true),
+            (Some("perfmap"), None, true, false),
+            (Some("jitdump"), None, false, true),
+            (Some("none"), Some("1"), false, false),
+            (None, Some("1"), true, true),
+            (None, Some("2"), false, true),
+            (None, Some("3"), true, false),
+            (None, Some("0"), false, false),
+            (None, None, false, false),
+        ];
+        for (cubecl, dotnet, perf_map, jitdump) in cases {
+            assert_eq!(
+                JitSymbols::parse(cubecl, dotnet),
+                JitSymbols { perf_map, jitdump },
+                "{cubecl:?} {dotnet:?}"
+            );
+        }
     }
 }

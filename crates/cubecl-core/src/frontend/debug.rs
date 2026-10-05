@@ -144,7 +144,8 @@ mod tests {
         settings::{DebugInfo, Dim3, ExecutionMode, KernelSettings},
     };
 
-    const FIRST_LINE: u32 = line!() + 1;
+    /// The line where the frame of `double` opens, and the line of its statement.
+    const DOUBLE_LINES: [u32; 2] = [line!() + 1, line!() + 3];
     #[cube]
     fn double(x: u32) -> u32 {
         x + x
@@ -153,6 +154,42 @@ mod tests {
     #[cube]
     fn quadruple(x: u32) -> u32 {
         double(x) + double(x)
+    }
+
+    #[cube]
+    fn add_double(x: u32) -> u32 {
+        x + double(x)
+    }
+
+    #[cube(no_debug_symbols)]
+    fn plain_double(x: u32) -> u32 {
+        x + x
+    }
+
+    const CALL_PLAIN_LINE: u32 = line!() + 3;
+    #[cube]
+    fn call_plain(x: u32) -> u32 {
+        plain_double(x)
+    }
+
+    #[derive(CubeType, Clone, Copy)]
+    struct Pair {
+        a: u32,
+    }
+
+    const SUM_LINES: [u32; 2] = [line!() + 4, line!() + 5];
+    #[cube]
+    impl Pair {
+        fn sum(self, x: u32) -> u32 {
+            let y = self.a + x;
+            y * x
+        }
+    }
+
+    #[cube]
+    fn use_pair(x: u32) -> u32 {
+        let pair = Pair { a: x };
+        pair.sum(x)
     }
 
     /// Runs `expand` on a new kernel scope and returns the location of each op it inserted.
@@ -173,45 +210,108 @@ mod tests {
         ops.into_iter().map(|op| op.deref(ctx).loc()).collect()
     }
 
+    /// A function name, and a line and a column in the function.
+    type Frame<'a> = (&'a str, u32, u32);
+
+    fn frame(loc: &Location) -> Option<Frame<'_>> {
+        match loc {
+            Location::Named { name, child_loc } => match child_loc.as_ref() {
+                Location::SrcPos { pos, .. } => Some((
+                    name,
+                    u32::try_from(pos.line).ok()?,
+                    u32::try_from(pos.column).ok()?,
+                )),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The innermost frame and its caller, for each op that a call inserted.
+    fn call_sites(locations: &[Location]) -> Vec<(Frame<'_>, Frame<'_>)> {
+        locations
+            .iter()
+            .filter_map(|loc| match loc {
+                Location::CallSite { callee, caller } => Some((frame(callee)?, frame(caller)?)),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn ops_get_the_line_of_their_expression() {
-        let named = locations(DebugInfo::LineTables, |scope, x| {
+        let locations = locations(DebugInfo::LineTables, |scope, x| {
             double::expand(scope, x);
-        })
-        .into_iter()
-        .filter_map(|loc| match loc {
-            Location::Named { name, child_loc } => Some((name, *child_loc)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-        assert!(!named.is_empty());
-        for (name, loc) in named {
+        });
+        let frames = locations.iter().filter_map(frame).collect::<Vec<_>>();
+        assert!(
+            frames.iter().any(|(_, line, _)| *line == DOUBLE_LINES[1]),
+            "{frames:?}"
+        );
+        for (name, line, _) in frames {
             assert_eq!(name, "double");
-            let Location::SrcPos { pos, .. } = loc else {
-                panic!("expected a source position, got {loc:?}");
-            };
-            assert!((FIRST_LINE..FIRST_LINE + 4).contains(&(pos.line as u32)));
+            assert!(DOUBLE_LINES.contains(&line), "{line}");
         }
     }
 
     #[test]
     fn inlined_calls_keep_their_call_site() {
-        let call_sites = locations(DebugInfo::LineTables, |scope, x| {
+        let locations = locations(DebugInfo::LineTables, |scope, x| {
             quadruple::expand(scope, x);
-        })
-        .into_iter()
-        .filter_map(|loc| match loc {
-            Location::CallSite { callee, caller } => Some((*callee, *caller)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
+        });
+        let call_sites = call_sites(&locations);
         // Every op of the two `double` calls records that `quadruple` called it.
         assert!(!call_sites.is_empty());
-        for (callee, caller) in call_sites {
-            assert!(matches!(callee, Location::Named { name, .. } if name == "double"));
-            assert!(matches!(caller, Location::Named { name, .. } if name == "quadruple"));
+        for ((inner, line, _), (outer, ..)) in call_sites {
+            assert_eq!(inner, "double");
+            assert!(DOUBLE_LINES.contains(&line), "{line}");
+            assert_eq!(outer, "quadruple");
+        }
+    }
+
+    /// The span of a call moves the frame to the call, and gives the frame back its position
+    /// when the call returns: the addition after `double(x)` is at the start of `x + double(x)`.
+    #[test]
+    fn an_op_after_a_call_gets_the_position_of_its_expression() {
+        let locations = locations(DebugInfo::LineTables, |scope, x| {
+            add_double::expand(scope, x);
+        });
+        let (_, (_, call_line, call_column)) = call_sites(&locations)[0];
+        let (name, line, column) = locations.last().and_then(frame).expect("the addition");
+        assert_eq!((name, line), ("add_double", call_line));
+        assert!(column < call_column, "{column} {call_column}");
+    }
+
+    /// A function with `no_debug_symbols` opens no frame. Its ops get the location of the call.
+    #[test]
+    fn a_function_without_debug_symbols_has_the_location_of_its_call() {
+        let locations = locations(DebugInfo::LineTables, |scope, x| {
+            call_plain::expand(scope, x);
+        });
+        assert!(call_sites(&locations).is_empty(), "{locations:?}");
+        let last = locations.last().and_then(frame);
+        assert_eq!(
+            last.map(|(name, line, _)| (name, line)),
+            Some(("call_plain", CALL_PLAIN_LINE))
+        );
+    }
+
+    /// A method of a `#[cube] impl` is one frame, with the lines of its statements.
+    #[test]
+    fn a_method_is_one_frame() {
+        let locations = locations(DebugInfo::LineTables, |scope, x| {
+            use_pair::expand(scope, x);
+        });
+        let call_sites = call_sites(&locations);
+        for line in SUM_LINES {
+            assert!(
+                call_sites
+                    .iter()
+                    .any(|((inner, at, _), (outer, ..))| *inner == "Pair :: sum"
+                        && *at == line
+                        && *outer == "use_pair"),
+                "no op at line {line}: {call_sites:?}"
+            );
         }
     }
 

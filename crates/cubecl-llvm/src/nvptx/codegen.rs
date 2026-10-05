@@ -322,21 +322,6 @@ entry:
         );
     }
 
-    #[test]
-    fn inlined_functions_get_their_name_as_linkage_name() {
-        let ir = concat!(
-            "!4 = distinct !DISubprogram(name: \"k\", linkageName: \"k_1f\", scope: !1)\n",
-            "!13 = distinct !DISubprogram(name: \"inner\", scope: !1, file: !1)\n",
-        );
-        assert_eq!(
-            name_inlined_functions(ir.to_string()),
-            concat!(
-                "!4 = distinct !DISubprogram(name: \"k\", linkageName: \"k_1f\", scope: !1)\n",
-                "!13 = distinct !DISubprogram(name: \"inner\", linkageName: \"inner\", scope: !1, file: !1)\n",
-            )
-        );
-    }
-
     fn compile_to_ptx(
         ir: &str,
         arch: &SmArch,

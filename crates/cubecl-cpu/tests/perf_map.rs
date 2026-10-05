@@ -48,7 +48,7 @@ fn each_kernel_has_a_perf_map_line() {
         assert_eq!(lines.len(), 1, "{kernel} in:\n{map}");
         let fields = lines[0].split(' ').collect::<Vec<_>>();
         assert_eq!(fields.len(), 3, "{}", lines[0]);
-        assert_ne!(u64::from_str_radix(fields[0], 16), Ok(0), "address");
-        assert!(u64::from_str_radix(fields[1], 16).unwrap() > 0, "size");
+        assert_ne!(u64::from_str_radix(fields[0], 16).unwrap(), 0, "address");
+        assert_ne!(u64::from_str_radix(fields[1], 16).unwrap(), 0, "size");
     }
 }

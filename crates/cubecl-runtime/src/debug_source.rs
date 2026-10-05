@@ -253,12 +253,6 @@ mod tests {
     }
 
     #[test]
-    fn md5_hex_is_the_md5_digest() {
-        assert_eq!(md5_hex(""), "d41d8cd98f00b204e9800998ecf8427e");
-        assert_eq!(md5_hex("abc"), "900150983cd24fb0d6963f7d28e17f72");
-    }
-
-    #[test]
     fn the_first_root_that_has_the_file() {
         let root = tree("first", "fn k() {}");
         let roots = [root.join("src"), root.clone(), PathBuf::from("/")];
@@ -279,17 +273,15 @@ mod tests {
         std::fs::remove_dir_all(new).unwrap();
     }
 
-    /// The tests run in the crate directory. The workspace root, a parent, has the kernel file.
+    /// An absolute path needs no directory. The compiler tests check that the search finds the
+    /// workspace root for a relative path.
     #[test]
-    fn the_workspace_root_is_a_parent_of_the_working_directory() {
-        let path = "crates/cubecl-runtime/src/debug_source.rs";
-        let root = source_root([(path, None)]).expect("the workspace root");
-        assert!(root.join(path).is_file(), "{}", root.display());
+    fn an_absolute_path_has_no_root() {
         assert_eq!(source_root([("/abs/k.rs", None)]), None);
     }
 
-    /// The cache gets each text under one directory for the files, and the same files get the
-    /// same directory. A different text gets a different directory.
+    /// The cache gets each text under one directory for the files, and the same files, in any
+    /// order, get the same directory. A different text gets a different directory.
     #[test]
     fn the_cache_has_the_texts_under_one_directory() {
         let cache = temporary("cache");
@@ -301,7 +293,8 @@ mod tests {
         assert!(root.starts_with(&cache), "{}", root.display());
         assert_eq!(std::fs::read_to_string(root.join("src/k.rs")).unwrap(), k);
         assert_eq!(std::fs::read_to_string(root.join("lib/f.rs")).unwrap(), f);
-        assert_eq!(cached_root(&cache, files), Some(root.clone()));
+        let [k_file, f_file] = files;
+        assert_eq!(cached_root(&cache, [f_file, k_file]), Some(root.clone()));
 
         let changed = "fn k() { changed }";
         let changed_md5: Arc<str> = md5_hex(changed).into();

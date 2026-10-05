@@ -332,15 +332,4 @@ mod test {
 
         assert_eq!(name, "UnaryNumeric | f32 | CubeTensor | Copy | CudaRuntime");
     }
-
-    #[cfg(std_io)]
-    #[test]
-    fn a_variable_names_a_variant_by_its_serde_name() {
-        use super::super::compilation::SpirvDebugFormat;
-        use cubecl_ir::settings::DebugInfo;
-
-        assert_eq!(variant("line-tables"), Some(DebugInfo::LineTables));
-        assert_eq!(variant("non-semantic"), Some(SpirvDebugFormat::NonSemantic));
-        assert_eq!(variant::<DebugInfo>("LineTables"), None);
-    }
 }

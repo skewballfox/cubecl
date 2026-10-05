@@ -28,12 +28,10 @@ pub fn effective_debug_info(requested: DebugInfo) -> DebugInfo {
             .map_or(NO_LIMIT, |level| level as u8);
         LIMIT.store(limit, Ordering::Relaxed);
     }
-    let limit = match limit {
-        0 => Some(DebugInfo::None),
-        1 => Some(DebugInfo::LineTables),
-        2 => Some(DebugInfo::Full),
-        _ => None,
-    };
+    // Decode with the casts that encoded the level, so the order of the variants does not matter.
+    let limit = [DebugInfo::None, DebugInfo::LineTables, DebugInfo::Full]
+        .into_iter()
+        .find(|level| *level as u8 == limit);
     resolve_debug_info(requested, limit)
 }
 

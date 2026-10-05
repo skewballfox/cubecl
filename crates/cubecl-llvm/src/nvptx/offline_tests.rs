@@ -1,13 +1,14 @@
 //! Real kernels compiled to PTX without a device, checked on the assembly.
 
 use crate::shared::offline_kernels::{
-    keep_largest_kernel, nested_calls_kernel, plane_moves_kernel, scale_kernel,
-    scale_with_source_kernel, strided_walk_kernel,
+    keep_largest_kernel, nested_calls_kernel, nested_calls_with_source_kernel, plane_moves_kernel,
+    scale_kernel, strided_walk_kernel,
 };
 use crate::target::LlvmTarget;
 use crate::{PlironArtifact, PlironCompiler, PlironOptions, nvptx::ptx_version::PtxVersion};
 use cubecl_core::Compiler;
 use cubecl_core::ir::{AddressType, nvidia::SmArch, settings::DebugInfo};
+use cubecl_core::runtime_tests::offline::SOURCE_PATH;
 use cubecl_runtime::kernel::CubeKernel;
 use std::ffi::CStr;
 
@@ -77,18 +78,29 @@ fn loop_body(ptx: &str) -> Option<String> {
     None
 }
 
-/// `ptxas` rejects a `.file` directive with a source text, so full debug data gives NVPTX only the
-/// line table.
+/// With debug data, the PTX has the `.file` and `.loc` directives, but its `.target` has no
+/// `debug`: with `debug`, the driver compiles the kernel for a debugger, which changes the
+/// optimization. `ptxas` rejects a `.file` directive with a source text, so full debug data gives
+/// NVPTX no text.
 #[test]
-fn full_debug_info_embeds_no_source_text() {
-    let ptx = ptx_of(scale_with_source_kernel(), 60);
-    assert!(ptx.contains(".loc"), "the line table stays:\n{ptx}");
-    assert!(
-        ptx.lines()
-            .filter(|line| line.trim_start().starts_with(".file"))
-            .all(|line| !line.contains(" source ")),
-        "{ptx}"
-    );
+fn debug_data_is_line_directives_only() {
+    for ptx in [
+        ptx_of(nested_calls_kernel(DebugInfo::LineTables), 60),
+        ptx_of(nested_calls_with_source_kernel(), 60),
+    ] {
+        assert!(ptx.contains(".loc"), "no line table:\n{ptx}");
+        let target = ptx
+            .lines()
+            .find(|line| line.starts_with(".target"))
+            .unwrap_or_else(|| panic!("no `.target`:\n{ptx}"));
+        assert!(!target.contains("debug"), "{target}");
+        assert!(
+            ptx.lines()
+                .filter(|line| line.trim_start().starts_with(".file"))
+                .all(|line| !line.contains(" source ")),
+            "{ptx}"
+        );
+    }
 }
 
 /// `ptxas` cannot take the source text, so the `.file` directive gives the absolute path of the
@@ -101,10 +113,7 @@ fn the_file_directive_is_the_absolute_path() {
         .find_map(|line| line.trim_start().strip_prefix(".file\t1 \""))
         .and_then(|rest| rest.split_once('"'))
         .map_or_else(|| panic!("no `.file 1`:\n{ptx}"), |(path, _)| path);
-    assert!(
-        path.ends_with("crates/cubecl-llvm/src/shared/offline_kernels.rs"),
-        "{path}"
-    );
+    assert!(path.ends_with(SOURCE_PATH), "{path}");
     assert!(std::path::Path::new(path).is_absolute(), "{path}");
     assert!(std::path::Path::new(path).is_file(), "{path}");
 }

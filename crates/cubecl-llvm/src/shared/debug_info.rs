@@ -82,116 +82,34 @@ mod tests {
         cpu::jit::engine::to_llvm_module,
         shared::{
             PlironOptions,
-            base::lower_cpu,
-            offline_kernels::{device_properties, scale_with_source_kernel},
+            base::{LoweredCpu, lower_cpu},
+            offline_kernels::{nested_calls_kernel, nested_calls_with_source_kernel},
         },
     };
-    use cubecl_core as cubecl;
-    use cubecl_core::prelude::*;
-    use cubecl_runtime::kernel::CubeKernel;
+    use cubecl_core::runtime_tests::offline::{SOURCE_PATH, source_line};
+    use cubecl_runtime::{debug_source::md5_hex, kernel::CubeKernel};
     use pliron::{graph::walkers::uninterruptible::immutable::walk_op, location::Location};
-    use std::sync::Arc;
 
-    #[cube]
-    fn inner(x: f32) -> f32 {
-        let y = x * x;
-        y / 3.0
-    }
-
-    #[cube]
-    fn mid(x: f32) -> f32 {
-        inner(x) * 2.0
-    }
-
-    #[cube(launch)]
-    fn outer(input: &[f32], output: &mut [f32]) {
-        if ABSOLUTE_POS < input.len() {
-            output[ABSOLUTE_POS] = mid(input[ABSOLUTE_POS]);
-        }
-    }
-
-    fn lowered(level: DebugInfo) -> super::super::base::LoweredCpu {
-        let settings = KernelSettings::new(
-            *CubeDim::new_1d(64),
-            ExecutionMode::Checked,
-            AddressType::U32,
-        )
-        .debug_info(level);
-        let kernel = outer::Outer::new(
-            settings,
-            device_properties(32),
-            Arc::new(TargetProperties::default()),
-            BufferCompilationArg { inplace: None },
-            BufferCompilationArg { inplace: None },
-        );
+    fn lowered(kernel: &impl CubeKernel) -> LoweredCpu {
         lower_cpu(kernel.define(), &PlironOptions::default()).unwrap()
     }
 
-    /// The LLVM IR of `kernel` for the CPU.
-    fn cpu_ir(kernel: &impl CubeKernel) -> String {
-        let lowered = lower_cpu(kernel.define(), &PlironOptions::default()).unwrap();
-        let module = to_llvm_module(
-            &lowered.ctx,
-            lowered.module,
-            &lowered.kernel_name,
-            lowered.debug_info,
-        )
-        .unwrap();
+    /// The LLVM IR of `lowered`, with the debug data of `level`.
+    fn ir_at(lowered: &LoweredCpu, level: DebugInfo) -> String {
+        let module =
+            to_llvm_module(&lowered.ctx, lowered.module, &lowered.kernel_name, level).unwrap();
         module.verify().unwrap();
         module.print()
     }
 
-    /// The function name, line and column of the innermost frame of `loc`.
-    fn innermost(loc: &Location) -> Option<(&str, i32, i32)> {
-        match loc {
-            Location::CallSite { callee, .. } => innermost(callee),
-            Location::Named { name, child_loc } => match child_loc.as_ref() {
-                Location::SrcPos { pos, .. } => Some((name, pos.line, pos.column)),
-                _ => None,
-            },
-            _ => None,
-        }
+    /// The LLVM IR of `kernel` for the CPU.
+    fn cpu_ir(kernel: &impl CubeKernel) -> String {
+        let lowered = lowered(kernel);
+        ir_at(&lowered, lowered.debug_info)
     }
 
-    /// Each float op and each store without a location. These ops come from the kernel source.
-    /// The entry ABI adds the loops over the units, which have no source and get line 0 in the
-    /// DWARF.
-    fn unlocated_source_ops(lowered: &super::super::base::LoweredCpu) -> Vec<String> {
-        let mut ops = Vec::new();
-        walk_op(
-            &lowered.ctx,
-            &mut ops,
-            &WALKCONFIG_PREORDER_FORWARD,
-            lowered.module.get_operation(),
-            |ctx, ops, node| {
-                let IRNode::Operation(op) = node else {
-                    return;
-                };
-                let name = Operation::get_opid(op, ctx).to_string();
-                let from_source = name == "llvm.store"
-                    || name.starts_with("llvm.call")
-                    || (name.starts_with("llvm.f")
-                        && !["llvm.func", "llvm.fence"].contains(&name.as_str()));
-                if from_source && op.deref(ctx).loc().is_unknown() {
-                    ops.push(name);
-                }
-            },
-        );
-        ops
-    }
-
-    /// The rewrites and the fallback pass keep a location on each op that comes from source.
-    #[test]
-    fn lowering_keeps_source_locations() {
-        let lowered = lowered(DebugInfo::LineTables);
-        let unlocated = unlocated_source_ops(&lowered);
-        assert!(
-            unlocated.is_empty(),
-            "ops without a location: {unlocated:?}"
-        );
-
-        // `x * x` and `y / 3.0` in `inner` keep their own positions. The fallback pass alone would
-        // give both the position of the op before them.
+    /// Each op of `lowered`.
+    fn ops(lowered: &LoweredCpu) -> Vec<Ptr<Operation>> {
         let mut ops = Vec::new();
         walk_op(
             &lowered.ctx,
@@ -204,103 +122,120 @@ mod tests {
                 }
             },
         );
-        let mut positions = ops
+        ops
+    }
+
+    /// The function name and the line of the innermost frame of `loc`.
+    fn innermost(loc: &Location) -> Option<(&str, u32)> {
+        match loc {
+            Location::CallSite { callee, .. } => innermost(callee),
+            Location::Named { name, child_loc } => match child_loc.as_ref() {
+                Location::SrcPos { pos, .. } => Some((name, u32::try_from(pos.line).ok()?)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The lowering passes keep the location of each op that comes from source: each float op,
+    /// store and call. The entry ABI adds the loops over the units, which have no source and get
+    /// line 0 in the DWARF. Each statement keeps its own line: `KeepLocation` gives a rewritten op
+    /// the location of the op it replaces, where the fallback pass alone would give the location
+    /// of the op before it.
+    #[test]
+    fn lowering_keeps_source_locations() {
+        let lowered = lowered(&nested_calls_kernel(DebugInfo::LineTables));
+        let ctx = &lowered.ctx;
+        let unlocated = ops(&lowered)
             .into_iter()
-            .map(|op| op.deref(&lowered.ctx).loc())
-            .filter_map(|loc| {
-                let (name, line, column) = innermost(&loc)?;
-                (name == "inner").then_some((line, column))
+            .map(|op| (Operation::get_opid(op, ctx).to_string(), op))
+            .filter(|(name, op)| {
+                let from_source = name == "llvm.store"
+                    || name.starts_with("llvm.call")
+                    || (name.starts_with("llvm.f")
+                        && !["llvm.func", "llvm.fence"].contains(&name.as_str()));
+                from_source && op.deref(ctx).loc().is_unknown()
+            })
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        assert!(
+            unlocated.is_empty(),
+            "ops without a location: {unlocated:?}"
+        );
+
+        let lines = ops(&lowered)
+            .into_iter()
+            .filter_map(|op| {
+                let loc = op.deref(ctx).loc();
+                let (name, line) = innermost(&loc)?;
+                Some((name.to_string(), line))
             })
             .collect::<Vec<_>>();
-        positions.sort();
-        positions.dedup();
-        assert!(positions.len() >= 2, "positions in `inner`: {positions:?}");
-    }
-
-    #[test]
-    fn inlined_functions_are_dwarf_frames() {
-        let lowered = lowered(DebugInfo::LineTables);
-        let module = to_llvm_module(
-            &lowered.ctx,
-            lowered.module,
-            &lowered.kernel_name,
-            lowered.debug_info,
-        )
-        .unwrap();
-        module.verify().unwrap();
-        let ir = module.print();
-        for name in ["outer", "mid", "inner"] {
+        for (function, text) in [
+            ("square_third", "let y = x * x;"),
+            ("square_third", "y / 3.0"),
+            ("doubled", "third * 2.0"),
+        ] {
+            let line = source_line(text);
             assert!(
-                ir.contains(&format!("DISubprogram(name: \"{name}\"")),
-                "{ir}"
+                lines.contains(&(function.to_string(), line)),
+                "no op of `{text}` in {lines:?}"
             );
         }
-        assert!(ir.contains("inlinedAt:"), "{ir}");
-        assert!(ir.contains("emissionKind: LineTablesOnly"), "{ir}");
     }
 
-    /// At `Full`, the `DIFile` of the kernel file embeds its text and MD5, in DWARF 5.
-    #[test]
-    fn full_debug_info_embeds_the_source_text() {
-        let ir = cpu_ir(&scale_with_source_kernel());
-        let file = ir
-            .lines()
-            .find(|line| line.contains("DIFile(") && line.contains("offline_kernels.rs"))
-            .unwrap_or_else(|| panic!("no `DIFile` of the kernel file:\n{ir}"));
-        assert!(file.contains("source: \""), "{file}");
-        assert!(file.contains("checksumkind: CSK_MD5"), "{file}");
-        assert!(ir.contains("!\"Dwarf Version\", i32 5"), "{ir}");
-    }
-
-    /// Without the text from the macro, `LineTables` embeds no source and keeps DWARF 4.
-    #[test]
-    fn line_tables_embed_no_source_text() {
-        let lowered = lowered(DebugInfo::LineTables);
-        let module = to_llvm_module(
-            &lowered.ctx,
-            lowered.module,
-            &lowered.kernel_name,
-            lowered.debug_info,
-        )
-        .unwrap();
-        let ir = module.print();
-        assert!(!ir.contains("source: \""), "{ir}");
-        assert!(ir.contains("!\"Dwarf Version\", i32 4"), "{ir}");
-    }
-
-    /// The directory of a `DIFile` line of `ir`.
-    fn file_directory<'a>(ir: &'a str, file: &str) -> &'a str {
+    /// The directory and the `DIFile` line of `file` in `ir`.
+    fn difile<'a>(ir: &'a str, file: &str) -> (&'a str, &'a str) {
         let line = ir
             .lines()
             .find(|line| line.contains("DIFile(") && line.contains(file))
             .unwrap_or_else(|| panic!("no `DIFile` of {file}:\n{ir}"));
-        line.split_once("directory: \"")
+        let directory = line
+            .split_once("directory: \"")
             .and_then(|(_, rest)| rest.split_once('"'))
-            .map_or("", |(directory, _)| directory)
+            .map_or("", |(directory, _)| directory);
+        (directory, line)
+    }
+
+    /// At `Full`, the `DIFile` of the kernel file embeds its text, in DWARF 5. Its MD5 is the MD5
+    /// of the file on disk, so a debugger accepts the file as the source.
+    #[test]
+    fn full_debug_info_embeds_the_source_text() {
+        let ir = cpu_ir(&nested_calls_with_source_kernel());
+        let (directory, file) = difile(&ir, SOURCE_PATH);
+        assert!(file.contains("source: \""), "{file}");
+        let checksum = file
+            .split_once("checksum: \"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map_or_else(|| panic!("no checksum: {file}"), |(checksum, _)| checksum);
+        let on_disk = std::fs::read(std::path::Path::new(directory).join(SOURCE_PATH)).unwrap();
+        assert_eq!(checksum, md5_hex(on_disk));
+        assert!(ir.contains("!\"Dwarf Version\", i32 5"), "{ir}");
+    }
+
+    /// `LineTables` asks for line tables only, and without the text from the macro it embeds no
+    /// source and keeps DWARF 4.
+    #[test]
+    fn line_tables_embed_no_source_text() {
+        let ir = cpu_ir(&nested_calls_kernel(DebugInfo::LineTables));
+        assert!(ir.contains("emissionKind: LineTablesOnly"), "{ir}");
+        assert!(!ir.contains("source: \""), "{ir}");
+        assert!(!ir.contains("checksum:"), "{ir}");
+        assert!(ir.contains("!\"Dwarf Version\", i32 4"), "{ir}");
     }
 
     /// The tests run in the crate directory, and the workspace root, which `file!()` is relative
     /// to, is a parent. At both levels, the compile directory is that root.
     #[test]
     fn the_compile_directory_has_the_source_files() {
-        let full = cpu_ir(&scale_with_source_kernel());
-        let lowered = lowered(DebugInfo::LineTables);
-        let line_tables = to_llvm_module(
-            &lowered.ctx,
-            lowered.module,
-            &lowered.kernel_name,
-            lowered.debug_info,
-        )
-        .unwrap()
-        .print();
-        for (ir, file) in [
-            (&full, "crates/cubecl-llvm/src/shared/offline_kernels.rs"),
-            (&line_tables, "crates/cubecl-llvm/src/shared/debug_info.rs"),
+        for kernel_ir in [
+            cpu_ir(&nested_calls_with_source_kernel()),
+            cpu_ir(&nested_calls_kernel(DebugInfo::LineTables)),
         ] {
-            let directory = file_directory(ir, file);
+            let (directory, _) = difile(&kernel_ir, SOURCE_PATH);
             assert!(
-                std::path::Path::new(directory).join(file).is_file(),
-                "`{directory}` does not have {file}"
+                std::path::Path::new(directory).join(SOURCE_PATH).is_file(),
+                "`{directory}` does not have {SOURCE_PATH}"
             );
         }
     }
@@ -308,15 +243,10 @@ mod tests {
     /// The ops have locations in a `dev` build. The level `None` must still give no debug data.
     #[test]
     fn no_debug_data_without_debug_info() {
-        let lowered = lowered(DebugInfo::None);
-        let module = to_llvm_module(
-            &lowered.ctx,
-            lowered.module,
-            &lowered.kernel_name,
+        let ir = ir_at(
+            &lowered(&nested_calls_kernel(DebugInfo::LineTables)),
             DebugInfo::None,
-        )
-        .unwrap();
-        let ir = module.print();
+        );
         assert!(
             !ir.contains("!dbg") && !ir.contains("DICompileUnit"),
             "{ir}"

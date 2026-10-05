@@ -87,7 +87,10 @@ mod tests {
             settings::DebugInfo,
         },
         prelude::*,
-        runtime_tests::offline::offline_device_properties,
+        runtime_tests::offline::{
+            SOURCE, SOURCE_PATH, doubled, nested_calls_with_source_kernel,
+            offline_device_properties, source_line,
+        },
     };
     use cubecl_runtime::config::compilation::SpirvDebugFormat;
     use cubecl_runtime::kernel::CubeKernel;
@@ -103,17 +106,6 @@ mod tests {
         sync::Arc,
     };
 
-    #[cube]
-    fn inner(x: f32) -> f32 {
-        let y = x * x;
-        y / 3.0
-    }
-
-    #[cube]
-    fn mid(x: f32) -> f32 {
-        inner(x) * 2.0
-    }
-
     /// The branches and the loop give selection merges and a loop merge, which no `OpLine` may
     /// separate from their branches.
     #[cube(launch)]
@@ -122,7 +114,7 @@ mod tests {
             let mut acc = 0.0;
             for i in 0..input.len() {
                 if i != ABSOLUTE_POS {
-                    acc += mid(input[i]);
+                    acc += doubled(input[i]);
                 }
             }
             output[ABSOLUTE_POS] = acc;
@@ -166,18 +158,14 @@ mod tests {
         module
     }
 
-    fn settings() -> KernelSettings {
-        KernelSettings::new(
-            *CubeDim::new_1d(64),
-            ExecutionMode::Checked,
-            AddressType::U32,
-        )
-    }
-
     /// The SPIR-V of `outer`.
     fn compile_outer(level: DebugInfo, non_semantic: bool) -> Module {
         let kernel = outer::Outer::new(
-            settings(),
+            KernelSettings::new(
+                *CubeDim::new_1d(64),
+                ExecutionMode::Checked,
+                AddressType::U32,
+            ),
             properties(),
             Arc::new(TargetProperties::default()),
             BufferCompilationArg { inplace: None },
@@ -186,12 +174,8 @@ mod tests {
         compile(kernel, level, non_semantic)
     }
 
-    /// The disassembled SPIR-V of `outer`.
-    fn disassembly(level: DebugInfo, non_semantic: bool) -> String {
-        compile_outer(level, non_semantic).disassemble()
-    }
-
-    /// Runs `spirv-val` on `words`. Does nothing if `spirv-val` is not installed.
+    /// Runs `spirv-val` on `words`. Without `spirv-val`, does nothing, except in CI, where the
+    /// workflow installs it.
     fn validate(words: &[u32]) {
         let mut child = match Command::new("spirv-val")
             .args(["--target-env", "vulkan1.3", "-"])
@@ -200,7 +184,9 @@ mod tests {
             .spawn()
         {
             Ok(child) => child,
-            Err(err) if err.kind() == ErrorKind::NotFound => return,
+            Err(err) if err.kind() == ErrorKind::NotFound && std::env::var_os("CI").is_none() => {
+                return;
+            }
             Err(err) => panic!("spirv-val: {err}"),
         };
         let bytes = words
@@ -216,45 +202,54 @@ mod tests {
         );
     }
 
-    /// Without device support, each op gets the `OpLine` of its innermost `#[cube]` frame, so the
-    /// lines of `inner`, `mid` and `outer` are in the module.
-    #[test]
-    fn source_lines_are_op_lines() {
-        let module = disassembly(DebugInfo::LineTables, false);
-        let mut lines = module
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("OpLine "))
-            .map(|rest| {
-                rest.split_whitespace()
-                    .nth(1)
-                    .unwrap()
-                    .parse::<u32>()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        lines.sort();
-        lines.dedup();
-        assert!(lines.len() >= 4, "lines {lines:?} in:\n{module}");
-        assert!(module.contains("debug_info.rs\""), "{module}");
-        assert!(!module.contains("NonSemantic"), "{module}");
-    }
-
-    /// The file name of the debug data is the absolute path of this file: the search finds the
-    /// workspace root, a parent of the working directory of the test.
-    #[test]
-    fn the_file_name_is_the_absolute_path() {
-        let module = compile_outer(DebugInfo::LineTables, false);
-        let file = module
+    /// The text of the `OpString` with the id `id`.
+    fn string(module: &Module, id: u32) -> &str {
+        let string = module
             .debug_string_source
             .iter()
-            .filter_map(|inst| match inst.operands.first() {
-                Some(Operand::LiteralString(text)) => Some(text.as_str()),
-                _ => None,
+            .find(|it| it.result_id == Some(id))
+            .unwrap();
+        match &string.operands[0] {
+            Operand::LiteralString(text) => text,
+            operand => panic!("%{id} is not a string: {operand:?}"),
+        }
+    }
+
+    /// The file and the line of each `OpLine` in the functions of `module`.
+    fn op_lines(module: &Module) -> Vec<(&str, u32)> {
+        module
+            .functions
+            .iter()
+            .flat_map(|func| &func.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|inst| inst.class.opcode == SpirvOp::Line)
+            .map(|inst| match inst.operands[..] {
+                [Operand::IdRef(file), Operand::LiteralBit32(line), ..] => {
+                    (string(module, file), line)
+                }
+                _ => panic!("{inst:?}"),
             })
-            .find(|text| text.ends_with("debug_info.rs"))
-            .expect("the file name of this file");
-        assert!(std::path::Path::new(file).is_absolute(), "{file}");
-        assert!(std::path::Path::new(file).is_file(), "{file}");
+            .collect()
+    }
+
+    /// Without device support, each op gets the `OpLine` of its innermost `#[cube]` frame. The
+    /// file name is the absolute path: the search finds the workspace root, a parent of the
+    /// working directory of the test. `third * 2.0` is not checked: it fuses with `acc +=` into
+    /// one `Fma`, which has the line of the addition.
+    #[test]
+    fn source_lines_are_op_lines() {
+        let module = compile_outer(DebugInfo::LineTables, false);
+        let lines = op_lines(&module);
+        for text in ["let y = x * x;", "y / 3.0"] {
+            let line = source_line(text);
+            let (file, _) = lines
+                .iter()
+                .find(|(file, number)| file.ends_with(SOURCE_PATH) && *number == line)
+                .unwrap_or_else(|| panic!("no `OpLine` for `{text}` in:\n{lines:?}"));
+            let path = std::path::Path::new(file);
+            assert!(path.is_absolute() && path.is_file(), "{file}");
+        }
+        assert!(!module.disassemble().contains("NonSemantic"));
     }
 
     /// The extended instructions `op` of `NonSemantic.Shader.DebugInfo.100` in `module`.
@@ -275,41 +270,11 @@ mod tests {
             .collect()
     }
 
-    /// The text of the `OpString` operand `index` of the extended instruction `inst`.
-    fn string_operand(module: &Module, inst: &Instruction, index: usize) -> String {
-        let Some(Operand::IdRef(id)) = inst.operands.get(index + 2) else {
-            panic!("operand {index} of {inst:?} is not an id");
-        };
-        let string = module
-            .debug_string_source
-            .iter()
-            .find(|it| it.result_id == Some(*id))
-            .unwrap();
-        match &string.operands[0] {
-            Operand::LiteralString(text) => text.clone(),
-            operand => panic!("%{id} is not a string: {operand:?}"),
-        }
-    }
-
-    /// With device support, `inner` and `mid` are separate frames, inlined in `outer`.
-    #[test]
-    fn non_semantic_has_inlined_frames() {
-        let module = compile_outer(DebugInfo::LineTables, true);
-        let mut names = debug_instructions(&module, DebugInfoOp::DebugFunction)
-            .into_iter()
-            .map(|inst| string_operand(&module, inst, 0))
-            .collect::<Vec<_>>();
-        names.sort();
-        assert_eq!(names, ["inner", "mid", "outer"]);
-        assert!(!debug_instructions(&module, DebugInfoOp::DebugInlinedAt).is_empty());
-        assert!(!module.disassemble().contains("OpLine"));
-    }
-
     /// Without debug data, the module has no debug instruction, although the ops have locations.
     #[test]
     fn no_debug_data_without_level() {
         for non_semantic in [false, true] {
-            let module = disassembly(DebugInfo::None, non_semantic);
+            let module = compile_outer(DebugInfo::None, non_semantic).disassemble();
             assert!(!module.contains("OpLine"), "{module}");
             assert!(!module.contains("NonSemantic"), "{module}");
         }
@@ -322,6 +287,7 @@ mod tests {
             (Auto, true, DebugInfoFormat::NonSemantic),
             (Auto, false, DebugInfoFormat::OpLine),
             (OpLine, true, DebugInfoFormat::OpLine),
+            (OpLine, false, DebugInfoFormat::OpLine),
             (NonSemantic, true, DebugInfoFormat::NonSemantic),
             (NonSemantic, false, DebugInfoFormat::OpLine),
         ];
@@ -330,31 +296,27 @@ mod tests {
         }
     }
 
-    /// `debug_symbols` embeds the text of this file. `spirv-val` checks each column against the
-    /// length of its line in the text, so the columns of the macro must fit the lines.
-    #[cube(launch, debug_symbols)]
-    fn outer_full(input: &[f32], output: &mut [f32]) {
-        if ABSOLUTE_POS < input.len() {
-            output[ABSOLUTE_POS] = mid(input[ABSOLUTE_POS]);
-        }
-    }
-
+    /// At `Full`, the `DebugSource` of the kernel file has the text that the macro records.
+    /// `spirv-val` checks each column against the length of its line in the text, so the columns
+    /// of the macro must fit the lines.
     #[test]
     fn full_debug_data_embeds_the_source() {
-        let kernel = outer_full::OuterFull::new(
-            settings(),
-            properties(),
-            Arc::new(TargetProperties::default()),
-            BufferCompilationArg { inplace: None },
-            BufferCompilationArg { inplace: None },
+        let module = compile(
+            nested_calls_with_source_kernel(properties()),
+            DebugInfo::Full,
+            true,
         );
-        let module = compile(kernel, DebugInfo::Full, true);
         let texts = debug_instructions(&module, DebugInfoOp::DebugSource)
             .into_iter()
-            .filter(|inst| inst.operands.len() > 3)
-            .map(|inst| string_operand(&module, inst, 1))
+            .filter_map(|inst| match inst.operands[2..] {
+                [_, Operand::IdRef(text), ..] => Some(string(&module, text)),
+                _ => None,
+            })
             .collect::<Vec<_>>();
-        assert_eq!(texts.len(), 1, "{}", module.disassemble());
-        assert!(texts[0].starts_with("//! Debug data in the SPIR-V of a kernel."));
+        // A long text continues in `DebugSourceContinued`, so the first part is a prefix.
+        let [text] = texts[..] else {
+            panic!("{}", module.disassemble());
+        };
+        assert!(!text.is_empty() && SOURCE.starts_with(text), "{text}");
     }
 }

@@ -133,6 +133,9 @@ impl CubeImplItem {
 
         // The function points to the method's body.
         core::mem::swap(&mut func.body, &mut body);
+        // The method has the body, so it opens the frame and records the lines. The function only
+        // forwards to it.
+        let debug_symbols = core::mem::replace(&mut func.context.debug_symbols, false);
 
         KernelFn {
             attrs: func.attrs.clone(),
@@ -141,10 +144,9 @@ impl CubeImplItem {
             body,
             full_name: func.full_name.clone(),
             span: func.span,
-            // The forwarded-to function opens the frame.
             context: Context::new(
                 func.context.return_type.clone(),
-                false,
+                debug_symbols,
                 func.context.is_intrinsic,
             ),
             args: func.args.clone(),

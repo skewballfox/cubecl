@@ -346,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_info_changes_the_hash() {
+    fn debug_info_changes_the_hash_and_the_cache_key() {
         let with = |debug_info| KernelId {
             debug_info,
             ..KernelId::new::<()>().info("1")
@@ -358,6 +358,8 @@ mod tests {
         );
         assert_ne!(none.stable_hash(), lines.stable_hash());
         assert_ne!(lines.stable_hash(), full.stable_hash());
+        assert_ne!(none.stable_format(), lines.stable_format());
+        assert_ne!(lines.stable_format(), full.stable_format());
         assert_ne!(none, lines);
         let state = std::collections::hash_map::RandomState::new();
         assert_ne!(

@@ -5,7 +5,7 @@
 use cubecl_core as cubecl;
 use cubecl_core::ir::settings::DebugInfo;
 use cubecl_core::prelude::*;
-use cubecl_core::runtime_tests::offline::offline_device_properties;
+use cubecl_core::runtime_tests::offline::{self, offline_device_properties};
 use cubecl_runtime::kernel::CubeKernel;
 use std::sync::Arc;
 
@@ -23,30 +23,6 @@ fn scale(input: &[f32], output: &mut [f32]) {
 pub(crate) fn scale_kernel(address_type: AddressType) -> impl CubeKernel {
     let settings = KernelSettings::new(*CubeDim::new_1d(64), ExecutionMode::Checked, address_type);
     scale::Scale::new(
-        settings,
-        device_properties(32),
-        Arc::new(TargetProperties::default()),
-        BufferCompilationArg { inplace: None },
-        BufferCompilationArg { inplace: None },
-    )
-}
-
-#[cube(launch, debug_symbols)]
-fn scale_with_source(input: &[f32], output: &mut [f32]) {
-    if ABSOLUTE_POS < input.len() {
-        output[ABSOLUTE_POS] = input[ABSOLUTE_POS] * 2.0;
-    }
-}
-
-/// `scale` with full debug data: the macro embeds the text of this file.
-pub(crate) fn scale_with_source_kernel() -> impl CubeKernel {
-    let settings = KernelSettings::new(
-        *CubeDim::new_1d(64),
-        ExecutionMode::Checked,
-        AddressType::U32,
-    )
-    .debug_info(DebugInfo::Full);
-    scale_with_source::ScaleWithSource::new(
         settings,
         device_properties(32),
         Arc::new(TargetProperties::default()),
@@ -160,37 +136,12 @@ pub(crate) fn strided_walk_kernel() -> impl CubeKernel {
     )
 }
 
-#[cube]
-fn square_third(x: f32) -> f32 {
-    let y = x * x;
-    y / 3.0
-}
-
-#[cube]
-fn doubled(x: f32) -> f32 {
-    square_third(x) * 2.0
-}
-
-#[cube(launch)]
-fn nested_calls(input: &[f32], output: &mut [f32]) {
-    if ABSOLUTE_POS < input.len() {
-        output[ABSOLUTE_POS] = doubled(input[ABSOLUTE_POS]);
-    }
-}
-
-/// `nested_calls → doubled → square_third` at `level`: two inlined `#[cube]` functions.
+/// `nested_calls` of `cubecl-core` at `level`: two inlined `#[cube]` functions.
 pub(crate) fn nested_calls_kernel(level: DebugInfo) -> impl CubeKernel {
-    let settings = KernelSettings::new(
-        *CubeDim::new_1d(64),
-        ExecutionMode::Checked,
-        AddressType::U32,
-    )
-    .debug_info(level);
-    nested_calls::NestedCalls::new(
-        settings,
-        device_properties(32),
-        Arc::new(TargetProperties::default()),
-        BufferCompilationArg { inplace: None },
-        BufferCompilationArg { inplace: None },
-    )
+    offline::nested_calls_kernel(device_properties(32), level)
+}
+
+/// `nested_calls_with_source` of `cubecl-core`: full debug data with the text of its file.
+pub(crate) fn nested_calls_with_source_kernel() -> impl CubeKernel {
+    offline::nested_calls_with_source_kernel(device_properties(32))
 }

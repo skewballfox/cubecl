@@ -84,15 +84,17 @@ fn line_directive<'c>(
         Some(directory) if file.is_relative() => directory.join(file),
         _ => file.clone(),
     };
-    // The file name is a C string literal.
-    let file = file.display().to_string();
-    let escaped = file.chars().flat_map(|c| {
-        let backslash = matches!(c, '\\' | '"').then_some('\\');
-        backslash.into_iter().chain([c])
-    });
-    out.extend(escaped);
+    push_string_literal(out, &file.display().to_string());
     out.push_str("\"\n");
     Some(source)
+}
+
+/// Appends `text` to `out` as the body of a C string literal.
+fn push_string_literal(out: &mut String, text: &str) {
+    out.extend(text.chars().flat_map(|c| {
+        let backslash = matches!(c, '\\' | '"').then_some('\\');
+        backslash.into_iter().chain([c])
+    }));
 }
 
 shared_op!(IfOp, |op, ctx| {
@@ -170,60 +172,27 @@ unrolling!(SelectOp);
 
 #[cfg(test)]
 mod tests {
+    use super::push_string_literal;
     use crate::{
         shared::{CompilationOptions, CppCompiler, register_supported_types},
         target::Cuda,
     };
-    use cubecl_core as cubecl;
     use cubecl_core::{
         Compiler,
-        ir::{DeviceProperties, settings::DebugInfo},
-        prelude::*,
-        runtime_tests::offline::offline_device_properties,
+        ir::settings::DebugInfo,
+        runtime_tests::offline::{
+            SOURCE_PATH, nested_calls_kernel, offline_device_properties, source_line,
+        },
     };
     use cubecl_runtime::kernel::CubeKernel;
     use std::sync::Arc;
 
-    #[cube]
-    fn inner(x: f32) -> f32 {
-        let y = x * x;
-        y / 3.0
-    }
-
-    #[cube]
-    fn mid(x: f32) -> f32 {
-        inner(x) * 2.0
-    }
-
-    #[cube(launch)]
-    fn outer(input: &[f32], output: &mut [f32]) {
-        if ABSOLUTE_POS < input.len() {
-            output[ABSOLUTE_POS] = mid(input[ABSOLUTE_POS]);
-        }
-    }
-
-    fn properties() -> Arc<DeviceProperties> {
-        let mut properties = offline_device_properties(32);
-        register_supported_types(&mut properties);
-        Arc::new(properties)
-    }
-
-    /// The CUDA source of `outer` at the debug level `level`. The level is set after the
+    /// The CUDA source of `nested_calls` at the debug level `level`. The level is set after the
     /// resolution, which gives a `dev` build at least line tables, as `CUBECL_DEBUG_INFO` does.
     fn source(level: DebugInfo) -> String {
-        let settings = KernelSettings::new(
-            *CubeDim::new_1d(64),
-            ExecutionMode::Checked,
-            AddressType::U32,
-        );
-        let kernel = outer::Outer::new(
-            settings,
-            properties(),
-            Arc::new(TargetProperties::default()),
-            BufferCompilationArg { inplace: None },
-            BufferCompilationArg { inplace: None },
-        );
-        let mut definition = kernel.define();
+        let mut properties = offline_device_properties(32);
+        register_supported_types(&mut properties);
+        let mut definition = nested_calls_kernel(Arc::new(properties), level).define();
         definition.settings.debug_info = level;
         CppCompiler::<Cuda>::default()
             .compile(definition, &CompilationOptions::default())
@@ -231,29 +200,35 @@ mod tests {
             .to_string()
     }
 
-    /// The lines of the `#line` directives in `source`.
-    fn directive_lines(source: &str) -> Vec<u32> {
+    /// A file and a line in it.
+    type SourceLine<'a> = (&'a str, u32);
+
+    /// Whether a code line is a statement, and the text of the statement in the source.
+    type Statement = (fn(&str) -> bool, &'static str);
+
+    /// Each code line of `source`, with the file and the line that the C++ compiler gives it after
+    /// the `#line` directives.
+    fn compiled_lines(source: &str) -> Vec<(&str, Option<SourceLine<'_>>)> {
+        let mut next = None;
         source
             .lines()
-            .filter_map(|line| line.strip_prefix("#line "))
-            .map(|rest| {
-                let (line, file) = rest.split_once(' ').unwrap();
-                assert!(file.ends_with("branch.rs\""), "{rest}");
-                // With `std`, the search finds the workspace root, a parent of the working
-                // directory.
-                let path = std::path::Path::new(file.trim_matches('"'));
-                if cfg!(feature = "std") {
-                    assert!(path.is_absolute() && path.is_file(), "{rest}");
+            .filter_map(|line| {
+                if let Some(rest) = line.strip_prefix("#line ") {
+                    let (number, file) = rest.split_once(' ').unwrap();
+                    next = Some((file.trim_matches('"'), number.parse().unwrap()));
+                    return None;
                 }
-                line.parse().unwrap()
+                let current = next;
+                next = next.map(|(file, number)| (file, number + 1));
+                Some((line, current))
             })
             .collect()
     }
 
-    /// Each op gets the line of its innermost `#[cube]` frame, so the lines of `inner`, `mid` and
-    /// `outer` are in the source.
+    /// Each statement gets the line of its innermost `#[cube]` frame, also where a directive is
+    /// left out because the line count already gives that line, and after a call returns.
     #[test]
-    fn source_lines_are_line_directives() {
+    fn statements_have_the_lines_of_their_source() {
         let source = source(DebugInfo::LineTables);
         let starts_a_line = source
             .match_indices("#line")
@@ -262,10 +237,39 @@ mod tests {
             starts_a_line,
             "a directive is not at the start of a line:\n{source}"
         );
-        let mut lines = directive_lines(&source);
-        lines.sort();
-        lines.dedup();
-        assert!(lines.len() >= 4, "lines {lines:?} in:\n{source}");
+
+        let lines = compiled_lines(&source);
+        let statements: [Statement; 3] = [
+            (
+                |code| code.contains("= x_v") && code.contains(" * x_v"),
+                "let y = x * x;",
+            ),
+            (
+                |code| code.contains("= y_v") && code.contains(" / "),
+                "y / 3.0",
+            ),
+            (
+                |code| code.contains("= third_v") && code.contains(" * "),
+                "third * 2.0",
+            ),
+        ];
+        for (is_statement, text) in statements {
+            let [(code, line)] = lines
+                .iter()
+                .filter(|(code, _)| is_statement(code))
+                .collect::<Vec<_>>()[..]
+            else {
+                panic!("no single statement for `{text}` in:\n{source}");
+            };
+            let (file, number) = line.unwrap_or_else(|| panic!("`{code}` has no line"));
+            assert_eq!(number, source_line(text), "`{code}` in:\n{source}");
+            assert!(file.ends_with(SOURCE_PATH), "{file}");
+            // With `std`, the search finds the workspace root, a parent of the working directory.
+            if cfg!(feature = "std") {
+                let path = std::path::Path::new(file);
+                assert!(path.is_absolute() && path.is_file(), "{file}");
+            }
+        }
     }
 
     /// Without debug data, the source has no directive, although the ops have locations.
@@ -273,5 +277,12 @@ mod tests {
     fn no_line_directives_without_debug_data() {
         let source = source(DebugInfo::None);
         assert!(!source.contains("#line"), "{source}");
+    }
+
+    #[test]
+    fn file_names_are_c_string_literals() {
+        let mut out = String::new();
+        push_string_literal(&mut out, r#"C:\src\"k".rs"#);
+        assert_eq!(out, r#"C:\\src\\\"k\".rs"#);
     }
 }
