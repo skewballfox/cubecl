@@ -61,9 +61,19 @@ The CPU path gives each tool the kernel name, the source lines, the inlined `#[c
 
 **Kernel:** the example [`profiling_kernels`](https://github.com/skewballfox/cubecl/blob/bcbe4e1ea363ca27d6b17fe34de20086a10f9b7a/examples/profiling_kernels/src/main.rs#L9-L32) has two kernels with the chain `kernel → doubled → square_third`. `nested_lines` has line tables from the cargo profile. `nested_full` has `debug_symbols`, thus `Full`. All checks used the `dev` profile. Nsight Compute also ran on a release profile with `debug = "line-tables-only"`, with the same result.
 
-**Nsight Compute user interface:** the report opens in `ncu-ui` 2025.3.1, in a container on a different computer. The two kernels have 16 registers for each thread, thus `Full` does not change the register count. The screenshot shows the Summary page, not the Inline Functions table.
+**Nsight Compute user interface:** the report opens in `ncu-ui` 2025.3.1, in a container on a different computer. The two kernels have 16 registers for each thread, thus `Full` does not change the register count.
 
 ![The Summary page of the report: nested_lines and nested_full, 16 registers each](ncu-summary-nested-lines-vs-full.png)
+
+The Source page of `nested_lines` shows `main.rs` from the report next to the SASS. The `#[cube]` lines have metrics: line 11 (`square_third`) has 46.99% of the warp stall samples, line 12 has 20.29% of the executed instructions, and line 17 (`doubled`) has 8.70%. On this page, line 17 has fewer executed instructions than line 12. Thus this page does not add the metrics of an inlined line to its call site, as the CSV output does (see below). Lines 11 and 17 have a warning sign. A click on the sign opens the tab "Inline Functions" below the source view. For line 11, the tab shows one call site: line 17 of `main.rs` (`square_third(x)`), with the inline function name `square_third` and its address. The SASS view selects the `FMUL R0, R4, R4` of `x * x`, with 48.86% of the warp stall samples. Thus the user interface shows the names that `name_inlined_functions` gives (§2).
+
+![The Inline Functions tab for line 11: call site main.rs:17, inline function square_third](ncu-inline-functions-nested-lines.png)
+
+For line 17, the tab shows the next level: the call site line 23 of `main.rs` (`output[ABSOLUTE_POS] = …`), with the inline function name `doubled`. Thus the user interface shows the two levels of the chain `nested_lines → doubled → square_third`.
+
+![The Inline Functions tab for line 17: call site main.rs:23, inline function doubled](ncu-inline-functions-doubled-nested-lines.png)
+
+![The Source page of nested_lines: main.rs with metrics on lines 11, 12 and 17, next to the SASS](ncu-source-nested-lines.png)
 
 **Tools:** `ncu` 2025.3.1 and cuda-gdb 13.0, from the NVIDIA CUDA RPM repository for Fedora 42 (`nsight-compute-2025.3.1`, `cuda-gdb-13-0`). `rpmkeys --checksig` accepts both packages with the NVIDIA key `610C7B14…D42D0685`. The packages were unpacked, not installed. The image `nvcr.io/nvidia/cuda` was not used: NVIDIA signs only the manifest list, not the amd64 image, and a policy that requires signatures rejects the image. The driver has `RmProfilingAdminOnly: 0`, thus `ncu` ran without root.
 
@@ -72,7 +82,7 @@ The CPU path gives each tool the kernel name, the source lines, the inlined `#[c
 - The source view shows the `#[cube]` lines from the absolute path `…/examples/profiling_kernels/src/main.rs`, for the two kernels.
 - The report contains the file text (1894 bytes, the size of the file). The Python report interface (`IAction.source_files`) gives it.
 - `ncu` uses the inline chain. The metrics of line 12 (`square_third`) are also added to its call sites, line 17 (`doubled`) and line 23 or 30 (the kernel). The NVIDIA documentation describes this aggregation for inline functions.
-- The command line and the Python report interface do not show the inline function names. Only the "Inline Functions" table of the user interface shows them. The table was not examined. The names are in the cubin (§2).
+- The command line and the Python report interface do not show the inline function names. Only the "Inline Functions" table of the user interface shows them (see the Source page above). The names are in the cubin (§2).
 - The slow path of the `f32` division is a subroutine (`CALL.REL.NOINC`). Its instructions have the line of the `#[cube(launch)]` attribute (line 20 or 27), not the line of the division.
 
 **The search for the compile directory:**
@@ -94,9 +104,14 @@ The CPU path gives each tool the kernel name, the source lines, the inlined `#[c
 
 **gdb on the CPU** (gdb 17.2, the `cpu` runtime, `dev` profile): a breakpoint on line 11 gives `square_third () at …:11`, `doubled () at …:17`, `nested_lines () at …:23`, then `run_kernel`. gdb shows the source from the workspace root, and from a directory outside the workspace with `CUBECL_SOURCE_ROOT`. Without the variable, gdb writes "No such file or directory", but the frames and the lines are correct. This closes "Not checked with gdb" of PLAN §3.4.
 
+**lldb on the CPU** (lldb 23.1.2 from Homebrew, the `cpu` runtime, `dev` profile, the GDB JIT interface of lldb at its default setting):
+
+- From the workspace root, a breakpoint on line 11 stops at `square_third at main.rs:11:13 [inlined]`, `doubled at main.rs:17:5 [inlined]`, `nested_lines at main.rs:23:32`, then `run_kernel`. lldb shows the source. `image lookup -v -a $pc` gives the blocks `doubled` and `square_third` in the kernel.
+- From a directory outside the workspace, without `CUBECL_SOURCE_ROOT`, the search finds no directory, and the path stays relative. At `Full`, lldb reads the source text from the DWARF and shows the `#[cube]` lines of `nested_full`. lldb writes the text to a temporary file (for example `/tmp/-8b8ba8.main.rs`), and the frames show that name. gdb does not read the text (PLAN §3.4).
+- **Limit:** lldb keeps a file that it did not find, by its path. `nested_lines` and `nested_full` have the same relative path, and only `nested_full` has the text. If lldb shows `nested_lines` first, it does not show the source of line 11 in `nested_full` later. The outer frames of `nested_full` still show the text. If lldb shows `nested_full` first, it shows the text in all frames. A small C program with `-gembed-source`, an empty compile directory and a relative path shows the text in all frames, thus the DWARF of the kernel is not the cause. With `CUBECL_SOURCE_ROOT` or the source cache (§7), the paths are absolute, and this limit does not apply. That was not checked with lldb.
+
 ## 6. Not done
 
-- **The Inline Functions table of the Nsight Compute user interface.** The command line does not show it, and the check had no display.
 - **NVRTC inline frames.** The C++ backend puts all `#[cube]` calls into one function body. Inline frames need a device function for each `#[cube]` function.
 - **Source text in the PTX.** `ptxas` rejects it (step-5-followup.md, fact 2). `ncu --import-source yes` copies the files into the report. The source cache (§7) gives a file when the source tree is not on the computer.
 
