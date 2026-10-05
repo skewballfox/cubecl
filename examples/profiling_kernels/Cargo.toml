@@ -13,6 +13,7 @@ version.workspace = true
 default = ["wgpu"]
 wgpu = ["cubecl/wgpu"]
 cuda = ["cubecl/cuda"]
+hip = ["cubecl/hip"]
 cpu = ["cubecl/cpu"]
 
 [dependencies]
