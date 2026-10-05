@@ -12,6 +12,7 @@ on:
       - "!**.md"
       - "!LICENSE-APACHE"
       - "!LICENSE-MIT"
+  workflow_dispatch:
   pull_request:
     types: [opened, synchronize]
     paths:
@@ -103,16 +104,7 @@ jobs:
         run: xtask doc --ci tests
 
   linux-std-tests:
-    runs-on: [
-      '@id:cubecl-linux-std-tests-${{ matrix.rust }}-${{ github.run_id }}-${{ github.run_attempt }}',
-      '@image-family:ubuntu-2404-lts-amd64',
-      '@image-project:ubuntu-os-cloud',
-      '@disk-size:100',
-      '@keep-alive:false',
-      '@machine-type:n2-standard-16',
-      '@os:linux',
-      '@zones:northamerica-northeast1-b'
-      ]
+    runs-on: ubuntu-24.04
     needs: [prepare-checks, code-quality]
     strategy:
       matrix:
@@ -123,6 +115,10 @@ jobs:
           - rust: prev
             toolchain: ${{ needs.prepare-checks.outputs.rust-prev-version }}
     steps:
+      - name: Free disk space
+        # GitHub-hosted runners have about 14 GB free; the test build needs more.
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      # --------------------------------------------------------------------------------
       - name: checkout
         uses: actions/checkout@v6
       # --------------------------------------------------------------------------------
@@ -143,16 +139,7 @@ jobs:
         run: xtask test --ci
 
   linux-miri-tests:
-    runs-on: [
-      '@id:cubecl-linux-miri-tests-${{ matrix.rust }}-${{ github.run_id }}-${{ github.run_attempt }}',
-      '@image-family:ubuntu-2404-lts-amd64',
-      '@image-project:ubuntu-os-cloud',
-      '@disk-size:100',
-      '@keep-alive:false',
-      '@machine-type:n2-standard-16',
-      '@os:linux',
-      '@zones:northamerica-northeast1-b'
-      ]
+    runs-on: ubuntu-24.04
     needs: [prepare-checks, code-quality]
     strategy:
       matrix:
@@ -163,6 +150,10 @@ jobs:
             # Unpin once a parking_lot_core release passes `*u32` to `syscall(SYS_futex, ...)`.
             toolchain: nightly-2026-09-09
     steps:
+      - name: Free disk space
+        # GitHub-hosted runners have about 14 GB free; the test build needs more.
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      # --------------------------------------------------------------------------------
       - name: checkout
         uses: actions/checkout@v6
       # --------------------------------------------------------------------------------
