@@ -7,6 +7,7 @@ use quote::{ToTokens, format_ident, quote, quote_spanned};
 use syn::{Ident, TypeParamBound, parse_quote};
 
 use crate::{
+    generate::statement::name_debug_var,
     parse::{
         kernel::{
             DefinedGeneric, ExecutionMode, KernelBody, KernelFn, Launch, anon_lifetime_to_static,
@@ -57,7 +58,6 @@ impl KernelFn {
 
         let (debug_source, debug_params) = if self.context.debug_symbols {
             let debug_source = frontend_type("debug_source_expand");
-            let debug_var = frontend_type("debug_var_expand");
             // Only full debug data embeds the source, so other builds don't carry every file.
             let full = self.args.forces_full_debug_info();
             let source_text = match full.then(|| self.source_file()).flatten() {
@@ -72,10 +72,7 @@ impl KernelFn {
             let debug_params = sig
                 .runtime_params()
                 .map(|it| &it.name)
-                .map(|name| {
-                    let name_str = name.to_string();
-                    quote! [#debug_var(scope, #name_str, &#name);]
-                })
+                .map(|name| name_debug_var(&name.to_string(), &quote![#name]))
                 .collect();
             (debug_source, debug_params)
         } else {

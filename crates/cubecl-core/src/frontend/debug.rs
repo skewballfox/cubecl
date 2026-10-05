@@ -78,13 +78,36 @@ impl Drop for DebugFrame<'_> {
     }
 }
 
-/// Names the value of variable `name`, when the kernel records debug data.
-pub fn debug_var_expand<E: CubeDebug>(scope: &Scope, name: &'static str, expand: E) -> E {
-    if scope.debug_state().is_some() {
-        expand.set_debug_name(scope, name);
-    }
-    expand
+/// A variable that the macro names only when its type implements [`CubeDebug`].
+///
+/// A `#[cube]` function can bind a value of a plain Rust type, for example a comptime enum that
+/// another `#[cube]` function returns. That value has no name to set, and must not need
+/// [`CubeDebug`]. The macro calls `debug_var` on `&DebugVar`: method resolution takes
+/// [`DebugVarNamed`] when it applies, else [`DebugVarUnnamed`].
+#[doc(hidden)]
+pub struct DebugVar<'a, E>(pub &'a E);
+
+/// Names a [`DebugVar`] whose type implements [`CubeDebug`].
+#[doc(hidden)]
+pub trait DebugVarNamed {
+    fn debug_var(&self, scope: &Scope, name: &'static str);
 }
+
+impl<E: CubeDebug> DebugVarNamed for DebugVar<'_, E> {
+    fn debug_var(&self, scope: &Scope, name: &'static str) {
+        if scope.debug_state().is_some() {
+            self.0.set_debug_name(scope, name);
+        }
+    }
+}
+
+/// Leaves a [`DebugVar`] of any other type without a name.
+#[doc(hidden)]
+pub trait DebugVarUnnamed {
+    fn debug_var(&self, _scope: &Scope, _name: &'static str) {}
+}
+
+impl<E> DebugVarUnnamed for &DebugVar<'_, E> {}
 
 /// Prints a formatted message using the print debug layer in Vulkan, or `printf` in CUDA.
 pub fn printf_expand(scope: &Scope, format_string: impl Into<String>, args: Vec<Value>) {
@@ -190,6 +213,28 @@ mod tests {
     fn use_pair(x: u32) -> u32 {
         let pair = Pair { a: x };
         pair.sum(x)
+    }
+
+    /// A plain Rust type: it has no `CubeType` and no `CubeDebug`.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Sign {
+        Plus,
+        Minus,
+    }
+
+    #[cube]
+    fn pick(#[comptime] sign: Sign) -> comptime_type!(Sign) {
+        sign
+    }
+
+    #[cube]
+    fn signed(x: u32, #[comptime] sign: Sign) -> u32 {
+        let sign = pick(sign);
+        if comptime!(sign == Sign::Minus) {
+            x * x
+        } else {
+            x + x
+        }
     }
 
     /// Runs `expand` on a new kernel scope and returns the location of each op it inserted.
@@ -311,6 +356,24 @@ mod tests {
                         && *at == line
                         && *outer == "use_pair"),
                 "no op at line {line}: {call_sites:?}"
+            );
+        }
+    }
+
+    /// A variable of a plain Rust type, such as a comptime enum, needs no `CubeDebug`. It gets no
+    /// name, and the ops of the function still get their lines.
+    #[test]
+    fn a_plain_variable_needs_no_cube_debug() {
+        for sign in [Sign::Plus, Sign::Minus] {
+            let locations = locations(DebugInfo::LineTables, |scope, x| {
+                signed::expand(scope, x, sign);
+            });
+            assert!(
+                locations
+                    .iter()
+                    .filter_map(frame)
+                    .any(|(name, ..)| name == "signed"),
+                "{locations:?}"
             );
         }
     }
