@@ -2,11 +2,11 @@ use crate as cubecl;
 use alloc::{string::String, vec, vec::Vec};
 
 use cubecl::prelude::*;
-use cubecl_common::bytes::Bytes;
+use cubecl_common::bytes::{AccessError, AccessPolicy, Bytes};
 use cubecl_ir::features::{GridSync, GridSyncEmulation};
 use cubecl_runtime::{
     persistent::split::split,
-    server::{Handle, ResourceLimitError},
+    server::{CompletionToken, Handle, ResourceLimitError},
 };
 
 use super::launch::resource_error;
@@ -817,6 +817,152 @@ pub fn test_sync_grid_needs_runtime_support(client: Client) {
     assert_eq!(refused, !supported, "{errors:?}");
 }
 
+/// Keeps each unit busy for `rounds` steps, so that a launch takes long enough to be in flight
+/// when the host asks a token.
+#[cube(launch)]
+fn kernel_busy(values: &mut [u32], rounds: u32) {
+    let mut value = values[ABSOLUTE_POS];
+    for round in 0..rounds {
+        value = value * 3 + round;
+    }
+    values[ABSOLUTE_POS] = value;
+}
+
+/// Adds `len` items of the ring, from `ring_offset`, to the output at `output_offset`. An
+/// output equal to the input proves that each chunk was consumed exactly one time.
+#[cube(launch, persistent)]
+fn kernel_consume_chunk(
+    ring: &[u32],
+    output: &mut [u32],
+    ring_offset: u32,
+    output_offset: u32,
+    len: u32,
+) {
+    for item in persistent_range_units(len as usize) {
+        output[output_offset as usize + item] += ring[ring_offset as usize + item];
+    }
+}
+
+/// Test 11 of the plan (H2): a token is done after a wait on it, with each [`MarkSubmit`].
+///
+/// The kernels can complete before the first question, so `is_done` before the wait proves
+/// nothing here. The runtime-independent default, where it does, is tested on the dummy server
+/// of `cubecl-server`.
+///
+/// # Panics
+///
+/// If a wait fails, or a token is not done after its wait.
+pub fn test_mark_is_done_after_wait(client: Client) {
+    let units = 4 * 256;
+    let values = client.create_from_slice(u32::as_bytes(&vec![1u32; units]));
+    let busy = |client: &Client| {
+        kernel_busy::launch(
+            client,
+            CubeCount::new_1d(4),
+            CubeDim::new_1d(256),
+            unsafe { BufferArg::from_raw_parts(values.clone(), units) },
+            100_000,
+        );
+    };
+
+    busy(&client);
+    let now = client.mark();
+    busy(&client);
+    let deferred = client.mark_deferred();
+
+    cubecl_environment::future::block_on(client.wait(&deferred)).unwrap();
+    assert!(deferred.is_done());
+    cubecl_environment::future::block_on(client.wait(&now)).unwrap();
+    assert!(now.is_done());
+
+    // Nothing is queued after the waits, so this mark is at a point the device has reached.
+    let idle = client.mark_deferred();
+    cubecl_environment::future::block_on(client.wait(&idle)).unwrap();
+    assert!(idle.is_done());
+}
+
+/// Test 12 of the plan (H1 and H2): a producer pushes chunks through a ring, and writes a slot
+/// only after the token of the launch that read the slot is done.
+///
+/// # Panics
+///
+/// If a wait or a view fails, or a chunk is not consumed exactly one time.
+pub fn test_ring_of_host_views(client: Client) {
+    const CHUNK: usize = 64;
+    const SLOTS: usize = 4;
+    const CHUNKS: usize = 100;
+    const SLOT_BYTES: usize = CHUNK * size_of::<u32>();
+    let index = |value: usize| u32::try_from(value).expect("the test indices fit in u32");
+    let bytes = |value: usize| u64::try_from(value).expect("the test sizes fit in u64");
+
+    let input: Vec<u32> = (1..=index(CHUNK * CHUNKS)).collect();
+    let ring = client.create_from_slice(u32::as_bytes(&vec![0u32; CHUNK * SLOTS]));
+    let output = client.create_from_slice(u32::as_bytes(&vec![0u32; CHUNK * CHUNKS]));
+    let mapped = client.properties().features.host_visible_storage;
+
+    let mut tokens: [Option<CompletionToken>; SLOTS] = Default::default();
+    for (chunk, data) in input.chunks(CHUNK).enumerate() {
+        let slot = chunk % SLOTS;
+        if let Some(token) = &tokens[slot] {
+            cubecl_environment::future::block_on(client.wait(token)).unwrap();
+            assert!(token.is_done());
+        }
+
+        let slot_handle = ring
+            .clone()
+            .offset_start(bytes(slot * SLOT_BYTES))
+            .offset_end(bytes((SLOTS - slot - 1) * SLOT_BYTES));
+        // SAFETY: the token of the last launch that read the slot is done, and no launch
+        // after it reads the slot.
+        let mut view = if mapped {
+            unsafe { client.host_view_mut(&slot_handle, AccessPolicy::zero_copy()) }.unwrap()
+        } else {
+            let refused = unsafe { client.host_view_mut(&slot_handle, AccessPolicy::zero_copy()) };
+            assert_eq!(refused.unwrap_err(), AccessError::WouldCopy);
+            unsafe { client.host_view_mut(&slot_handle, AccessPolicy::allow_copy()) }.unwrap()
+        };
+        assert_eq!(view.is_mapped(), mapped);
+        assert_eq!(view.len(), SLOT_BYTES);
+        view.copy_from_slice(u32::as_bytes(data));
+        drop(view);
+
+        kernel_consume_chunk::launch_persistent(
+            &client,
+            PersistentCount::Fill,
+            CubeDim::new_1d(16),
+            unsafe { BufferArg::from_raw_parts(ring.clone(), CHUNK * SLOTS) },
+            unsafe { BufferArg::from_raw_parts(output.clone(), CHUNK * CHUNKS) },
+            index(slot * CHUNK),
+            index(chunk * CHUNK),
+            index(CHUNK),
+        );
+        tokens[slot] = Some(if chunk % 2 == 0 {
+            client.mark()
+        } else {
+            client.mark_deferred()
+        });
+    }
+
+    // One launch over all the chunks.
+    let all = client.create_from_slice(u32::as_bytes(&input));
+    let expected = client.create_from_slice(u32::as_bytes(&vec![0u32; CHUNK * CHUNKS]));
+    kernel_consume_chunk::launch_persistent(
+        &client,
+        PersistentCount::Fill,
+        CubeDim::new_1d(16),
+        unsafe { BufferArg::from_raw_parts(all, CHUNK * CHUNKS) },
+        unsafe { BufferArg::from_raw_parts(expected.clone(), CHUNK * CHUNKS) },
+        0,
+        0,
+        index(CHUNK * CHUNKS),
+    );
+
+    let output = u32::from_bytes(&client.read_one_unchecked(output)).to_vec();
+    let expected = u32::from_bytes(&client.read_one_unchecked(expected)).to_vec();
+    assert_eq!(output, input);
+    assert_eq!(output, expected);
+}
+
 #[allow(missing_docs)]
 #[macro_export]
 macro_rules! testgen_persistent {
@@ -846,7 +992,9 @@ macro_rules! testgen_persistent {
                 test_split_refuses_a_value_in_registers,
                 test_split_refuses_sync_grid_in_a_loop,
                 test_sync_grid_needs_a_cooperative_kernel,
-                test_sync_grid_needs_runtime_support
+                test_sync_grid_needs_runtime_support,
+                test_mark_is_done_after_wait,
+                test_ring_of_host_views
             );
         }
     };

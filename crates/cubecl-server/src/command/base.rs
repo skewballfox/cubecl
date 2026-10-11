@@ -547,6 +547,23 @@ impl<'a, D: Driver> Command<'a, D> {
         Box::pin(async move { fence.wait() })
     }
 
+    /// A fence after everything already enqueued on the current stream, for
+    /// a caller to ask or wait on outside the server.
+    ///
+    /// # Errors
+    ///
+    /// While the stream records a graph: a fence recorded there is a node of
+    /// the graph, not a point the host can wait for.
+    pub fn mark(&mut self) -> Result<<D::Stream as DeviceStream>::Fence, ServerError> {
+        let stream = self.streams.current();
+        if stream.capturing().is_recording() {
+            return Err(ServerError::graph_state(
+                "a stream that records a graph cannot take a mark",
+            ));
+        }
+        Ok(D::Stream::fence(stream.signal()))
+    }
+
     /// Enqueue an already-compiled kernel on the current stream.
     ///
     /// # Errors

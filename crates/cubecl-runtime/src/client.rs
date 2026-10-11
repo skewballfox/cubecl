@@ -7,10 +7,10 @@ use crate::{
     memory_management::{MemoryAllocationMode, MemoryReport, MemoryScope},
     persistent::{LaunchPlan, PersistentCount, split::SplitPhase},
     server::{
-        BufferBinding, Collective, CommunicationId, CopyDescriptor, CubeCount, Handle,
-        KernelArguments, KernelResource, MemoryLayout, MemoryLayoutDescriptor,
-        MemoryLayoutStrategy, ProfileError, ProfilingToken, ReduceOperation, Server, ServerError,
-        ServerStorage, ServerUtilities,
+        BufferBinding, Collective, CommunicationId, CompletionToken, CopyDescriptor, CubeCount,
+        Handle, HostView, KernelArguments, KernelResource, MarkSubmit, MemoryLayout,
+        MemoryLayoutDescriptor, MemoryLayoutStrategy, ProfileError, ProfilingToken,
+        ReduceOperation, Server, ServerError, ServerStorage, ServerUtilities,
     },
     storage::{ComputeStorage, ManagedResource},
     throughput::{
@@ -23,7 +23,7 @@ use core::any::{Any, TypeId};
 #[cfg(not(target_family = "wasm"))]
 mod lazy;
 use cubecl_common::{
-    bytes::{AllocationProperty, Bytes},
+    bytes::{AccessError, AccessPolicy, AllocationProperty, Bytes},
     device::{DeviceId, ServiceId},
     device_handle::{CallResultExt, DeviceHandle},
     profile::ProfileDuration,
@@ -1562,6 +1562,97 @@ impl Client {
         self.utilities.logger.profile_summary();
 
         fut
+    }
+
+    /// A token for the point after the last task queued on this client's
+    /// stream. Submits the queued work now (see [`MarkSubmit::Now`]).
+    #[must_use]
+    pub fn mark(&self) -> CompletionToken {
+        self.mark_with(MarkSubmit::Now)
+    }
+
+    /// [`mark`](Self::mark), but the queued work stays batched until the next
+    /// flush of the stream (see [`MarkSubmit::Deferred`]).
+    #[must_use]
+    pub fn mark_deferred(&self) -> CompletionToken {
+        self.mark_with(MarkSubmit::Deferred)
+    }
+
+    fn mark_with(&self, submit: MarkSubmit) -> CompletionToken {
+        let stream_id = self.stream_id();
+        let signal = self
+            .device
+            .submit_blocking(move |server| server.mark(stream_id, submit))
+            .unwrap_or_resume();
+        CompletionToken::new(signal, stream_id, submit)
+    }
+
+    /// Resolves when the device has completed every task queued before
+    /// `token` was marked. The token must come from a client of this device.
+    ///
+    /// # Errors
+    ///
+    /// The fault the device reports, or the reason the mark was refused. A
+    /// launch failure is not this wait's to report, as for
+    /// [`sync`](Self::sync).
+    pub fn wait(&self, token: &CompletionToken) -> DynFut<Result<(), ServerError>> {
+        token.wait(self)
+    }
+
+    /// A writable host view of `handle`.
+    ///
+    /// Where the memory is host-visible ([`Features::host_visible_storage`]),
+    /// the view writes into the allocation itself, with no copy. Elsewhere, an
+    /// [`AccessPolicy::zero_copy`] policy fails with
+    /// [`AccessError::WouldCopy`], and an [`AccessPolicy::allow_copy`] policy
+    /// gives a zeroed host buffer that the drop of the view queues with
+    /// [`write`](Self::write) on this client's stream.
+    ///
+    /// # Errors
+    ///
+    /// [`AccessError::WouldCopy`] as above, or [`AccessError::Read`] when the
+    /// handle belongs to another device or the server refuses the view.
+    ///
+    /// # Safety
+    ///
+    /// For a view with no copy ([`HostView::is_mapped`]): while the view
+    /// exists, no launch, write or copy that is queued and not complete may
+    /// read or write the range of `handle`. A [`CompletionToken`] marked after
+    /// the last such task, and done, proves this. A staged view has no such
+    /// condition, because its write is ordered on the stream.
+    pub unsafe fn host_view_mut(
+        &self,
+        handle: &Handle,
+        policy: AccessPolicy,
+    ) -> Result<HostView, AccessError> {
+        let binding = handle.clone().binding();
+        self.local(&binding)
+            .map_err(|err| AccessError::Read(format!("{err}")))?;
+        let stream_id = self.stream_id();
+        let mapped = self
+            .device
+            .submit_blocking(move |server| server.host_view(binding, stream_id))
+            .unwrap_or_resume()
+            .map_err(|err| AccessError::Read(format!("{err}")))?;
+        match mapped {
+            Some(memory) => Ok(HostView::mapped(memory)),
+            None if policy.copy_allowed() => Ok(HostView::staged(handle.clone(), self.clone())),
+            None => Err(AccessError::WouldCopy),
+        }
+    }
+
+    /// Flush `stream_id`, which can be another stream than this client's.
+    pub(crate) fn flush_stream(&self, stream_id: StreamId) -> Result<(), ServerError> {
+        self.device
+            .submit_blocking(move |server| server.flush(stream_id))
+            .unwrap_or_resume()
+    }
+
+    /// Sync `stream_id`, which can be another stream than this client's.
+    pub(crate) fn sync_stream(&self, stream_id: StreamId) -> DynFut<Result<(), ServerError>> {
+        self.device
+            .submit_blocking(move |server| server.sync(Vec::new(), stream_id))
+            .unwrap_or_resume()
     }
 
     /// The bindings `handles` name, which is what crosses to the device

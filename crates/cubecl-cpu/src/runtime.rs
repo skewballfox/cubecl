@@ -217,6 +217,8 @@ impl DeviceService for CpuServer {
                 unaligned_io: true,
                 // Launches on a stream run in order, so a split is a barrier.
                 grid_sync: GridSync::Emulated(GridSyncEmulation::Split.into()),
+                // The storage is host memory, so a host view writes it in place.
+                host_visible_storage: true,
                 ..Default::default()
             },
             mem_properties.clone(),

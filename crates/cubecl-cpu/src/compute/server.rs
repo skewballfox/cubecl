@@ -13,8 +13,9 @@ use cubecl_core::{
     CompilationError, CubeCount, MemoryConfiguration,
     ir::MemoryDeviceProperties,
     server::{
-        BufferBinding, CopyDescriptor, IoError, KernelArguments, KernelResource, LaunchError,
-        ProfileError, ProfilingToken, Server, ServerCommunication, ServerError, ServerUtilities,
+        BufferBinding, CompletionSignal, CopyDescriptor, IoError, KernelArguments, KernelResource,
+        LaunchError, MappedMemory, MarkSubmit, ProfileError, ProfilingToken, Server,
+        ServerCommunication, ServerError, ServerUtilities,
     },
     zspace::{Shape, Strides, strides},
 };
@@ -31,6 +32,7 @@ use cubecl_server::{
     stream::scheduler::{SchedulerMultiStream, SchedulerMultiStreamOptions, SchedulerStrategy},
     stream::{ExecuteScope, FailureStore, WriteScoped, failed_writing},
 };
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -473,6 +475,56 @@ impl Server for CpuServer {
         // Nothing beyond that is the flush's to report: a launch failure
         // lives on the buffers it left unwritten.
         stream.flush(stream_id)
+    }
+
+    /// The CPU runtime sends each task to the thread pool when the scheduler
+    /// executes it, so both [`MarkSubmit`] values give the same point.
+    fn mark(
+        &mut self,
+        stream_id: StreamId,
+        _submit: MarkSubmit,
+    ) -> Result<Option<Arc<dyn CompletionSignal>>, ServerError> {
+        self.scheduler.execute_streams(vec![stream_id]);
+        Ok(Some(self.scheduler.stream(&stream_id).mark()))
+    }
+
+    /// The memory is host memory, so the view is the pool allocation itself.
+    /// It does not copy on write, as a read-back does: the `# Safety` contract
+    /// of `Client::host_view_mut` replaces the copy.
+    fn host_view(
+        &mut self,
+        binding: BufferBinding,
+        stream_id: StreamId,
+    ) -> Result<Option<MappedMemory>, ServerError> {
+        // The same scope as a write: the host fills the range, which releases
+        // an earlier failure's claim on it.
+        let mut written = self.write_set();
+        written.push(binding.clone());
+        ExecuteScope::over(self, stream_id, written)
+            .execute(|server| {
+                let mut streams = vec![stream_id];
+                if binding.stream != stream_id {
+                    streams.push(binding.stream);
+                }
+                server.scheduler.execute_streams(streams);
+
+                let len = binding.size_in_used();
+                let stream = server.scheduler.stream(&binding.stream);
+                let mut resource = stream.memory_management.managed_resource(
+                    binding.memory,
+                    binding.offset_start,
+                    binding.offset_end,
+                )?;
+                let slice = resource.resource_mut().write();
+                let len = slice.len().min(usize::try_from(len).unwrap_or(usize::MAX));
+                let ptr = NonNull::new(slice.as_mut_ptr()).unwrap_or(NonNull::dangling());
+                // SAFETY: the bound resource keeps the allocation in place, and the
+                // caller of `host_view_mut` keeps every task off the range.
+                Ok(Some(unsafe {
+                    MappedMemory::new(ptr, len, Box::new(resource))
+                }))
+            })
+            .into_result()
     }
 
     fn sync(

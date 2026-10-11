@@ -3,7 +3,7 @@ mod dummy;
 use crate::dummy::{DummyDevice, DummyElementwiseAddition, test_client};
 use cubecl_server::memory_management::MemoryScope;
 
-use cubecl_common::bytes::Bytes;
+use cubecl_common::bytes::{AccessError, AccessPolicy, Bytes};
 use cubecl_common::device::{DeviceId, ServiceId};
 use cubecl_environment::stream::StreamId;
 use cubecl_ir::{ElemType, UIntKind};
@@ -2037,4 +2037,37 @@ fn a_launch_is_collected_while_a_collection_is_open() {
     let collection = LaunchedKernels::new();
     let launched = collection.finish();
     assert!(launched.is_empty(), "a new collection starts empty");
+}
+
+/// The dummy server has no signal of its own, so a token is done only after a
+/// wait on it: the default of `Server::mark`.
+#[test_log::test]
+fn a_mark_without_a_signal_is_done_after_its_wait() {
+    let client = test_client(&DummyDevice);
+    for token in [client.mark(), client.mark_deferred()] {
+        assert!(!token.is_done());
+        cubecl_environment::future::block_on(client.wait(&token)).unwrap();
+        assert!(token.is_done());
+    }
+}
+
+/// The dummy server has no host-visible memory: the default of
+/// `Server::host_view`. A view that may copy writes back on drop.
+#[test_log::test]
+fn a_host_view_without_a_mapping_copies_only_when_allowed() {
+    let client = test_client(&DummyDevice);
+    let handle = client.create_from_slice(&[9u8; 8]);
+
+    let refused = unsafe { client.host_view_mut(&handle, AccessPolicy::zero_copy()) };
+    assert_eq!(refused.unwrap_err(), AccessError::WouldCopy);
+
+    let mut view = unsafe { client.host_view_mut(&handle, AccessPolicy::allow_copy()) }.unwrap();
+    assert!(!view.is_mapped());
+    // A staged view starts zeroed: it does not read the handle back.
+    assert_eq!(&*view, &[0u8; 8]);
+    view.copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    drop(view);
+
+    let written = client.read_one(handle).unwrap().to_vec();
+    assert_eq!(written, [1, 2, 3, 4, 5, 6, 7, 8]);
 }

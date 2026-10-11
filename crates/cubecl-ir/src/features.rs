@@ -40,6 +40,9 @@ pub struct Features {
     /// Whether an exclusive persistent launch gets native grid sync. It can be `true` while
     /// `grid_sync` is an emulation: other work shares the device, so the default launch splits.
     pub exclusive_grid_sync: bool,
+    /// Whether the host can write a live storage buffer with no copy, through a host view.
+    /// A caller reads it before the allocation and selects a strategy.
+    pub host_visible_storage: bool,
 }
 
 /// Type support for a device

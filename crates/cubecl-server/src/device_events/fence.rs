@@ -1,7 +1,9 @@
 use crate::device_events::{Event, EventApi};
 #[cfg(multi_threading)]
 use crate::memory_management::drop_queue;
-use crate::server::ServerError;
+use crate::server::{CompletionSignal, ServerError};
+use alloc::boxed::Box;
+use cubecl_environment::future::DynFut;
 
 /// An event recorded on a stream and handed out, so a caller can wait for that
 /// stream's work from outside the server.
@@ -99,5 +101,32 @@ impl<A: EventApi> core::fmt::Debug for EventFence<A> {
 impl<A: EventApi> drop_queue::Fence for EventFence<A> {
     fn wait(self) -> Result<(), ServerError> {
         self.wait_sync()
+    }
+}
+
+/// A fence is the signal of a [`Client::mark`](cubecl_runtime::client::Client::mark): a
+/// query answers [`is_done`](CompletionSignal::is_done) without a wait, and the wait
+/// runs outside the server.
+impl<A: EventApi> CompletionSignal for EventFence<A> {
+    fn is_done(&self) -> bool {
+        match &self.event {
+            Ok(Some(event)) => event.query().unwrap_or_else(|err| {
+                // Done, as far as a poll can tell: the wait reports the fault.
+                log::debug!("a fence query failed: {err}");
+                true
+            }),
+            // Reached at creation, or refused: the wait reports the refusal.
+            Ok(None) | Err(_) => true,
+        }
+    }
+
+    fn wait(self: alloc::sync::Arc<Self>) -> DynFut<Result<(), ServerError>> {
+        Box::pin(async move {
+            match &self.event {
+                Ok(Some(event)) => Ok(event.wait()?),
+                Ok(None) => Ok(()),
+                Err(err) => Err(err.clone()),
+            }
+        })
     }
 }

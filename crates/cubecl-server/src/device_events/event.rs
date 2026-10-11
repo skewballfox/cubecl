@@ -42,6 +42,15 @@ impl<A: EventApi> Event<A> {
         A::event_wait(&self.sys)
     }
 
+    /// Whether the device has reached this event. Does not block.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError`], the fault the query revealed on the stream.
+    pub fn query(&self) -> Result<bool, DriverError> {
+        A::event_query(&self.sys)
+    }
+
     /// Make `stream` wait for this event on the device, without blocking here.
     ///
     /// # Errors

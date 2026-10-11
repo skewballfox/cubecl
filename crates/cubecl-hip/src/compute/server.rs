@@ -11,7 +11,7 @@ use crate::compute::modules::HipCompiledKernel;
 use crate::compute::{Captures, Window};
 use crate::compute::{Command, context::HipContext, stream::HipStreamBackend};
 use cubecl_common::{bytes::Bytes, profile::ProfileDuration};
-use cubecl_core::server::{DeviceCaptures, ServerStorage};
+use cubecl_core::server::{CompletionSignal, DeviceCaptures, MarkSubmit, ServerStorage};
 use cubecl_core::{
     MemoryConfiguration,
     ir::MemoryDeviceProperties,
@@ -200,6 +200,17 @@ impl Server for HipServer {
         command.stream().memory_management_gpu.storage().flush();
 
         Ok(())
+    }
+
+    /// A device event on the stream. Launches go to the device when they are
+    /// enqueued, so both [`MarkSubmit`] values give the same point.
+    fn mark(
+        &mut self,
+        stream_id: StreamId,
+        _submit: MarkSubmit,
+    ) -> Result<Option<Arc<dyn CompletionSignal>>, ServerError> {
+        let fence = self.command_no_inputs(stream_id)?.mark()?;
+        Ok(Some(Arc::new(fence)))
     }
 
     fn graph_prepare(&mut self, stream_id: StreamId) -> Result<(), ServerError> {

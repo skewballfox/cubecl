@@ -1,4 +1,5 @@
 pub(crate) mod artifact;
+pub(crate) mod completion;
 pub(crate) mod controller;
 pub(crate) mod copies;
 pub(crate) mod device_poison;

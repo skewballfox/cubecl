@@ -1,4 +1,4 @@
-use super::{CaptureStatus, DeviceCaptures, Handle};
+use super::{CaptureStatus, CompletionSignal, DeviceCaptures, Handle, MappedMemory, MarkSubmit};
 use crate::kernel::BufferIOAttr;
 use crate::{
     client::Client,
@@ -757,6 +757,50 @@ pub trait Server:
     /// is not the flush's to report: it lives on the buffers the launch left
     /// unwritten, and surfaces on any read, sync or check of them.
     fn flush(&mut self, stream_id: StreamId) -> Result<(), ServerError>;
+
+    /// A signal for the point after the last task queued on `stream_id`.
+    ///
+    /// `submit` says if the queued work goes to the device now. A runtime that
+    /// does not batch its work ignores it.
+    ///
+    /// The default returns `Ok(None)`: the runtime has no signal, and the
+    /// client syncs the stream to wait for the point. This is correct on every
+    /// runtime, but a sync waits for all the work of the stream, not only the
+    /// work before the mark.
+    ///
+    /// # Errors
+    ///
+    /// When the stream cannot take a mark now, for example while it records a
+    /// graph. The token carries the error, and a wait on it reports it.
+    fn mark(
+        &mut self,
+        stream_id: StreamId,
+        submit: MarkSubmit,
+    ) -> Result<Option<Arc<dyn CompletionSignal>>, ServerError> {
+        let _ = (stream_id, submit);
+        Ok(None)
+    }
+
+    /// Host-visible memory of the range of `binding`, with no copy, or `None`
+    /// if the memory is not host-visible.
+    ///
+    /// The range counts as written when this returns `Some`: the caller writes
+    /// it through the view.
+    ///
+    /// The default returns `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// When the memory is host-visible, but the server cannot give it now, for
+    /// example while the stream records a graph.
+    fn host_view(
+        &mut self,
+        binding: BufferBinding,
+        stream_id: StreamId,
+    ) -> Result<Option<MappedMemory>, ServerError> {
+        let _ = (binding, stream_id);
+        Ok(None)
+    }
 
     /// Compiles every kernel a [`LaunchMode::Queue`] launch queued, now
     /// rather than inside the next launch, so a measurement that follows

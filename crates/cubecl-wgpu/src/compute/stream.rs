@@ -4,6 +4,7 @@ use super::{
     poll::WgpuPoll,
     timings::{QueryProfiler, TimestampQuerySetBudget, TimestampSampling},
 };
+use crate::compute::completion::WgpuSignal;
 use crate::compute::copies::WgpuCopies;
 use crate::compute::device_poison::PoisonWatch;
 use crate::{
@@ -20,7 +21,10 @@ use cubecl_common::{
 };
 use cubecl_core::{
     CubeCount, MemoryConfiguration,
-    server::{BufferBinding, DeviceCaptures, IoError, ProfileError, ProfilingToken, ServerError},
+    server::{
+        BufferBinding, DeviceCaptures, IoError, MarkSubmit, ProfileError, ProfilingToken,
+        ServerError,
+    },
     zspace::Shape,
 };
 use cubecl_environment::backtrace::BackTrace;
@@ -103,6 +107,9 @@ pub struct WgpuStream {
     /// Kept alive here until the next `flush` ties their release to the submission's completion.
     /// See [`ScheduleTask::Execute::pins`](crate::schedule::ScheduleTask).
     shared_bindings: SharedMemoryBindings,
+    /// Marks on work that is not submitted yet. The next submission completes
+    /// them (see [`mark`](Self::mark)).
+    pending_marks: Vec<Arc<WgpuSignal>>,
     /// Reusable per-launch info uniforms (kernel shapes/strides/scalars), keyed
     /// by the exact info words they were built from — same scheme as the CUDA
     /// and HIP servers. A hit reuses the already-uploaded uniform buffer, so a
@@ -236,6 +243,7 @@ impl WgpuStream {
             submission_load: SubmissionLoad::default(),
             pending_write_count: 0,
             shared_bindings: SharedMemoryBindings::default(),
+            pending_marks: Vec::new(),
             // Tighter entry cap than the default policy: the uniforms pool is
             // bucketed exclusive pages with a 32 KiB minimum, so every cached
             // entry pins a whole page (512 × 32 KiB ≈ 16 MiB worst case) —
@@ -886,9 +894,49 @@ impl WgpuStream {
         Ok(())
     }
 
+    /// The loss of the device, if it is lost: a lost device has freed its
+    /// memory, so nothing may write through a mapping any more.
+    pub(crate) fn check_poison(&self) -> Result<(), ServerError> {
+        self.poison.check()
+    }
+
+    /// A signal for the point after the last task queued on this stream.
+    ///
+    /// [`MarkSubmit::Now`] submits the queued work. [`MarkSubmit::Deferred`]
+    /// leaves it for the next submission, unless nothing is queued: then the
+    /// point is already on the queue.
+    pub(crate) fn mark(&mut self, submit: MarkSubmit) -> Result<Arc<WgpuSignal>, ServerError> {
+        self.reject_while_recording("mark")?;
+        let signal = WgpuSignal::new(self.poison.clone());
+        self.pending_marks.push(signal.clone());
+        if submit == MarkSubmit::Now || self.tasks_count == 0 {
+            self.submit();
+        }
+        Ok(signal)
+    }
+
+    /// Complete the pending marks when the queue completes what it has been
+    /// given so far. Call it after each submission.
+    fn complete_marks(&mut self) {
+        if self.pending_marks.is_empty() {
+            return;
+        }
+        let marks = core::mem::take(&mut self.pending_marks);
+        // The callback runs from a device poll, so keep the polling active
+        // until it has run.
+        let poll = self.poll.start_polling();
+        self.queue.on_submitted_work_done(move || {
+            for mark in marks {
+                mark.complete();
+            }
+            core::mem::drop(poll);
+        });
+    }
+
     fn submit_tasks(&mut self) {
         if self.tasks_count == 0 {
             self.shared_bindings.clear();
+            self.complete_marks();
             return;
         }
 
@@ -908,6 +956,7 @@ impl WgpuStream {
 
         // This will _first_ fire off all pending write_buffer work.
         let index = self.queue.submit([tasks_encoder.finish()]);
+        self.complete_marks();
 
         // Release cross-stream input pins.
         if !self.shared_bindings.is_empty() {
