@@ -746,6 +746,12 @@ impl WgpuStream {
         let Some(host_ptr) = resource.host_ptr else {
             return false;
         };
+        // A lost device frees its memory, mapping and all, while the buffers
+        // that name it live on. The queue path reports the loss; a copy through
+        // the mapping would write freed memory.
+        if self.poison.is_poisoned() {
+            return false;
+        }
         // The copy below is unchecked; the queue path validates.
         if data.len() as u64 > resource.size {
             return false;
