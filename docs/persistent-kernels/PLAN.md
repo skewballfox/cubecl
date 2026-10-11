@@ -3,7 +3,7 @@
 - **Base commit:** [`a1bb768ce919260eea56dbd0b59c70e55236e22d`](https://github.com/skewballfox/cubecl/commit/a1bb768ce919260eea56dbd0b59c70e55236e22d) (`main`, 2026-09-25).
 - **Language:** ASD-STE100 and Attempto Controlled English. Domain terms are permitted.
 - **Decisions:** closed decisions are in 3.2. Open decisions are in [`DECISIONS.md`](./DECISIONS.md). This plan refers to a decision as `Dn`.
-- **Status:** ✅ done, 🟡 partly done, ⬜ not started. "Code:" links point to the commit that implements the item: [`39b8e82`](https://github.com/skewballfox/cubecl/commit/39b8e82288fd8856b00bb87ee8240c016b540f62) for M1 and M2, [`ca01d09`](https://github.com/skewballfox/cubecl/commit/ca01d098aaf28feb37227c32023cf53c8857b7f2) for M3, [`7a065a0`](https://github.com/skewballfox/cubecl/commit/7a065a02f6ef4da039892a5d86d63daef0557f27) for M4 to M7. Items without a mark are design text. The branch `claude/vibrant-wright-7zpf9j` holds the implemented parts. Where the code differs from the first draft of this plan, the plan now describes the code.
+- **Status:** ✅ done, 🟡 partly done, ⬜ not started. "Code:" links point to the commit that implements the item: [`39b8e82`](https://github.com/skewballfox/cubecl/commit/39b8e82288fd8856b00bb87ee8240c016b540f62) for M1 and M2, [`ca01d09`](https://github.com/skewballfox/cubecl/commit/ca01d098aaf28feb37227c32023cf53c8857b7f2) for M3, [`7a065a0`](https://github.com/skewballfox/cubecl/commit/7a065a02f6ef4da039892a5d86d63daef0557f27) for M4 to M7. Items without a mark are design text. Section 3.9, M8 and M9 (host-shared buffers for streaming input) are design text only. The branch `claude/vibrant-wright-7zpf9j` holds the implemented parts. Where the code differs from the first draft of this plan, the plan now describes the code.
 - **Merge of `main` at [`4362f78`](https://github.com/skewballfox/cubecl/commit/4362f783f4d160ca33f466d141245d4e30c67510) (2026-10-10):** `main` moved kernel loading into `KernelLoader` (`cubecl-server/src/compiler/loader.rs`), renamed `dry_run` to `execution`, replaced the `SideEffects` interface with the `HasSideEffects` op trait, renamed `MemoryEffects` to `side_effects::MemoryEffectsOp`, and replaced `Scope::child` with `branch_child` and other children. The sections 3.4 and 3.8 describe the code after the merge. The "Code:" links still point to the commits before the merge.
 - **Reverification:** All permalinks point to the base commit. Before you implement a step against a later commit, open each permalink of that step. Compare it with the same path on the later commit. If the code changed, verify the step again.
 
@@ -312,6 +312,56 @@ Tier A needs no change. Tier B uses E1 by default and E2 by opt-in (D1). Both wo
 - ✅ Tier A: default `launch_persistent`. Capacity: both use the `CapacityHint`. `DefaultCapacity` gives one cube per core on the CPU. Code: [`cubecl-runtime/src/persistent.rs` L37-L59](https://github.com/skewballfox/cubecl/blob/39b8e82288fd8856b00bb87ee8240c016b540f62/crates/cubecl-runtime/src/persistent.rs#L37-L59).
 - ✅ Tier B: see the section above. No Metal server change is needed. The CPU runtime reports `Emulated(Split)`: it has no device-scope memory ordering, so it has no spin barrier.
 
+### 3.9 Host-shared buffers for streaming input ⬜
+
+A persistent kernel can process a stream, for example audio chunks. The kernel reads its input from a ring buffer. The ring stays at one device address for the life of the stream. The host writes each new chunk into a free slot of the ring, and the next launch reads the slot. For this, two items are necessary:
+
+- **H1. Host view.** The host writes into a live handle with no copy, where the memory of the device permits it.
+- **H2. Completion token.** The host knows when a launch no longer uses a slot, so that the host can write the slot again.
+
+Both items have one API on GPU runtimes and on CPU runtimes. A ring consumer is a Tier A launch with `next_work_item`. It gets the ring position as scalar arguments (`tail`, `head`, `capacity`) and uses modular indices. It does not need grid sync.
+
+A kernel that stays resident and reads the ring while the host writes it is not in this plan. Three facts prevent it. An integrated GPU is a shared device (D9), and the driver watchdog resets a kernel that does not end (P6). Vulkan does not guarantee that a running dispatch sees host writes. cubecl has a device memory scope (`Features::device_memory_scope`), but no system memory scope.
+
+The permalinks in this section point to the merge of `main` at `4362f78`. After that merge, this branch changed only one of the linked files, `cubecl-runtime/src/client.rs`. The branch did not change `ComputeClient::sync`.
+
+#### State of cubecl
+
+| Item | Fact | Location |
+|---|---|---|
+| Vulkan unified memory | `create_storage_buffer` selects `DEVICE_LOCAL \| HOST_VISIBLE \| HOST_COHERENT` memory only on an `INTEGRATED_GPU`. On a discrete GPU, host-visible memory is the BAR window, which is small. The function maps the memory one time and keeps the pointer as `HostPtr`. | [`cubecl-wgpu/src/backend/vulkan.rs` L246-L258](https://github.com/skewballfox/cubecl/blob/4362f783f4d160ca33f466d141245d4e30c67510/crates/cubecl-wgpu/src/backend/vulkan.rs#L246-L258), [`cubecl-wgpu/src/backend/vulkan.rs` L289-L301](https://github.com/skewballfox/cubecl/blob/4362f783f4d160ca33f466d141245d4e30c67510/crates/cubecl-wgpu/src/backend/vulkan.rs#L289-L301) |
+| `HostPtr` | The type is crate-private. No public API gives the mapping. | [`cubecl-wgpu/src/compute/storage.rs` L31-L37](https://github.com/skewballfox/cubecl/blob/4362f783f4d160ca33f466d141245d4e30c67510/crates/cubecl-wgpu/src/compute/storage.rs#L31-L37) |
+| Mapped write | `write_mapped` runs only for `ScheduleTask::Write`, and only when `device.poll` reports an idle queue. Else the write goes through `queue.write_buffer` and its staging buffer. In a pipelined stream, the queue is almost never idle, so the write almost always uses staging. | [`cubecl-wgpu/src/compute/stream.rs` L309-L334](https://github.com/skewballfox/cubecl/blob/4362f783f4d160ca33f466d141245d4e30c67510/crates/cubecl-wgpu/src/compute/stream.rs#L309-L334), [`cubecl-wgpu/src/compute/stream.rs` L743-L776](https://github.com/skewballfox/cubecl/blob/4362f783f4d160ca33f466d141245d4e30c67510/crates/cubecl-wgpu/src/compute/stream.rs#L743-L776) |
+| Software Vulkan device | lavapipe enumerates as `DeviceType::Cpu`. wgpu does not select it by default; the caller must name it. The device type is not `INTEGRATED_GPU`, so the unified-memory path does not apply. | [`cubecl-wgpu/src/runtime.rs` L93-L96](https://github.com/skewballfox/cubecl/blob/4362f783f4d160ca33f466d141245d4e30c67510/crates/cubecl-wgpu/src/runtime.rs#L93-L96), [`cubecl-wgpu/src/backend/vulkan.rs` L248-L249](https://github.com/skewballfox/cubecl/blob/4362f783f4d160ca33f466d141245d4e30c67510/crates/cubecl-wgpu/src/backend/vulkan.rs#L248-L249) |
+| CPU runtime memory | The memory is host memory. A read gives a pointer into the live pool allocation, with no copy. `memory_mut` copies first (copy-on-write), because live tensors can share the allocation. | [`cubecl-cpu/src/compute/alloc_controller.rs` L30-L61](https://github.com/skewballfox/cubecl/blob/4362f783f4d160ca33f466d141245d4e30c67510/crates/cubecl-cpu/src/compute/alloc_controller.rs#L30-L61) |
+| Host access contract | `AllocationController` gives host access to memory. A no-copy `AccessPolicy` makes an access fail with `AccessError::WouldCopy` when a copy is necessary. | [`cubecl-environment/src/bytes/base.rs` L89-L115](https://github.com/skewballfox/cubecl/blob/4362f783f4d160ca33f466d141245d4e30c67510/crates/cubecl-environment/src/bytes/base.rs#L89-L115), [`cubecl-environment/src/bytes/access.rs` L17-L51](https://github.com/skewballfox/cubecl/blob/4362f783f4d160ca33f466d141245d4e30c67510/crates/cubecl-environment/src/bytes/access.rs#L17-L51) |
+| Completion | `ComputeClient::sync` waits for all tasks of the server. No API waits for one launch. Internally, wgpu has `on_submitted_work_done`, and CUDA has `CudaEvent`. | [`cubecl-runtime/src/client.rs` L1458-L1467](https://github.com/skewballfox/cubecl/blob/4362f783f4d160ca33f466d141245d4e30c67510/crates/cubecl-runtime/src/client.rs#L1458-L1467), [`cubecl-wgpu/src/compute/stream.rs` L907-L911](https://github.com/skewballfox/cubecl/blob/4362f783f4d160ca33f466d141245d4e30c67510/crates/cubecl-wgpu/src/compute/stream.rs#L907-L911), [`cubecl-cuda/src/compute/events.rs` L28-L28](https://github.com/skewballfox/cubecl/blob/4362f783f4d160ca33f466d141245d4e30c67510/crates/cubecl-cuda/src/compute/events.rs#L28-L28) |
+
+#### H2. Completion token ⬜
+
+1. Add `ComputeClient::mark(&self) -> CompletionToken`. The token records a point on the current stream, after the last task that the stream has queued.
+2. Add `CompletionToken::is_done(&self) -> bool`, which does not block, and `ComputeClient::wait(&self, token) -> DynFut<Result<(), ServerError>>`.
+3. Add a default to the server trait: `wait` calls `sync`, and `is_done` is `true` only after a `sync` that started after the mark. This default is correct on every runtime, but it is coarse. Principle 1 holds: the change adds items only.
+4. wgpu: submit the encoder, then register `on_submitted_work_done`. The callback sets the flag of the token.
+5. CUDA and HIP: record an event on the stream. `is_done` queries the event. `wait` synchronizes on the event.
+6. CPU runtime: the token is the count of tasks that the stream has queued. The token is done when the stream has completed that count.
+7. Optional: `write_mapped` uses the token of the last launch that used the target range, not the idle-queue check. This change needs the server to keep a token for each binding. Measure the cost before this step.
+
+#### H1. Host view ⬜
+
+1. Add `Features::host_visible_storage: bool` (principle 1 permits new `Features` fields). A caller reads it before the allocation and selects a strategy.
+2. Add `unsafe fn ComputeClient::host_view_mut(&self, handle: &Handle, policy: AccessPolicy) -> Result<HostView, AccessError>`. `HostView` gives `&mut [u8]` for the range of the handle. `HostView` holds the memory binding, so the pool cannot give the range to a different handle while the view exists. The `# Safety` section names the condition: no pending launch reads or writes the range. H2 lets the caller prove this condition.
+3. If the memory is not host-visible, the call returns `AccessError::WouldCopy`. The caller then uses `ComputeClient::write`. Add this behavior as the default of the server trait.
+4. wgpu on Vulkan: give the view from `HostPtr` and the offset of the handle. Also select unified memory on `PhysicalDeviceType::CPU`. Before this step, use `vulkaninfo` to verify that lavapipe has a memory type with `DEVICE_LOCAL \| HOST_VISIBLE \| HOST_COHERENT`. Do not change the discrete-GPU path.
+5. CPU runtime: give a pointer into the pool allocation. Do not copy on write. The `# Safety` contract of step 2 replaces the copy.
+6. CUDA and HIP: return `WouldCopy`. A later step can add an allocation in mapped host memory (`cuMemHostAlloc` with `DEVICEMAP`) or in managed memory. That step is not in this plan.
+7. wgpu on WebGPU or Metal, and native Metal: return `WouldCopy`. Native Metal can give a view of a buffer with shared storage mode later. It cannot be tested here, because it needs macOS.
+8. Measure the cost of steps 1 to 5 (binary size, launch time). If the cost is large, put H1 behind a cargo feature.
+
+#### Open points
+
+- Embedded targets: verify that `cubecl-cpu` builds without `std`. It compiles kernels with LLVM at run time, so it can need the host toolchain.
+
 ## 4. Milestones
 
 Each milestone compiles, passes `cargo xtask` checks, and is releasable alone.
@@ -325,6 +375,8 @@ Each milestone compiles, passes `cargo xtask` checks, and is releasable alone.
 | M5 | 🟡 | E2 Spin on wgpu (SPIR-V, MSL) and Metal. Not done: discovery (E2.4). | M4 |
 | M6 | ✅ | `next_work_item` (runtime-owned counter) and `unsafe next_work_item_from`. | M4 |
 | M7 | ✅ | `AutotunedCapacity`, V6. | M1 |
+| M8 | ⬜ | H2: `mark`, `CompletionToken`, `wait`, the server default, and the wgpu, CUDA, HIP and CPU overrides (3.9). | M1 |
+| M9 | ⬜ | H1: `Features::host_visible_storage`, `host_view_mut`, the server default, wgpu on Vulkan (integrated GPU and CPU device types) and the CPU runtime. Tests 11 and 12. | M8 |
 
 ## 5. Tests
 
@@ -340,6 +392,8 @@ Add `crates/cubecl-core/src/runtime_tests/persistent.rs`. Register it in `runtim
 8. 🟡 Configuration. Done: unit tests of `PersistentCount::resolve` in `cubecl-runtime/src/persistent.rs` (fraction, invalid fraction, bounds, `Exact`). Not done: a test that reads `fill_fraction` from a configuration file. Code: [`cubecl-runtime/src/persistent.rs` L74-L105](https://github.com/skewballfox/cubecl/blob/39b8e82288fd8856b00bb87ee8240c016b540f62/crates/cubecl-runtime/src/persistent.rs#L74-L105).
 9. ✅ `AutotunedCapacity`: every tuning launch does the caller's work, and the launches after the tuning use a candidate. Code: [`cubecl-core/src/runtime_tests/persistent.rs` L97-L124](https://github.com/skewballfox/cubecl/blob/7a065a02f6ef4da039892a5d86d63daef0557f27/crates/cubecl-core/src/runtime_tests/persistent.rs#L97-L124), [`cubecl-runtime/src/persistent.rs` L245-L256](https://github.com/skewballfox/cubecl/blob/7a065a02f6ef4da039892a5d86d63daef0557f27/crates/cubecl-runtime/src/persistent.rs#L245-L256).
 10. ✅ `next_work_item`: 20 launches, each processes each item exactly one time, also when cube 0 exits early. Code: [`cubecl-core/src/runtime_tests/persistent.rs` L203-L244](https://github.com/skewballfox/cubecl/blob/7a065a02f6ef4da039892a5d86d63daef0557f27/crates/cubecl-core/src/runtime_tests/persistent.rs#L203-L244). Original text: launch a kernel 1000 times; every launch processes each item exactly one time. Include a kernel where some cubes exit early (P5).
+11. ⬜ H2: launch a long kernel, then `mark`. `is_done` is `false` before `wait` and `true` after `wait`. Run on every runtime, with the server default and with each override.
+12. ⬜ H1 and H2: push 100 chunks through a ring of 4 slots. The producer writes a slot only after the token of the launch that read the slot is done. Each chunk is processed exactly one time, and the result is equal to one launch over all chunks. Where `host_visible_storage` is `false`, the producer uses `write`, and the test checks that `host_view_mut` returns `WouldCopy`. Run on the CPU runtime, on wgpu with Vulkan (an integrated GPU, and lavapipe), and on CUDA.
 
 ## 6. Documentation
 
