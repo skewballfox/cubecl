@@ -1,7 +1,7 @@
 use alloc::string::{String, ToString};
 use pliron::derive::format;
 
-use crate::AddressType;
+use crate::{AddressType, features::GridSyncEmulation};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
@@ -75,6 +75,41 @@ pub enum ExecutionMode {
     Unchecked,
 }
 
+/// Whether a kernel is persistent, and whether its cubes may wait on each other.
+///
+/// A persistent kernel launches as many cubes as the device holds at once, and each cube loops
+/// over work items.
+#[derive(Default, Hash, PartialEq, Eq, Clone, Copy, Debug)]
+pub enum Persistence {
+    /// A regular kernel: the caller sets the cube count.
+    #[default]
+    None,
+    /// The runtime sets the cube count from the device capacity. Cubes never wait on each other.
+    Persistent,
+    /// [`Persistent`](Self::Persistent), and the kernel may call `sync_grid`.
+    Cooperative(CooperativeOptions),
+}
+
+/// How a cooperative kernel behaves on a runtime without native grid sync.
+#[derive(Default, Hash, PartialEq, Eq, Clone, Copy, Debug)]
+pub struct CooperativeOptions {
+    /// The emulation to use when the runtime supports it.
+    pub emulation: GridSyncEmulation,
+    /// What shared memory holds after a grid sync.
+    pub shared: SharedAfterGridSync,
+}
+
+/// What shared memory holds after a grid sync, when the grid sync is emulated with
+/// [`Split`](GridSyncEmulation::Split). Native grid sync and `Spin` always keep it.
+#[derive(Default, Hash, PartialEq, Eq, Clone, Copy, Debug)]
+pub enum SharedAfterGridSync {
+    /// Shared memory keeps its values. The runtime copies it out and back.
+    #[default]
+    Spill,
+    /// Shared memory is undefined. Faster, but a kernel that reads it gets wrong values.
+    Discard,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct KernelSettings {
     /// The cube dim of the kernel
@@ -89,6 +124,8 @@ pub struct KernelSettings {
     pub cluster_dim: Option<Dim3>,
     /// Execution mode
     pub execution_mode: ExecutionMode,
+    /// Whether the kernel is persistent
+    pub persistence: Persistence,
 }
 
 impl KernelSettings {
@@ -100,6 +137,7 @@ impl KernelSettings {
             debug_symbols: false,
             cluster_dim: None,
             execution_mode,
+            persistence: Persistence::None,
         }
     }
 }
@@ -132,6 +170,12 @@ impl KernelSettings {
     /// Set cluster dim
     pub fn cluster_dim(mut self, cluster_dim: Dim3) -> Self {
         self.cluster_dim = Some(cluster_dim);
+        self
+    }
+
+    /// Set persistence
+    pub fn persistence(mut self, persistence: Persistence) -> Self {
+        self.persistence = persistence;
         self
     }
 }

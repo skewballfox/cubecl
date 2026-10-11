@@ -66,9 +66,12 @@ pub mod tma;
 
 /// Compiler trait and related types
 pub mod compiler;
-pub mod dry_run;
+pub mod execution;
 pub mod launched;
 /// The payload every error type carries when the device is poisoned.
 pub mod poison;
 /// Runtime trait and related types
 pub mod runtime;
+
+/// Persistent kernels: the cube count follows the device, not the problem size.
+pub mod persistent;

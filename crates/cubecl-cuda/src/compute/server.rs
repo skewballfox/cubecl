@@ -25,7 +25,8 @@ use cubecl_server::command::{CollectiveDriver, Collectives, DeviceStream, Refuse
 use cubecl_server::compiler::ArtifactId;
 use cubecl_server::{
     config::{CubeClRuntimeConfig, RuntimeConfig},
-    dry_run::LaunchMode,
+    cooperative::{LaunchCount, launch_lowering, resolve_count},
+    execution::LaunchMode,
     id::GraphId,
     kernel::CubeKernel,
     logging::ServerLogger,
@@ -188,67 +189,35 @@ impl Server for CudaServer {
         stream_id: StreamId,
         launch_mode: LaunchMode,
     ) {
-        // A compile-only launch only queues its kernel, touching nothing else.
-        if launch_mode == LaunchMode::CompileOnly {
-            self.ctx.queue_kernel(kernel);
-            return;
-        }
+        let count = LaunchCount::Grid(count);
+        self.launch_counted(kernel, count, bindings, stream_id, launch_mode);
+    }
+
+    fn capacity(
+        &mut self,
+        kernel: Box<dyn CubeKernel>,
+        _stream_id: StreamId,
+    ) -> Result<Option<u32>, ServerError> {
         let id = ArtifactId {
             kernel: kernel.id(),
             variant: (),
         };
-        let Some(loaded) = self.load_or_fail(kernel, &id, &bindings, stream_id, launch_mode) else {
-            return;
-        };
-        // A dry run stops right here, after compilation and before anything
-        // that touches a buffer: resolving resources, building tensor maps,
-        // uploading metadata or reading a dynamic cube count would materialize
-        // memory the run exists to leave unmapped.
-        if launch_mode.is_skipped() {
-            return;
-        }
-        let kernel_id = id.kernel;
-        let io = loaded.io.as_deref();
+        // Queried for each call, because each `ExecutionMode` compiles to its own function.
+        let loaded = self.ctx.load_kernel(&*kernel, &id, &self.streams.logger)?;
+        Ok(Some(self.ctx.capacity(&loaded)?))
+    }
 
-        // The count resolves before the scope opens, because entering the
-        // scope replaces whatever claim the outputs carry — and a count that
-        // resolves to zero enqueues nothing, so those claims must be left
-        // exactly as they were, which no exit can restore once entry took
-        // them.
-        let count = match self.resolve_cube_count(count, stream_id) {
-            Ok(count) => count,
-            Err(err) => {
-                // The launch cannot run, so its outputs take the failure
-                // exactly as a failed launch's would: a tainted or unreadable
-                // count buffer travels to everything downstream of it.
-                let mut written = self.write_set();
-                written.extend(bindings.buffers_written(io).cloned());
-                failed_writing(self, stream_id, written, err);
-                return;
-            }
-        };
-        // Zero threads: the driver rejects a zero grid dim, and a launch of
-        // zero threads writes nothing — no scope opens, so a claim an earlier
-        // failure holds on the outputs stays exactly where it was.
-        if count.0 == 0 || count.1 == 0 || count.2 == 0 {
-            return;
-        }
-
-        // The scope claims what the launch writes until the body proves the
-        // work enqueued, so a failure — or a panic — anywhere in it leaves a
-        // read of those buffers failing on the error rather than copying
-        // bytes nothing wrote. An input that already carries a failure skips
-        // the launch instead, and the scope settles that too.
-        let mut written = self.write_set();
-        written.extend(bindings.buffers_written(io).cloned());
-        ExecuteScope::launching(
-            self,
-            kernel_id.clone(),
-            stream_id,
-            bindings.buffers_read(io),
-            written,
-        )
-        .execute(|server| server.launch_checked(kernel_id, &loaded, count, bindings, stream_id));
+    unsafe fn launch_persistent(
+        &mut self,
+        kernel: Box<dyn CubeKernel>,
+        count: PersistentCount,
+        _estimate: u32,
+        bindings: KernelArguments,
+        stream_id: StreamId,
+        launch_mode: LaunchMode,
+    ) {
+        let count = LaunchCount::Persistent(count);
+        self.launch_counted(kernel, count, bindings, stream_id, launch_mode);
     }
 
     fn check(
@@ -436,7 +405,7 @@ impl ServerCommunication for CudaServer {
         // A group already joined is joined once, so the membership is
         // announced once too.
         if let Some(id) = self.collectives.join(device_ids)? {
-            self.utilities.initialized_comms.write().insert(id);
+            self.connect(&id)?;
         }
         Ok(())
     }
@@ -497,6 +466,14 @@ impl ServerCommunication for CudaServer {
         stream_id: StreamId,
         device_id_dst: DeviceId,
     ) -> Result<(), ServerError> {
+        // Joined before anything that can fail: on a pair's first transfer the
+        // peer's thread waits in its own join until this one arrives.
+        let comm = *self.collectives.transfers_with(device_id_dst)?;
+        let peer = self
+            .collectives
+            .peer_rank(&pair(self.device_id, device_id_dst))?;
+        let transfers = self.transfer_stream();
+
         // The send reads the source, so it is worth no more than the work
         // that wrote it; see `FailureStore::ensure_written`. Skipping this
         // hands the peer stale bytes on a handle that carries no claim over
@@ -511,17 +488,16 @@ impl ServerCommunication for CudaServer {
         let mut command = self.command(stream_id, [&desc.handle].into_iter())?;
         let resource = command.resource(binding)?;
         let stream = command.stream().sys;
-        drop(command);
 
         // Wait for the data to be ready on the compute stream.
-        Fence::new(stream).wait_async(self.comm_stream())?;
-
-        let (peers, comm_id) = pair(self.device_id, device_id_dst);
-        let comm = self.collectives.get(&comm_id)?;
-        let peer = self.collectives.peer_rank(&peers)?;
+        Fence::new(stream).wait_async(transfers)?;
         let (nccl_dtype, count) = Cuda::data_type(dtype, resource.size)?;
-
-        Cuda::send(comm, &resource, nccl_dtype, count, peer, self.comm_stream())
+        Cuda::send(&comm, &resource, nccl_dtype, count, peer, transfers)?;
+        // This stream's pool may reuse the source from here, and dropping the command releases one
+        // borrowed from another stream once this stream gets here: both wait for the send.
+        Fence::new(transfers).wait_async(stream)?;
+        drop(command);
+        Ok(())
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace"))]
@@ -617,6 +593,27 @@ impl CudaServer {
         self.ctx.comm_stream
     }
 
+    fn transfer_stream(&self) -> CUstream {
+        self.ctx.transfer_stream
+    }
+
+    /// Runs one single-element `all_reduce` over the group `id`, so NCCL connects its peers now:
+    /// it connects them on a communicator's first operation, which waits on the host for every
+    /// peer. A single element connects the algorithm it picks, the ring on a single node.
+    fn connect(&self, id: &CommunicationId) -> Result<(), ServerError> {
+        let element = &self.ctx.connect_element;
+        let (dtype, count) = Cuda::data_type(ElemType::Float(FloatKind::F32), element.size)?;
+        Cuda::all_reduce(
+            self.collectives.get(id)?,
+            element,
+            element,
+            dtype,
+            count,
+            ReduceOperation::Sum,
+            self.comm_stream(),
+        )
+    }
+
     fn command_no_inputs(&mut self, stream_id: StreamId) -> Result<Command<'_>, ServerError> {
         self.command(stream_id, [].into_iter())
     }
@@ -652,7 +649,7 @@ impl CudaServer {
     /// kernel was only going to read — tainting those would refuse every
     /// later launch that shares them, an autotune sweep above all.
     ///
-    /// A dry run claims none. It was never going to write, so a failure in it
+    /// A discarded launch claims none. It was never going to write, so a failure in it
     /// leaves nothing stale, and tainting its buffers would fail unrelated
     /// reads of memory the run deliberately left alone.
     fn load_or_fail(
@@ -667,7 +664,7 @@ impl CudaServer {
             Ok(loaded) => return Some(loaded),
             Err(err) => err,
         };
-        if !launch_mode.is_skipped() {
+        if !launch_mode.discards_launch() {
             // No compiled answer exists for a kernel that never compiled, so
             // the caller's declared IO decides what the failure claims: only
             // the outputs, never the buffers the kernel was only going to
@@ -746,27 +743,30 @@ impl CudaServer {
         stream_id: StreamId,
         device_id_src: DeviceId,
     ) -> Result<(), ServerError> {
+        // Joined before anything that can fail or relocate: on a pair's first
+        // transfer the peer's thread waits in its own join until this one arrives.
+        let comm = *self.collectives.transfers_with(device_id_src)?;
+        let peer = self
+            .collectives
+            .peer_rank(&pair(self.device_id, device_id_src))?;
+
         // A command on the destination server reserves the memory the incoming
         // data lands in.
         let mut command_dst = self.command_no_inputs(stream_id)?;
         let memory = command_dst.reserve(handle.size())?;
         command_dst.bind(memory, handle.memory.clone())?;
         let resource_dst = command_dst.resource(handle.binding())?;
+        let stream = command_dst.stream().sys;
         drop(command_dst);
 
-        let (peers, comm_id) = pair(self.device_id, device_id_src);
-        let comm = self.collectives.get(&comm_id)?;
-        let peer = self.collectives.peer_rank(&peers)?;
+        // Compute work queued before the reservation may still use its memory, and compute work
+        // queued after it reads what arrives.
+        let transfers = self.transfer_stream();
+        Fence::new(stream).wait_async(transfers)?;
         let (nccl_dtype, count) = Cuda::data_type(dtype, resource_dst.size)?;
-
-        Cuda::recv(
-            comm,
-            &resource_dst,
-            nccl_dtype,
-            count,
-            peer,
-            self.comm_stream(),
-        )
+        Cuda::recv(&comm, &resource_dst, nccl_dtype, count, peer, transfers)?;
+        Fence::new(transfers).wait_async(stream)?;
+        Ok(())
     }
 
     /// The stream a profiling window records its events into.
@@ -823,6 +823,80 @@ impl CudaServer {
         self.streams.written([written].into_iter());
     }
 
+    /// Launch `kernel` with a grid or persistent cube count.
+    fn launch_counted(
+        &mut self,
+        kernel: Box<dyn CubeKernel>,
+        count: LaunchCount,
+        bindings: KernelArguments,
+        stream_id: StreamId,
+        launch_mode: LaunchMode,
+    ) {
+        if launch_mode == LaunchMode::Queue {
+            self.ctx.queue_kernel(kernel);
+            return;
+        }
+        let id = ArtifactId {
+            kernel: kernel.id(),
+            variant: (),
+        };
+        let Some(loaded) = self.load_or_fail(kernel, &id, &bindings, stream_id, launch_mode) else {
+            return;
+        };
+        // A discarded launch stops right here, after compilation and before anything
+        // that touches a buffer: resolving resources, building tensor maps,
+        // uploading metadata or reading a dynamic cube count would materialize
+        // memory the run exists to leave unmapped.
+        if launch_mode.discards_launch() {
+            return;
+        }
+        let kernel_id = id.kernel;
+        let io = loaded.io.as_deref();
+
+        // The count resolves before the scope opens, because entering the
+        // scope replaces whatever claim the outputs carry — and a count that
+        // resolves to zero enqueues nothing, so those claims must be left
+        // exactly as they were, which no exit can restore once entry took
+        // them.
+        let lowering = count.lowering();
+        let count = match self.resolve_launch_count(&kernel_id, &loaded, count, stream_id) {
+            Ok(count) => count,
+            Err(err) => {
+                // The launch cannot run, so its outputs take the failure
+                // exactly as a failed launch's would: a tainted or unreadable
+                // count buffer travels to everything downstream of it.
+                let mut written = self.write_set();
+                written.extend(bindings.buffers_written(io).cloned());
+                failed_writing(self, stream_id, written, err);
+                return;
+            }
+        };
+        // Zero threads: the driver rejects a zero grid dim, and a launch of
+        // zero threads writes nothing — no scope opens, so a claim an earlier
+        // failure holds on the outputs stays exactly where it was.
+        if count.0 == 0 || count.1 == 0 || count.2 == 0 {
+            return;
+        }
+
+        // The scope claims what the launch writes until the body proves the
+        // work enqueued, so a failure — or a panic — anywhere in it leaves a
+        // read of those buffers failing on the error rather than copying
+        // bytes nothing wrote. An input that already carries a failure skips
+        // the launch instead, and the scope settles that too.
+        let mut written = self.write_set();
+        written.extend(bindings.buffers_written(io).cloned());
+        ExecuteScope::launching(
+            self,
+            kernel_id.clone(),
+            stream_id,
+            bindings.buffers_read(io),
+            written,
+        )
+        .execute(|server| {
+            server.launch_checked(kernel_id, &loaded, count, lowering, bindings, stream_id)
+        });
+    }
+
     /// The grid dimensions this launch runs with, host-read from the count
     /// buffer when the count is dynamic.
     ///
@@ -864,11 +938,37 @@ impl CudaServer {
         }
     }
 
+    /// The grid dimensions of a launch of `kernel_id`. A persistent count resolves against the
+    /// capacity of the loaded `kernel`.
+    ///
+    /// # Errors
+    ///
+    /// See [`resolve_cube_count`](Self::resolve_cube_count) and [`resolve_count`].
+    fn resolve_launch_count(
+        &mut self,
+        kernel_id: &KernelId,
+        kernel: &CudaCompiledKernel,
+        count: LaunchCount,
+        stream_id: StreamId,
+    ) -> Result<(u32, u32, u32), ServerError> {
+        match count {
+            LaunchCount::Grid(count) => self.resolve_cube_count(count, stream_id),
+            LaunchCount::Persistent(count) => {
+                let capacity = self.ctx.capacity(kernel)?;
+                let max = self.utilities.properties.hardware.max_cube_count.0;
+                let cubes =
+                    resolve_count(kernel_id, count, capacity, max).map_err(LaunchError::from)?;
+                Ok((cubes, 1, 1))
+            }
+        }
+    }
+
     fn launch_checked(
         &mut self,
         kernel_id: KernelId,
         kernel: &CudaCompiledKernel,
         count: (u32, u32, u32),
+        lowering: Option<PersistentCount>,
         bindings: KernelArguments,
         stream_id: StreamId,
     ) -> Result<(), ServerError> {
@@ -908,7 +1008,7 @@ impl CudaServer {
         // refine this to minimize allocations.
         let mut tensor_maps = Vec::new();
 
-        // Resolving is also where a dry run's deferred allocations get their
+        // Resolving is also where a discarded launch's deferred allocations get their
         // device backing, so this can fail on a device the measured plan does
         // not fit — reported, not panicked.
         for resource in bindings.resources.into_iter() {
@@ -933,7 +1033,12 @@ impl CudaServer {
         }
         resources.extend(info_const);
 
-        command.kernel(&kernel_id, kernel, count, &mut resources)?;
+        match lowering {
+            Some(persistent) => launch_lowering(&kernel_id, persistent, count.0, |cubes| {
+                command.kernel(&kernel_id, kernel, (cubes, 1, 1), &mut resources)
+            })?,
+            None => command.kernel(&kernel_id, kernel, count, &mut resources)?,
+        }
 
         Ok(())
     }
@@ -1353,15 +1458,14 @@ fn check_tma_im2col(
     Ok(())
 }
 
-/// The two devices of a peer-to-peer transfer, sorted, and the group they name.
+/// The two devices of a peer-to-peer transfer, sorted.
 ///
 /// Sorted because a rank is a position: `send` and `recv` are the two sides of
 /// one transfer and have to agree on which device is which.
-fn pair(this: DeviceId, peer: DeviceId) -> (Vec<DeviceId>, CommunicationId) {
+fn pair(this: DeviceId, peer: DeviceId) -> Vec<DeviceId> {
     let mut devices = vec![this, peer];
     devices.sort();
-    let id = CommunicationId::from(devices.clone());
-    (devices, id)
+    devices
 }
 
 impl ServerStorage for CudaServer {

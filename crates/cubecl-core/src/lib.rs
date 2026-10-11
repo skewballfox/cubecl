@@ -51,6 +51,7 @@ pub use cubecl_runtime::memory_management::{
     AuxiliaryMemoryReport, MemoryPoolKind, MemoryPoolReport, MemoryPoolsReport, MemoryReport,
     MemoryScope, StreamMemoryReport,
 };
+pub use cubecl_runtime::persistent;
 pub use cubecl_runtime::server;
 pub use cubecl_runtime::throughput;
 pub use cubecl_runtime::tune;

@@ -4,13 +4,14 @@ use crate::{
     client::Client,
     compiler::CompilationError,
     config::{CubeClRuntimeConfig, RuntimeConfig, compilation::BoundsCheckMode},
-    dry_run::LaunchMode,
+    execution::LaunchMode,
     id::GraphId,
     kernel::CubeKernel,
     logging::ServerLogger,
     memory_management::{
         ManagedMemoryHandle, ManagedMemoryId, MemoryAllocationMode, StreamMemoryReport,
     },
+    persistent::PersistentCount,
     poison::DevicePoison,
     server::{BufferBinding, KernelResource},
     storage::{ComputeStorage, ManagedResource},
@@ -305,6 +306,19 @@ pub enum ResourceLimitError {
         requested: (u32, u32, u32),
         /// Maximum value
         max: (u32, u32, u32),
+        /// The backtrace for this error.
+        #[cfg_attr(serializable, serde(skip))]
+        backtrace: BackTrace,
+    },
+    /// A cooperative launch has more cubes than the device runs at the same time.
+    #[error(
+        "Too many cubes for a cooperative launch.\nRequested {requested} cubes, the device runs at most {max} at the same time.\nBacktrace\n{backtrace}"
+    )]
+    CooperativeGrid {
+        /// Requested cube count
+        requested: u32,
+        /// The capacity of the kernel
+        max: u32,
         /// The backtrace for this error.
         #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
@@ -684,10 +698,11 @@ pub trait Server:
     /// and are responsible of determining which should be read or written.
     ///
     /// `launch_mode` says whether the kernel actually runs. On
-    /// [`LaunchMode::Skip`] the server must still do everything a first launch
+    /// [`LaunchMode::Compile`] the server must still do everything a first launch
     /// does short of dispatching — expand, compile, validate, fill its caches —
-    /// and then drop the launch; skipping the compilation instead would defeat
-    /// the whole point of a [dry run](crate::dry_run).
+    /// and then discard the launch; skipping the compilation instead would defeat
+    /// the whole point of an [override](crate::execution::ProcessModeOverride) that
+    /// drops launches.
     ///
     /// # Safety
     ///
@@ -701,6 +716,39 @@ pub trait Server:
         launch_mode: LaunchMode,
     );
 
+    /// How many cubes of `kernel` the device runs at the same time, or `None` if the runtime
+    /// cannot query it.
+    fn capacity(
+        &mut self,
+        kernel: Box<dyn CubeKernel>,
+        stream_id: StreamId,
+    ) -> Result<Option<u32>, ServerError> {
+        let _ = (kernel, stream_id);
+        Ok(None)
+    }
+
+    /// Executes a persistent `kernel` (see [`PersistentCount`]).
+    ///
+    /// `estimate` is the cube count that `count` gives with the client's capacity estimate. A
+    /// runtime that can query its [`capacity`](Self::capacity) computes the count again.
+    ///
+    /// # Safety
+    ///
+    /// The same as [`launch`](Self::launch).
+    unsafe fn launch_persistent(
+        &mut self,
+        kernel: Box<dyn CubeKernel>,
+        count: PersistentCount,
+        estimate: u32,
+        bindings: KernelArguments,
+        stream_id: StreamId,
+        launch_mode: LaunchMode,
+    ) {
+        let _ = count;
+        let cube_count = CubeCount::new_1d(estimate);
+        unsafe { self.launch(kernel, cube_count, bindings, stream_id, launch_mode) }
+    }
+
     /// Flush all outstanding tasks in the server.
     ///
     /// # Errors
@@ -710,7 +758,7 @@ pub trait Server:
     /// unwritten, and surfaces on any read, sync or check of them.
     fn flush(&mut self, stream_id: StreamId) -> Result<(), ServerError>;
 
-    /// Compiles every kernel a [`LaunchMode::CompileOnly`] launch queued, now
+    /// Compiles every kernel a [`LaunchMode::Queue`] launch queued, now
     /// rather than inside the next launch, so a measurement that follows
     /// times its own kernels only.
     ///
@@ -878,6 +926,18 @@ impl From<Vec<DeviceId>> for CommunicationId {
         value.sort();
         CommunicationId {
             id: FixedState::default().hash_one(value),
+        }
+    }
+}
+
+impl CommunicationId {
+    /// The communicator transfers between `a` and `b` go through. It is not the one an
+    /// `all_reduce` over the same two devices uses, so neither waits in line behind the other.
+    pub fn transfers_between(a: DeviceId, b: DeviceId) -> Self {
+        let mut devices = [a, b];
+        devices.sort();
+        CommunicationId {
+            id: FixedState::default().hash_one((devices, "transfers")),
         }
     }
 }
@@ -1284,8 +1344,9 @@ pub enum IoError {
         backtrace: BackTrace,
     },
 
-    /// An allocation carved lazily under a [`DryRun`](crate::dry_run::DryRun)
-    /// could not be given real device backing when it was finally resolved.
+    /// An allocation carved lazily under a
+    /// [process mode](crate::execution::ProcessMode) that discards launches could
+    /// not be given real device backing when it was finally resolved.
     ///
     /// Distinct from the same failure at reservation time, and the distinction
     /// is what a caller acts on: the memory was promised earlier, by a pass
@@ -1367,7 +1428,7 @@ impl core::fmt::Debug for IoError {
 }
 
 /// Arguments to execute a kernel.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct KernelArguments {
     /// Kernel bindings
     pub resources: Vec<KernelResource>,
@@ -1401,6 +1462,13 @@ impl core::fmt::Display for KernelArguments {
 }
 
 impl KernelArguments {
+    /// Appends a buffer that the runtime binds after the kernel's own buffers, without
+    /// metadata, such as the launch workspace or a spill buffer.
+    pub fn push_hidden_buffer(&mut self, buffer: BufferBinding) {
+        self.resources.push(KernelResource::Buffer(buffer));
+        self.declared_io.push(BufferIOAttr::ReadWrite);
+    }
+
     /// Create a new bindings struct
     pub fn new() -> Self {
         Self::default()
@@ -1527,7 +1595,7 @@ impl KernelArguments {
 ///
 /// The [`Server`] is responsible to convert those info into actual [`Binding`] when launching
 /// kernels.
-#[derive(new, Debug, Default)]
+#[derive(new, Debug, Default, Clone)]
 pub struct MetadataBindingInfo {
     /// Scalar and metadata values
     pub data: Vec<u64>,

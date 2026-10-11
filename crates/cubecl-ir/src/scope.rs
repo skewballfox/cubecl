@@ -1,6 +1,8 @@
 use crate::{
     EnumSet,
+    dialect::memory::StoreOp,
     interfaces::control_flow::{SymbolOpInterface, SymbolVisibility},
+    rewrite::op_insertion_point_in_block,
 };
 use alloc::{boxed::Box, format, rc::Rc, string::String, vec, vec::Vec};
 use core::{
@@ -27,7 +29,7 @@ use pliron::{
     dict_key,
     identifier::Identifier,
     irbuild::{
-        inserter::{IRInserter, Inserter},
+        inserter::{IRInserter, Inserter, OpInsertionPoint},
         listener::DummyListener,
     },
     op::Op,
@@ -41,6 +43,7 @@ use spin::LazyLock;
 
 use crate::{
     AddressSpace, AddressType, DeviceProperties, ElemType, FastMath, TargetProperties, TypeHash,
+    UIntKind,
     arena::DropBump,
     attributes::{
         ATTR_BUFFER_BINDING, ATTR_KEY_ARG_ATTRS, ATTR_TENSOR_MAP_BINDING, BoolAttr,
@@ -54,8 +57,8 @@ use crate::{
     },
     interfaces::{ScalarType, TypedExt},
     read_value,
-    settings::KernelSettings,
-    types::{PointerType, RuntimeArrayType, cuda::TensorMapType, scalar::BoolType},
+    settings::{KernelSettings, Persistence},
+    types::{AtomicType, PointerType, RuntimeArrayType, cuda::TensorMapType, scalar::BoolType},
 };
 
 pub type Types = HashMap<TypeId, ElemType>;
@@ -125,12 +128,20 @@ pub struct Scope {
 
 #[derive(Clone, Copy, Default)]
 pub struct ExpandState {
+    pub may_terminate: bool,
     pub may_return: bool,
     pub may_break: bool,
-    // Whether the kernel has *not* returned. Inverted to save a not on the loop condition.
+    pub may_continue: bool,
+    // Whether the kernel has *not* terminated. Inverted to save a not on the loop condition.
+    pub inv_terminate_flag: Option<Value>,
+    // Whether the current function has *not* returned. Inverted to save a not on the loop condition.
     pub inv_return_flag: Option<Value>,
     /// Whether the loop is *not* broken. Inverted to save a not on the loop condition.
     pub inv_break_flag: Option<Value>,
+    /// Whether the loop is *not* continued. Inverted to save a not on the loop condition.
+    pub inv_continue_flag: Option<Value>,
+    /// The return value, if early return is used.
+    pub return_value: Option<Value>,
 }
 
 impl Debug for Scope {
@@ -158,7 +169,13 @@ pub struct GlobalState {
     pub modes: InstructionModes,
     pub target_properties: TargetProperties,
     pub device_properties: Option<Rc<DeviceProperties>>,
+    pub persistence: Persistence,
+    /// The launch workspace, once the kernel asks for it (see [`Scope::launch_workspace`]).
+    pub workspace: Option<Value>,
 }
+
+/// Words in the launch workspace. Slot 0 is the work queue; slots 1 and 2 are the spin barrier.
+pub const LAUNCH_WORKSPACE_WORDS: usize = 16;
 
 unsafe impl Send for GlobalState {}
 
@@ -337,6 +354,8 @@ fn new_context(settings: KernelSettings) -> Rc<UnsafeCell<Context>> {
         target_properties: Default::default(),
         device_properties: Default::default(),
         errors: Default::default(),
+        persistence: settings.persistence,
+        workspace: None,
         warnings: Default::default(),
     };
     settings.address_type.register(&mut state);
@@ -372,6 +391,8 @@ fn dummy_context() -> Rc<UnsafeCell<Context>> {
         target_properties: Default::default(),
         device_properties: Default::default(),
         errors: Default::default(),
+        persistence: Default::default(),
+        workspace: None,
         warnings: Default::default(),
     };
 
@@ -388,6 +409,7 @@ impl Debug for GlobalState {
             .field("modes", &self.modes)
             .field("target_properties", &self.target_properties)
             .field("device_properties", &self.device_properties)
+            .field("persistence", &self.persistence)
             .finish()
     }
 }
@@ -453,16 +475,17 @@ impl Scope {
             let entry_block = state.entry_func.get_entry_block(ctx);
             OpInserter::new_at_block_end(entry_block)
         };
-        let return_flag =
-            init_bool_flag(unsafe { &mut *ctx.get() }, &mut inserter, "inv_return_flag");
+        let terminate_flag = init_bool_flag(
+            unsafe { &mut *ctx.get() },
+            &mut inserter,
+            "inv_terminate_flag",
+        );
         Self {
             ctx: CtxHandle::Rc(ctx),
             inserter: InserterHandle::owned(inserter),
             expand_state: RefCell::new(ExpandState {
-                may_break: false,
-                may_return: false,
-                inv_return_flag: Some(return_flag),
-                inv_break_flag: None,
+                inv_terminate_flag: Some(terminate_flag),
+                ..ExpandState::default()
             }),
         }
     }
@@ -493,12 +516,7 @@ impl Scope {
         Self {
             ctx: CtxHandle::Ref(ctx),
             inserter: InserterHandle::Ref(inserter),
-            expand_state: RefCell::new(ExpandState {
-                may_return: false,
-                may_break: false,
-                inv_return_flag: None,
-                inv_break_flag: None,
-            }),
+            expand_state: RefCell::new(ExpandState::default()),
         }
     }
 
@@ -572,9 +590,67 @@ impl Scope {
         }
     }
 
-    pub fn set_break_return(&self, children: &[Scope]) {
+    pub fn update_flags_after_branch(&self, children: &[Scope]) {
+        self.set_may_continue(children);
         self.set_may_break(children);
         self.set_may_return(children);
+        self.set_may_terminate(children);
+    }
+
+    pub fn update_flags_after_loop(&self, children: &[Scope]) {
+        self.set_may_return(children);
+        self.set_may_terminate(children);
+    }
+
+    pub fn update_flags_after_early_return(&self, children: &[Scope]) {
+        self.set_may_terminate(children);
+    }
+
+    pub fn update_flags_before_unrolled_iteration(&self, body: &Scope) {
+        body.update_flags_before_unrolled_iteration_at(self.unrolled_insertion_point(body));
+    }
+
+    fn update_flags_before_unrolled_iteration_at(&self, insertion_point: OpInsertionPoint) {
+        self.inserter().set_insertion_point(insertion_point);
+
+        // Reset continue to initial state
+        if self.expand_state().may_continue {
+            let flag = self.expand_state().inv_continue_flag.unwrap();
+            self.register(&StoreOp::new(self.ctx_mut(), flag, self.const_bool(true)));
+            self.expand_state_mut().may_continue = false;
+        }
+
+        self.set_may_break(core::slice::from_ref(self));
+        self.set_may_return(core::slice::from_ref(self));
+        self.set_may_terminate(core::slice::from_ref(self));
+    }
+
+    pub fn finalize_unrolled_loop(&self, body: &Scope) {
+        self.inserter()
+            .set_insertion_point(self.unrolled_insertion_point(body));
+
+        self.set_may_return(core::slice::from_ref(body));
+        self.set_may_terminate(core::slice::from_ref(body));
+    }
+
+    fn unrolled_insertion_point(&self, body: &Scope) -> OpInsertionPoint {
+        let current_block = self.inserter().get_insertion_block(self.ctx()).unwrap();
+        op_insertion_point_in_block(
+            self.ctx(),
+            body.inserter().get_insertion_point(),
+            current_block,
+        )
+    }
+
+    pub fn set_may_terminate(&self, children: &[Scope]) {
+        let child_may_terminate = children
+            .iter()
+            .any(|scope| scope.expand_state().may_terminate);
+        if child_may_terminate {
+            self.expand_state_mut().may_terminate = true;
+            let flag = self.expand_state().inv_terminate_flag;
+            self.predicate_on_flag(flag.expect("Can't terminate in rewrite context"));
+        }
     }
 
     pub fn set_may_return(&self, children: &[Scope]) {
@@ -587,11 +663,22 @@ impl Scope {
     }
 
     pub fn set_may_break(&self, children: &[Scope]) {
-        let child_may_return = children.iter().any(|scope| scope.expand_state().may_break);
-        if child_may_return {
+        let child_may_break = children.iter().any(|scope| scope.expand_state().may_break);
+        if child_may_break {
             self.expand_state_mut().may_break = true;
             let flag = self.expand_state().inv_break_flag;
             self.predicate_on_flag(flag.expect("Should have break flag"));
+        }
+    }
+
+    pub fn set_may_continue(&self, children: &[Scope]) {
+        let child_may_continue = children
+            .iter()
+            .any(|scope| scope.expand_state().may_continue);
+        if child_may_continue {
+            self.expand_state_mut().may_continue = true;
+            let flag = self.expand_state().inv_continue_flag;
+            self.predicate_on_flag(flag.expect("Should have continue flag"));
         }
     }
 
@@ -672,46 +759,110 @@ impl Scope {
         self.register_size::<N>(vector_size);
     }
 
-    /// Create an empty child scope.
-    pub fn child(&self, inserter: impl Inserter + 'static) -> Self {
+    /// Create an empty child scope for branching ops that don't need new flags, i.e. if/else.
+    pub fn branch_child(&self, inserter: impl Inserter + 'static) -> Self {
         Self {
             ctx: self.ctx.clone(),
             inserter: InserterHandle::owned(inserter),
             expand_state: RefCell::new(ExpandState {
+                may_continue: false,
                 may_break: false,
                 may_return: false,
+                may_terminate: false,
+                inv_terminate_flag: self.expand_state().inv_terminate_flag,
                 inv_return_flag: self.expand_state().inv_return_flag,
                 inv_break_flag: self.expand_state().inv_break_flag,
+                inv_continue_flag: self.expand_state().inv_continue_flag,
+                return_value: self.expand_state().return_value,
             }),
         }
     }
 
     /// Create a child scope with a new break condition.
-    pub fn loop_child(&self, inserter: impl Inserter + 'static) -> Self {
+    pub fn loop_child(&self, mut inserter: impl Inserter + 'static) -> Self {
         let break_flag = init_bool_flag(self.ctx_mut(), self.inserter(), "inv_break_flag");
+        let continue_flag = init_bool_flag(self.ctx_mut(), &mut inserter, "inv_continue_flag");
         Self {
             ctx: self.ctx.clone(),
             inserter: InserterHandle::owned(inserter),
             expand_state: RefCell::new(ExpandState {
+                may_terminate: false,
                 may_return: false,
                 may_break: false,
+                may_continue: false,
+                inv_terminate_flag: self.expand_state().inv_terminate_flag,
                 inv_return_flag: self.expand_state().inv_return_flag,
                 inv_break_flag: Some(break_flag),
+                inv_continue_flag: Some(continue_flag),
+                return_value: self.expand_state().return_value,
             }),
         }
     }
 
-    /// Create a child that's at the root of a new function
-    pub fn func_child(&self, mut inserter: impl Inserter + 'static) -> Self {
+    /// Create a child scope with a new break condition.
+    pub fn unrolled_loop_child(&self) -> Self {
+        let break_flag = init_bool_flag(self.ctx_mut(), self.inserter(), "inv_break_flag");
+        let continue_flag = init_bool_flag(self.ctx_mut(), self.inserter(), "inv_continue_flag");
+        let inserter = OpInserter::new(self.inserter().get_insertion_point());
+        Self {
+            ctx: self.ctx.clone(),
+            inserter: InserterHandle::owned(inserter),
+            expand_state: RefCell::new(ExpandState {
+                may_terminate: false,
+                may_return: false,
+                may_break: false,
+                may_continue: false,
+                inv_terminate_flag: self.expand_state().inv_terminate_flag,
+                inv_return_flag: self.expand_state().inv_return_flag,
+                inv_break_flag: Some(break_flag),
+                inv_continue_flag: Some(continue_flag),
+                return_value: self.expand_state().return_value,
+            }),
+        }
+    }
+
+    /// Create a child that's at the root of a new inlined function and sets up a new early return flag.
+    pub fn inlined_func_child(
+        &self,
+        mut inserter: impl Inserter + 'static,
+        return_value: Option<Value>,
+    ) -> Self {
         let return_flag = init_bool_flag(self.ctx_mut(), &mut inserter, "inv_return_flag");
         Self {
             ctx: self.ctx.clone(),
             inserter: InserterHandle::owned(inserter),
             expand_state: RefCell::new(ExpandState {
+                may_continue: false,
                 may_break: false,
                 may_return: false,
+                may_terminate: false,
+                inv_terminate_flag: self.expand_state().inv_terminate_flag,
                 inv_return_flag: Some(return_flag),
                 inv_break_flag: None,
+                inv_continue_flag: None,
+                return_value: return_value,
+            }),
+        }
+    }
+
+    /// Create a child that's at the root of a new non-inlined function.
+    /// `terminate!()` won't work for now so if non-inlined functions are ever made user accessible
+    /// we need to deal with that.
+    pub fn func_child(&self, mut inserter: impl Inserter + 'static) -> Self {
+        let terminate_flag = init_bool_flag(self.ctx_mut(), &mut inserter, "inv_terminate_flag");
+        Self {
+            ctx: self.ctx.clone(),
+            inserter: InserterHandle::owned(inserter),
+            expand_state: RefCell::new(ExpandState {
+                may_continue: false,
+                may_break: false,
+                may_return: false,
+                may_terminate: false,
+                inv_terminate_flag: Some(terminate_flag),
+                inv_return_flag: None,
+                inv_break_flag: None,
+                inv_continue_flag: None,
+                return_value: None,
             }),
         }
     }
@@ -761,6 +912,37 @@ impl Scope {
     }
 
     /// Obtain the index-th tensor map
+    /// The first buffer position after every buffer and tensor map the kernel declared.
+    pub fn next_buffer_pos(&self) -> usize {
+        let entry_func = self.state().entry_func;
+        let ctx = self.ctx();
+        let args = entry_func
+            .get_entry_block(ctx)
+            .deref(ctx)
+            .get_num_arguments();
+        (0..args)
+            .filter_map(|i| {
+                entry_func.get_arg_attr::<BufferBindingAttr>(ctx, i, &ATTR_BUFFER_BINDING)
+            })
+            .map(|binding| binding.buffer_pos + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// [`LAUNCH_WORKSPACE_WORDS`] atomic `u32` counters that the runtime zeroes before each
+    /// launch of a persistent kernel. Declared after the kernel's own buffers, the first time the
+    /// kernel asks for it, without metadata.
+    pub fn launch_workspace(&self) -> Value {
+        if let Some(workspace) = self.state().workspace {
+            return workspace;
+        }
+        let word = ElemType::UInt(UIntKind::U32).to_type(self.ctx());
+        let atomic = AtomicType::get(self.ctx(), word).to_handle();
+        let workspace = self.global(self.next_buffer_pos(), None, atomic);
+        self.state_mut().workspace = Some(workspace);
+        workspace
+    }
+
     pub fn tensor_map(&self, buffer_pos: usize, ext_meta_pos: usize) -> Value {
         let entry_func = self.state().entry_func;
         let ctx = self.ctx();

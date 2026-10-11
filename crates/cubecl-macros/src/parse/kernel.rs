@@ -8,7 +8,7 @@ use crate::{
 use core::hash::Hash;
 use darling::{FromMeta, ast::NestedMeta, util::Flag};
 use proc_macro2::{Span, TokenStream};
-use quote::{ToTokens, format_ident, quote};
+use quote::{ToTokens, quote};
 use std::{collections::BTreeMap, iter};
 use syn::{
     AssocType, Attribute, ConstParam, Expr, GenericArgument, Generics, Ident, ItemFn, LitStr, Path,
@@ -31,6 +31,14 @@ pub(crate) struct KernelArgs {
     /// Generate expansion only, for expanding existing types
     pub expand_only: Flag,
     pub cluster_dim: Option<Expr>,
+    /// Persistent kernel: the runtime sets the cube count from the device capacity.
+    pub persistent: Flag,
+    /// Persistent kernel that may call `sync_grid`.
+    pub cooperative: Flag,
+    /// Grid sync emulation of a cooperative kernel, on runtimes without native grid sync.
+    pub grid_sync_emulation: Option<GridSyncEmulation>,
+    /// What shared memory holds after an emulated grid sync.
+    pub shared_after_grid_sync: Option<SharedAfterGridSync>,
     pub src_file: Option<LitStr>,
     /// Base traits for a split expand trait
     pub expand_base_traits: Option<String>,
@@ -40,6 +48,21 @@ pub(crate) struct KernelArgs {
     pub address_type: AddressType,
 }
 
+#[derive(Default, FromMeta, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum GridSyncEmulation {
+    #[default]
+    Split,
+    Spin,
+}
+
+#[derive(Default, FromMeta, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum SharedAfterGridSync {
+    #[default]
+    Spill,
+    Discard,
+}
+
+#[derive(Clone, Copy)]
 pub enum ExecutionMode {
     /// Checked kernels are safe.
     Checked,
@@ -64,12 +87,36 @@ impl KernelArgs {
     pub fn is_launch(&self) -> bool {
         self.launch.is_present() || self.launch_unchecked.is_present()
     }
+
+    pub fn is_persistent(&self) -> bool {
+        self.persistent.is_present() || self.cooperative.is_present()
+    }
+
+    /// Whether the launch functions must be `unsafe` because the grid sync may hang.
+    pub fn may_hang(&self) -> bool {
+        self.grid_sync_emulation == Some(GridSyncEmulation::Spin)
+    }
+
+    fn validate_persistence(&self) -> syn::Result<()> {
+        let error = |msg: &str| Err(syn::Error::new(Span::call_site(), msg));
+        if self.is_persistent() && !self.is_launch() {
+            return error("`persistent` and `cooperative` need `launch` or `launch_unchecked`");
+        }
+        if self.persistent.is_present() && self.cooperative.is_present() {
+            return error("`cooperative` implies `persistent`; use only `cooperative`");
+        }
+        let has_grid_sync_keys =
+            self.grid_sync_emulation.is_some() || self.shared_after_grid_sync.is_some();
+        if has_grid_sync_keys && !self.cooperative.is_present() {
+            return error("`grid_sync_emulation` and `shared_after_grid_sync` need `cooperative`");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
 pub struct GenericArg {
     pub expand_ty: syn::Path,
-    pub marker_ty: syn::Ident,
     pub kind: DefineKind,
 }
 
@@ -231,8 +278,9 @@ impl GenericAnalysis {
         let mut map = BTreeMap::new();
         let elem_expand = prelude_type("DynamicScalar");
         let size_expand = prelude_type("DynamicSize");
+        let slot = prelude_type("GenericSlot");
 
-        for type_param in generics.type_params() {
+        for (position, type_param) in generics.type_params().enumerate() {
             if type_param.bounds.len() > 1 {
                 continue;
             }
@@ -242,7 +290,10 @@ impl GenericAnalysis {
             {
                 let name = bound.to_string();
                 let ident = type_param.ident.clone();
-                let marker_ty = format_ident!("_{ident}");
+                // Keyed by position, not by kernel, so the same slot in two
+                // kernels is the same type and shares instantiations.
+                let position = proc_macro2::Literal::usize_unsuffixed(position);
+                let marker_ty: syn::Path = parse_quote!(#slot<#position>);
 
                 match name.as_str() {
                     "Float" | "Int" | "Numeric" | "CubePrimitive" | "Complex" => {
@@ -251,7 +302,6 @@ impl GenericAnalysis {
                                 ident.clone(),
                                 GenericArg {
                                     expand_ty: parse_quote!(#ident),
-                                    marker_ty,
                                     kind: DefineKind::Type,
                                 },
                             );
@@ -260,7 +310,6 @@ impl GenericAnalysis {
                                 ident,
                                 GenericArg {
                                     expand_ty: parse_quote!(#elem_expand<#marker_ty>),
-                                    marker_ty,
                                     kind: DefineKind::Type,
                                 },
                             );
@@ -272,7 +321,6 @@ impl GenericAnalysis {
                                 ident.clone(),
                                 GenericArg {
                                     expand_ty: parse_quote!(#ident),
-                                    marker_ty,
                                     kind: DefineKind::Size,
                                 },
                             );
@@ -281,7 +329,6 @@ impl GenericAnalysis {
                                 type_param.ident.clone(),
                                 GenericArg {
                                     expand_ty: parse_quote!(#size_expand<#marker_ty>),
-                                    marker_ty,
                                     kind: DefineKind::Size,
                                 },
                             );
@@ -427,6 +474,7 @@ impl KernelFn {
 
 impl Launch {
     pub fn from_item_fn(function: ItemFn, args: KernelArgs) -> syn::Result<Self> {
+        args.validate_persistence()?;
         let ret = function.sig.output.clone();
 
         let vis = function.vis;

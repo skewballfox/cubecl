@@ -4,6 +4,7 @@ use cubecl_ir::{ExpandValue, OpInserter, dialect::branch::RangeLoopOp};
 use num_traits::NumCast;
 
 use crate as cubecl;
+use crate::unexpanded;
 use cubecl::prelude::*;
 
 #[derive_expand(CubeType)]
@@ -344,17 +345,21 @@ fn iter_expand_unroll<I: Int>(
         .expect("Only constant end can be unrolled.")
         .as_i64();
 
+    let body_scope = scope.unrolled_loop_child();
     if inclusive {
         for i in start..=end {
             let val = I::from_int(i);
-            body(scope, val.into())
+            scope.update_flags_before_unrolled_iteration(&body_scope);
+            body(&body_scope, val.into());
         }
     } else {
         for i in start..end {
             let val = I::from_int(i);
-            body(scope, val.into())
+            scope.update_flags_before_unrolled_iteration(&body_scope);
+            body(&body_scope, val.into());
         }
     }
+    scope.finalize_unrolled_loop(&body_scope);
 }
 
 fn iter_expand<I: Int>(
@@ -385,7 +390,7 @@ fn iter_expand<I: Int>(
     child.terminate_yield();
 
     register_range_loop::<I>(scope, &range_loop, &child);
-    scope.set_may_return(&[child]);
+    scope.update_flags_after_loop(&[child]);
 }
 
 pub struct SteppedRangeExpand<I: Int> {
@@ -416,7 +421,7 @@ impl<I: Int + Into<ExpandValue>> Iterable for SteppedRangeExpand<I> {
         body(&child, i.into());
 
         register_range_loop::<I>(scope, &range_loop, &child);
-        scope.set_may_return(&[child]);
+        scope.update_flags_after_loop(&[child]);
     }
 
     fn expand_unroll(
@@ -443,32 +448,38 @@ impl<I: Int + Into<ExpandValue>> Iterable for SteppedRangeExpand<I> {
             .expect("Only constant step can be unrolled.")
             .as_i128();
 
+        let body_scope = scope.unrolled_loop_child();
         match (self.inclusive, step.is_negative()) {
             (true, true) => {
                 for i in (end..=start).rev().step_by(step.unsigned_abs() as usize) {
                     let val = I::from_int_128(i);
-                    body(scope, val.into())
+                    scope.update_flags_before_unrolled_iteration(&body_scope);
+                    body(&body_scope, val.into());
                 }
             }
             (true, false) => {
                 for i in (start..=end).step_by(step.unsigned_abs() as usize) {
                     let val = I::from_int_128(i);
-                    body(scope, val.into())
+                    scope.update_flags_before_unrolled_iteration(&body_scope);
+                    body(&body_scope, val.into());
                 }
             }
             (false, true) => {
                 for i in (end..start).rev().step_by(step.unsigned_abs() as usize) {
                     let val = I::from_int_128(i);
-                    body(scope, val.into())
+                    scope.update_flags_before_unrolled_iteration(&body_scope);
+                    body(&body_scope, val.into());
                 }
             }
             (false, false) => {
                 for i in (start..end).step_by(step.unsigned_abs() as usize) {
                     let val = I::from_int_128(i);
-                    body(scope, val.into())
+                    scope.update_flags_before_unrolled_iteration(&body_scope);
+                    body(&body_scope, val.into());
                 }
             }
         }
+        scope.finalize_unrolled_loop(&body_scope);
     }
 
     fn const_len(&self) -> Option<usize> {
@@ -556,4 +567,45 @@ pub mod range_stepped {
             inclusive: false,
         }
     }
+}
+
+/// Cube-strided range over `0..len` for a persistent kernel. Cube `c` gets the items `c`,
+/// `c + CUBE_COUNT`, `c + 2 * CUBE_COUNT`, and so on.
+///
+/// Every unit of a cube gets the same items, so the loop body may call `sync_cube`.
+#[allow(unused_variables)]
+pub fn persistent_range(len: usize) -> Box<dyn Iterator<Item = usize>> {
+    unexpanded!()
+}
+
+pub mod persistent_range {
+    use super::*;
+
+    pub fn expand(scope: &Scope, len: NativeExpand<usize>) -> SteppedRangeExpand<usize> {
+        let start = CUBE_POS::expand(scope);
+        let step = CUBE_COUNT::expand(scope);
+        range_stepped::expand(scope, start, len, step)
+    }
+}
+
+/// Unit-strided range over `0..len` for a persistent kernel. Unit `u` gets the items `u`,
+/// `u + CUBE_COUNT * CUBE_DIM`, and so on, where `u` is [`ABSOLUTE_POS`].
+#[allow(unused_variables)]
+pub fn persistent_range_units(len: usize) -> Box<dyn Iterator<Item = usize>> {
+    unexpanded!()
+}
+
+pub mod persistent_range_units {
+    use super::*;
+
+    pub fn expand(scope: &Scope, len: NativeExpand<usize>) -> SteppedRangeExpand<usize> {
+        let start = ABSOLUTE_POS::expand(scope);
+        let step = units_launched::expand(scope);
+        range_stepped::expand(scope, start, len, step)
+    }
+}
+
+#[cube]
+fn units_launched() -> usize {
+    CUBE_COUNT * CUBE_DIM as usize
 }

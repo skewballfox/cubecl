@@ -1,7 +1,7 @@
 use core::marker::PhantomData;
 
 use cubecl_core::ir::{
-    ContextExt,
+    ContextExt, PropagatesUniformity,
     attributes::{ATTR_BUFFER_IO, BufferIOAttr, FuncInterface, buffer_io_by_position},
     cube_op,
     dialect::OperationPtrExt,
@@ -66,6 +66,10 @@ pub struct LoadInfoOp {
 pub struct LoadDynMetaOp {
     ptr: Value,
 }
+
+// The info struct is a kernel argument, so it is as uniform as the pointer it is loaded from.
+PropagatesUniformity!(LoadInfoOp);
+PropagatesUniformity!(LoadDynMetaOp);
 
 shared_op!(LoadInfoOp, |op, ctx| {
     let ptr = op.ptr(ctx).name(ctx);

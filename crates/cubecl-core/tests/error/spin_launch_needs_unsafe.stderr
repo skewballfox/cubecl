@@ -1,0 +1,7 @@
+error[E0133]: call to unsafe function `spin_kernel::launch_persistent` is unsafe and requires unsafe block
+  --> tests/error/spin_launch_needs_unsafe.rs:11:5
+   |
+11 |     spin_kernel::launch_persistent(client, PersistentCount::Fill, CubeDim::new_1d(1), output);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+   |
+   = note: consult the function's documentation for information on how to avoid undefined behavior

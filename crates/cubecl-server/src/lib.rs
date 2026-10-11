@@ -29,7 +29,7 @@ extern crate derive_new;
 // `cubecl_server::server::Handle` both name the one type.
 pub use cubecl_runtime::benchmark;
 pub use cubecl_runtime::{
-    client, config, device, dry_run, id, launched, logging, runtime, throughput, tma, tune,
+    client, config, device, execution, id, launched, logging, runtime, throughput, tma, tune,
 };
 pub use cubecl_runtime::{local_tuner, storage_id_type};
 
@@ -62,6 +62,9 @@ pub mod timestamp_profiler;
 
 /// Validation utils for shared properties
 pub mod validation;
+
+/// Cooperative launches on runtimes with native grid sync.
+pub mod cooperative;
 
 /// Allocators moddule.
 pub mod allocator;
