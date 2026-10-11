@@ -1,12 +1,11 @@
 use cubecl_macros_internal::cube_op;
 use derive_more::From;
 use derive_new::new;
-use pliron::{
-    derive::{format, op_interface_impl, pliron_attr},
-    opts::dce::SideEffects,
-};
+use pliron::derive::{format, op_interface_impl, pliron_attr};
 
-use crate::{CanMaterialize, attributes::BoolAttr, interfaces::Synchronizes, prelude::*};
+use crate::{
+    CanMaterialize, HasSideEffects, attributes::BoolAttr, interfaces::Synchronizes, prelude::*,
+};
 
 /// Scope that the synchronization should apply to. This is a *minimum*, when fine-grained control
 /// is not available it should synchronize at the smallest scope that includes this scope
@@ -35,7 +34,7 @@ pub struct SyncScopeAttr(pub SyncScope);
 
 #[cube_op(name = "sync.sync")]
 #[result_ty(none)]
-#[op_traits(CanMaterialize)]
+#[op_traits(CanMaterialize, HasSideEffects)]
 pub struct SyncOp {
     pub scope: SyncScopeAttr,
 }
@@ -50,19 +49,12 @@ impl Synchronizes for SyncOp {
     }
 }
 
-#[op_interface_impl]
-impl SideEffects for SyncOp {
-    fn has_side_effects(&self, _ctx: &Context) -> bool {
-        true
-    }
-}
-
 /// Fences the async proxy in CUDA, to make shared memory available to it. Does not implement
 /// `Synchronizes`, because it works only as a memory availability barrier with an outside chip.
 /// It does not synchronize the actual threads, and is typically called only by the TMA leader.
 #[cube_op(name = "sync.sync_async_proxy")]
 #[result_ty(none)]
-#[op_traits(CanMaterialize)]
+#[op_traits(CanMaterialize, HasSideEffects)]
 pub struct SyncAsyncProxyOp {}
 
 /// Barrier that every unit of every cube of the launch must reach. It orders memory like
@@ -70,7 +62,7 @@ pub struct SyncAsyncProxyOp {}
 /// may use it, unless `checked` is `false`.
 #[cube_op(name = "sync.sync_grid")]
 #[result_ty(none)]
-#[op_traits(CanMaterialize)]
+#[op_traits(CanMaterialize, HasSideEffects)]
 pub struct GridSyncOp {
     pub checked: BoolAttr,
 }
@@ -82,12 +74,5 @@ impl Synchronizes for GridSyncOp {
     }
     fn maximum_scope(&self, _ctx: &Context) -> SyncScope {
         SyncScope::Device
-    }
-}
-
-#[op_interface_impl]
-impl SideEffects for GridSyncOp {
-    fn has_side_effects(&self, _ctx: &Context) -> bool {
-        true
     }
 }

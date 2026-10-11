@@ -21,12 +21,15 @@ use cubecl_ir::{
         synchronization::{GridSyncOp, SyncOp, SyncScope},
     },
     features::{GridSync, GridSyncEmulation},
-    interfaces::{MemoryEffects, TypedExt},
+    interfaces::{TypedExt, side_effects::MemoryEffectsOp},
     prelude::*,
     settings::{Persistence, SharedAfterGridSync},
     types::{ArrayType, AtomicType, scalar::IndexType},
 };
-use pliron::{basic_block::BasicBlock, linked_list::ContainsLinkedList, r#type::TypeHandle};
+use pliron::{
+    basic_block::BasicBlock, linked_list::ContainsLinkedList, opts::dce::SideEffects,
+    r#type::TypeHandle,
+};
 
 use crate::{
     client::Client,
@@ -340,9 +343,12 @@ fn derived_users(ctx: &Context, op: Ptr<Operation>) -> Vec<Ptr<Operation>> {
 }
 
 fn is_pure(ctx: &Context, op: Ptr<Operation>) -> bool {
-    let no_effects =
-        op_cast::<dyn MemoryEffects>(&*op.dyn_op(ctx)).is_some_and(|e| !e.has_effects(ctx));
-    no_effects && op.deref(ctx).num_regions() == 0
+    let dyn_op = op.dyn_op(ctx);
+    let no_side_effects =
+        op_cast::<dyn SideEffects>(&*dyn_op).is_some_and(|e| !e.has_side_effects(ctx));
+    let no_memory_effects =
+        op_cast::<dyn MemoryEffectsOp>(&*dyn_op).is_some_and(|e| !e.has_effects(ctx));
+    no_side_effects && no_memory_effects && op.deref(ctx).num_regions() == 0
 }
 
 enum Direction {
@@ -372,7 +378,7 @@ fn copy_shared(
     let step = builtin_as_index(&scope, Builtin::CubeDim);
     let copy = RangeLoopOp::new(scope.ctx_mut(), unit, len, step);
     let i = copy.iter_var(scope.ctx());
-    let body = scope.child(OpInserter::new_at_block_end(copy.loop_body(scope.ctx())));
+    let body = scope.branch_child(OpInserter::new_at_block_end(copy.loop_body(scope.ctx())));
 
     let shared = spill.var.get_result(body.ctx());
     let shared = match spill.len {
