@@ -378,6 +378,18 @@ RTX 4070, driver 580.178.04, and lavapipe from Mesa 26.2.4 (Homebrew), on the ho
 - Full suites: `cubecl-runtime`, `cubecl-server`, `cubecl-core` and `cubecl-cpu` (1029) pass. The lavapipe suite has the same failures as before M8 and M9; they move between runs, because the device loss above fails the tests that follow it. These failures exist before M8 and M9 too: the NVIDIA Vulkan suite crashes after `test_cubecl_std::fp4::e2m1_codec_matches_host` and fails 3 `bf16_conversion` tests; `test_spin_grid_sync_in_a_loop` fails on lavapipe; the CUDA math tests need `libdevice.10.bc`.
 - Not tested: HIP and Metal. No device is available.
 
+#### Follow-up after `feat/buffer-allocator-generic` merges ⬜
+
+**Do not act on this note before [PR #1896](https://github.com/tracel-ai/cubecl/pull/1896) (`feat/buffer-allocator-generic`) is in `main`.** Then merge `main` into this branch and do the steps below.
+
+PR #1896 makes `Bytes` generic over a `BufferAllocator`. A different backing memory can then own a `Bytes`. H1 interacts with that change in three places:
+
+1. **Staging buffer.** `ViewInner::Staged` makes its buffer with `vec![0; len]`, and `HostView::drop` wraps it with `Bytes::from_bytes_vec`. Both use the global allocator. Make the staging buffer through the allocator-aware constructor of `Bytes` (`with_capacity_like`, or the constructor that takes a `BufferAllocator`). Then a staged write comes from the allocator of the client, as every other `Bytes` does.
+2. **Aliasing flag.** `MappedMemory` is host memory that the device can write. `AllocationController::may_alias_mutable_storage` (from [PR #2036](https://github.com/tracel-ai/cubecl/pull/2036)) describes exactly this case. `HostView` is not a `Bytes` now, so no change is necessary. If a mapped view ever becomes a `Bytes`, its controller must return `true`. The generic `Controller<P>` returns `false` for every provider, so it must not wrap a `MappedMemory` pointer.
+3. **Provider for mapped memory.** If you want a zero-copy `Bytes` over a mapped range, add a `Provider` with `DETACHABLE = false` and a property other than `Native`. The `MAY_ALIAS_MUTABLE` constant on `Provider` must be `true` for it. That constant does not exist yet. Add it in PR #1896 or in a follow-up, whichever is first.
+
+Also, after the merge, open every permalink in section 2 and in H1 again (see "Reverification"). `main` changed `client.rs`, `server/base.rs`, the CUDA, HIP and CPU servers, and the macros since `4362f78`.
+
 #### Open points
 
 - Embedded targets: verify that `cubecl-cpu` builds without `std`. It compiles kernels with LLVM at run time, so it can need the host toolchain.
