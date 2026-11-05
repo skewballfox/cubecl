@@ -12,7 +12,7 @@ use cubecl_common::{
 };
 use cubecl_ir::{
     AddressType,
-    settings::{Dim3, ExecutionMode},
+    settings::{Dim3, ExecutionMode, Persistence},
 };
 use derive_more::{Eq, PartialEq};
 
@@ -97,6 +97,8 @@ pub struct KernelId {
     pub address_type: AddressType,
     /// The execution mode for this kernel
     pub mode: ExecutionMode,
+    /// Whether this kernel is persistent
+    pub persistence: Persistence,
     pub(crate) info: Option<Info>,
 }
 
@@ -106,6 +108,7 @@ impl Hash for KernelId {
         self.address_type.hash(state);
         self.cube_dim.hash(state);
         self.mode.hash(state);
+        self.hash_persistence(state);
         self.info.hash(state);
     }
 }
@@ -118,6 +121,7 @@ impl core::fmt::Debug for KernelId {
             .field("address_type", &self.address_type);
         debug_str.field("cube_dim", &self.cube_dim);
         debug_str.field("mode", &self.mode);
+        debug_str.field("persistence", &self.persistence);
         match &self.info {
             Some(info) => debug_str.field("info", info),
             None => debug_str.field("info", &self.info),
@@ -164,6 +168,7 @@ impl KernelId {
             info: None,
             cube_dim: Dim3::new_single(),
             mode: ExecutionMode::Checked,
+            persistence: Persistence::None,
             address_type: Default::default(),
         }
     }
@@ -172,10 +177,14 @@ impl KernelId {
     ///
     /// Can be used as a persistent kernel cache key.
     pub fn stable_format(&self) -> String {
-        format!(
+        let mut key = format!(
             "{}-{}-{:?}-{:?}-{:?}",
             self.type_name, self.address_type, self.cube_dim, self.mode, self.info
-        )
+        );
+        if self.persistence != Persistence::None {
+            key += &format!("-{:?}", self.persistence);
+        }
+        key
     }
 
     /// Hash the key in a stable way that can be used between runs.
@@ -187,6 +196,7 @@ impl KernelId {
         self.address_type.hash(&mut hasher);
         self.cube_dim.hash(&mut hasher);
         self.mode.hash(&mut hasher);
+        self.hash_persistence(&mut hasher);
         self.info.hash(&mut hasher);
 
         hasher.finalize()
@@ -213,6 +223,20 @@ impl KernelId {
     pub fn mode(mut self, mode: ExecutionMode) -> Self {
         self.mode = mode;
         self
+    }
+
+    /// Set the [`Persistence`].
+    pub fn persistence(mut self, persistence: Persistence) -> Self {
+        self.persistence = persistence;
+        self
+    }
+
+    /// Hashes the persistence only when it is set, so the keys of regular kernels stay
+    /// the same as before persistence existed.
+    fn hash_persistence<H: Hasher>(&self, state: &mut H) {
+        if self.persistence != Persistence::None {
+            self.persistence.hash(state);
+        }
     }
 
     /// Set the [cube dim](CubeDim).

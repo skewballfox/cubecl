@@ -11,6 +11,8 @@ pub mod compilation;
 pub mod environment;
 /// Memory config module.
 pub mod memory;
+/// Persistent kernel config module.
+pub mod persistent;
 /// Profiling config module.
 pub mod profiling;
 /// Human-readable byte sizes for config files.

@@ -21,8 +21,8 @@ use cubecl_core::{
     MemoryConfiguration, WgpuCompilationOptions,
     prelude::*,
     server::{
-        CopyDescriptor, IoError, KernelArguments, ProfileError, ProfilingToken,
-        ServerCommunication, ServerError, ServerUtilities,
+        CompletionSignal, CopyDescriptor, IoError, KernelArguments, MappedMemory, MarkSubmit,
+        ProfileError, ProfilingToken, ServerCommunication, ServerError, ServerUtilities,
     },
     zspace::{Strides, strides},
 };
@@ -39,7 +39,7 @@ use cubecl_server::memory_management::{
 };
 use cubecl_server::{
     config::{CubeClRuntimeConfig, RuntimeConfig},
-    dry_run::LaunchMode,
+    execution::LaunchMode,
     id::GraphId,
     kernel::CubeKernel,
     logging::ServerLogger,
@@ -426,12 +426,11 @@ impl<C: WgpuCompiler> Server for WgpuServer<C> {
         // refuse every later launch that shares them, an autotune sweep
         // above all.
         //
-        // A dry run stages none either way. It was never going to write, so a
+        // A discarded launch stages none either way. It was never going to write, so a
         // failure in it leaves nothing stale, and tainting its buffers would
         // fail unrelated reads of memory the run deliberately left alone.
-        // A compile-only launch only queues its kernel, touching nothing else.
         let layout = MetadataLayout::from(&args.info);
-        if launch_mode == LaunchMode::CompileOnly {
+        if launch_mode == LaunchMode::Queue {
             self.pipelines.enqueue(kernel, layout);
             return;
         }
@@ -449,7 +448,7 @@ impl<C: WgpuCompiler> Server for WgpuServer<C> {
             Err(err) => {
                 let error = ServerError::Launch(err);
                 self.scheduler.stream(&stream_id).profile_failure(&error);
-                if !launch_mode.is_skipped() {
+                if !launch_mode.discards_launch() {
                     let mut written = self.write_set();
                     written.extend(args.buffers_written(None).cloned());
                     failed_writing(self, stream_id, written, error);
@@ -457,7 +456,7 @@ impl<C: WgpuCompiler> Server for WgpuServer<C> {
                 return;
             }
         };
-        if launch_mode.is_skipped() {
+        if launch_mode.discards_launch() {
             return;
         }
         let kernel_id = id.kernel;
@@ -542,6 +541,73 @@ impl<C: WgpuCompiler> Server for WgpuServer<C> {
         let stream = self.scheduler.stream(&stream_id);
 
         stream.flush(stream_id)
+    }
+
+    fn mark(
+        &mut self,
+        stream_id: StreamId,
+        submit: MarkSubmit,
+    ) -> Result<Option<Arc<dyn CompletionSignal>>, ServerError> {
+        self.scheduler.execute_streams(vec![stream_id]);
+        let signal = self.scheduler.stream(&stream_id).mark(submit)?;
+        Ok(Some(signal))
+    }
+
+    /// A view of the persistent mapping of the buffer. Only buffers in unified
+    /// memory have one (see `backend::vulkan::create_storage_buffer`).
+    fn host_view(
+        &mut self,
+        binding: BufferBinding,
+        stream_id: StreamId,
+    ) -> Result<Option<MappedMemory>, ServerError> {
+        let stream = self.scheduler.stream(&stream_id);
+        stream.reject_while_recording("host_view")?;
+        stream.check_poison()?;
+        let mut streams = vec![stream_id];
+        if binding.stream != stream_id {
+            streams.push(binding.stream);
+        }
+        self.scheduler.execute_streams(streams);
+
+        // No claim check, as a read makes: the host is about to fill the range.
+        let resource = self
+            .scheduler
+            .stream(&binding.stream)
+            .memory
+            .managed_resource(
+                binding.memory.clone(),
+                binding.offset_start,
+                binding.offset_end,
+            )?;
+        let Some(host_ptr) = resource.resource().host_ptr else {
+            return Ok(None);
+        };
+        let offset = usize::try_from(resource.resource().offset)
+            .expect("a mapped buffer fits in the address space");
+        let len = resource
+            .resource()
+            .size
+            .min(binding.size_in_used())
+            .try_into()
+            .unwrap_or(usize::MAX);
+
+        // The same scope as a write: the host fills the range, which releases
+        // an earlier failure's claim on it.
+        let mut written = self.write_set();
+        written.push(binding);
+        ExecuteScope::over(self, stream_id, written)
+            .execute(|_| Ok(()))
+            .into_result()?;
+
+        // SAFETY: the mapping covers the whole buffer and lives as long as its
+        // memory, which the bound resource keeps in place. The offset and the
+        // length stay inside the binding.
+        let ptr = unsafe { host_ptr.0.add(offset) };
+        // SAFETY: as above; the caller of `host_view_mut` keeps every task off
+        // the range while the view exists.
+        Ok(Some(unsafe {
+            MappedMemory::new(ptr, len, Box::new(resource))
+        }))
     }
 
     /// Returns the total time of GPU work this sync completes.

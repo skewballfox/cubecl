@@ -1,0 +1,78 @@
+# Open Decisions: Kernel Profiling and Flamegraph Support
+
+Base commit: [`a1bb768ce919260eea56dbd0b59c70e55236e22d`](https://github.com/skewballfox/cubecl/commit/a1bb768ce919260eea56dbd0b59c70e55236e22d). Plan: [PLAN.md](PLAN.md).
+
+## Rules for all decisions
+
+1. The behavior must be the same as for ordinary Rust code. The user sets `debug` in a cargo profile. Then the profilers work. A choice that needs a compile-time setting **and** a run-time switch is correct only if the feature has a run-time cost or a side effect that is too high to have in every build with debug data (PLAN §3.0).
+2. cubecl uses only open formats and interfaces that existing tools read (perf, samply, `cargo flamegraph`, CUPTI, rocprofiler, gdb, `tracing` layers). cubecl adds no profiler and no output format of its own.
+
+This file lists only the open choices. The plan contains the result of each closed choice. For each open choice, the plan uses the **provisional** option, so work can start. A maintainer must confirm or change it.
+
+| ID | Subject | Provisional | Blocks |
+|---|---|---|---|
+| D4 | LLVM debug data: cubecl bridge or pliron-llvm change | B (on a `pliron` fork revision, not released) | upstream review of B |
+| D10 | Trigger for perf symbol files | A + B | P3 step 3 |
+| D11 | Configuration surface for the SPIR-V debug format | A + B (done) | maintainer confirmation |
+
+---
+
+## D4. LLVM debug data: cubecl-side metadata bridge or pliron-llvm change
+
+The rule does not apply. The user-visible behavior is the same.
+
+| Option | For | Against |
+|---|---|---|
+| A. cubecl bridge. `cubecl.loc` metadata, then the `llvm-sys` `DIBuilder` after `LlvmModule::new` (PLAN §6 steps 3–4). | It changes cubecl only. It works with `pliron-llvm 0.18`. It uses the text round trip that already exists. | It uses a private metadata kind as a side channel. It adds about 300 lines of unsafe FFI to cubecl. Other `pliron-llvm` users do not get the feature. |
+| B. `pliron-llvm` change. In `convert_block` ([`to_llvm_ir.rs#L2052-L2083`](https://github.com/pliron-org/pliron/blob/3517dc6c08370e486297972be8da2b98ed0cd683/pliron-llvm/src/to_llvm_ir.rs#L2052-L2083)), call `LLVMSetCurrentDebugLocation2` from `op.loc()`. Add a `DISubprogram` for each function. | It is the correct layer. All pliron users get the feature. cubecl has no side channel. | It needs upstream review and a release. It needs an upstream design for `Named` and `Fused`. The `DI*` nodes are not modelled yet ([`metadata.rs#L36-L38`](https://github.com/pliron-org/pliron/blob/3517dc6c08370e486297972be8da2b98ed0cd683/pliron-llvm/src/metadata.rs#L36-L38)). |
+| **C. A now, B later.** Remove A when B is released. | You get the feature now, with a path to the clean design. | The work is done twice. |
+
+**Decide with:** whether the pliron maintainers accept B, and how long a release takes.
+
+**Status:** A was done first ([`9ee8163`](https://github.com/skewballfox/cubecl/commit/9ee81636f029fecb387f16973bae522c10f48174)). B is now done in the `pliron` fork, commit [`d3a31a1`](https://github.com/skewballfox/pliron/tree/d3a31a15d253797f6f90fa2245c53caf800264ad) on `v0.18.0`. A is removed in [`0692c38`](https://github.com/skewballfox/cubecl/commit/0692c3850c5ee65c8dfe750d76d80b8cea3d48e6) (PLAN §6). cubecl uses B through `[patch.crates-io]`. The fork branch `cubecl-patch` also merges `pliron` `master`, which cubecl does not compile with. Thus the patch uses the revision, not the branch. B has these designs for the open points:
+
+- `Named`: the name of the outermost frame of a location is the name of a function. Other names have no effect.
+- `CallSite`: the callee gets a `DISubprogram` from its name, inlined at the location of the caller. A callee without a name gets the location of the caller.
+- `Fused`: the first location that converts. The LLVM C-API cannot merge locations.
+- `Unknown`: line 0 in the function scope.
+- No `DI*` metadata nodes are modelled. The conversion uses the LLVM `DIBuilder` directly.
+
+**Update** ([`c68f831`](https://github.com/skewballfox/cubecl/commit/c68f83128de6edbe23944ae8c5c1468cb622d8c2), merge of `main`): `main` takes `pliron` from git, at `master`. The patch is now `[patch."https://github.com/pliron-org/pliron.git"]`, at the fork commit [`8b27b0e`](https://github.com/skewballfox/pliron/tree/8b27b0e7271b0c84f49f7f8afad6d7fc0c904144) on `cubecl-patch`. That branch merges a newer `master`, and cubecl compiles with it. The fork has no feature `debug-info` any more (PLAN §6).
+
+The choice stays open until the pliron maintainers accept B or ask for changes.
+
+## D10. Trigger for perf symbol files
+
+The perf jitdump and the perf map (PLAN §7) write files that stay after the process stops. Thus rule 1 requires a run-time trigger. The question is which signal starts them.
+
+**Facts (checked in the source code):**
+
+- `cargo flamegraph` 0.6.14 runs `perf record` (Linux) or `dtrace` / `xctrace` (macOS). It sets no environment variable on the profiled program.
+- `samply` 0.13.1 sets `DOTNET_PerfMapEnabled` on the program that it starts, if the variable is not already set: `2` (jitdump) on Linux, `3` (perf map) on macOS. The name comes from .NET: `1` = both, `2` = jitdump only, `3` = perf map only.
+- No JIT-neutral standard exists for "a profiler asks for JIT symbols". Each JIT runtime uses its own opt-in: .NET `DOTNET_PerfMapEnabled`, Python `PYTHONPERFSUPPORT` / `-X perf`, Node `--perf-basic-prof`, JVM `-XX:+DumpPerfMapAtExit`.
+- Detection of the parent process (for example `/proc/<ppid>/comm == "perf"`) is not reliable. `perf record -p`, `perf record -a`, eBPF agents and wrapper scripts have a different parent.
+
+| Option | For | Against |
+|---|---|---|
+| **A. `CUBECL_JIT_SYMBOLS=perf` (or `jitdump`, `perfmap`).** | It is the same convention as all other JIT runtimes. It is clear and not hacky. | One variable more than for native Rust code. |
+| **B. Also accept `DOTNET_PerfMapEnabled` (`1`, `2`, `3`, same meanings).** | `samply record` works with no cubecl variable. | It uses a name from a different runtime. A user who profiles .NET code in the same shell also enables cubecl output. `cargo flamegraph` still needs A. |
+| C. Always write the files when the level is not `None`. | `cargo flamegraph` and `samply` work with no variable, as for native code. | Each dev-profile process, each `cargo test` process included, leaves files in `/tmp` and `~/.debug/jit`. |
+
+No clean automatic detection for `cargo flamegraph` exists. B is automatic for `samply` only.
+
+## D11. Configuration surface for the SPIR-V debug format
+
+The format is decided: `Auto` selects `NonSemantic.Shader.DebugInfo.100` when the device supports it, else `OpLine` (PLAN §8 step 4). This choice is about **how the user overrides `Auto`**. Each option is a code location where the setting can enter.
+
+| Option | Code location | For | Against |
+|---|---|---|---|
+| **A. Automatic (default).** Device support sets `supports_non_semantic_info`. | [`vulkan/features.rs#L113-L122`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-wgpu/src/backend/vulkan/features.rs#L113-L122), [`vulkan.rs#L391-L395`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-wgpu/src/backend/vulkan.rs#L391-L395) | No setting. It is always necessary as the base. | No override alone. |
+| **B. Global config: `[compilation] spirv_debug_format = "auto" \| "op-line" \| "non-semantic"` in `cubecl.toml`, and `CUBECL_SPIRV_DEBUG_FORMAT`.** | `CompilationConfig` ([`config/compilation.rs#L4-L20`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-runtime/src/config/compilation.rs#L4-L20)), env read in [`config/base.rs`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-runtime/src/config/base.rs#L80) | Same pattern as `check_mode` and `f16_evaluation`. No API change. It works for tools that fail on one format. | Global, not per device. |
+| C. Per device: a field in `RuntimeOptions`. | [`cubecl-wgpu/src/runtime.rs#L283-L288`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-wgpu/src/runtime.rs#L283-L288) | Programmatic. Different devices can use different formats. | `RuntimeOptions` has public fields and no `#[non_exhaustive]`, so a new field breaks struct literals in user code. |
+| D. Per device: a new `WgpuSetup` builder method or `init_device_with_options`. | [`runtime.rs#L315-L337`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-wgpu/src/runtime.rs#L315-L337) | Programmatic, and additive. | A new function for one setting. |
+| E. Cargo feature on `cubecl-wgpu` (`spirv-non-semantic`). | `crates/cubecl-wgpu/Cargo.toml` | Simple. | It violates rule 1: the format has no run-time cost, so a build switch is not justified. Features are additive, so "force `OpLine`" cannot be a feature. |
+| F. Per kernel: `KernelSettings` or `#[cube(...)]`. | [`cubecl-ir/src/settings.rs#L79-L92`](https://github.com/skewballfox/cubecl/blob/a1bb768ce919260eea56dbd0b59c70e55236e22d/crates/cubecl-ir/src/settings.rs#L79-L92) | Maximum control. | The format is a property of the device and the tool, not of the kernel. It adds noise to the kernel API. |
+
+Provisional: A as the default, B as the override. Add D only if a user needs different formats on two devices in one process.
+
+**Status:** A and B are done in [`7f10c05`](https://github.com/skewballfox/cubecl/commit/7f10c05fdd42a033df4cc13ea88a2b667a84ed62) (PLAN §8 step 4). The Vulkan backend sets `supports_non_semantic_info`. `compilation.spirv_debug_format` and `CUBECL_SPIRV_DEBUG_FORMAT` take `auto`, `op-line` or `non-semantic`. The choice stays open until a maintainer confirms it.

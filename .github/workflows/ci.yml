@@ -103,16 +103,8 @@ jobs:
         run: xtask doc --ci tests
 
   linux-std-tests:
-    runs-on: [
-      '@id:cubecl-linux-std-tests-${{ matrix.rust }}-${{ github.run_id }}-${{ github.run_attempt }}',
-      '@image-family:ubuntu-2404-lts-amd64',
-      '@image-project:ubuntu-os-cloud',
-      '@disk-size:100',
-      '@keep-alive:false',
-      '@machine-type:n2-standard-16',
-      '@os:linux',
-      '@zones:northamerica-northeast1-b'
-      ]
+    # The self-hosted runner labels exist only for tracel-ai. Forks use a GitHub-hosted runner.
+    runs-on: ${{ github.repository_owner == 'tracel-ai' && fromJSON(format('["@id:cubecl-linux-std-tests-{0}-{1}-{2}","@image-family:ubuntu-2404-lts-amd64","@image-project:ubuntu-os-cloud","@disk-size:100","@keep-alive:false","@machine-type:n2-standard-16","@os:linux","@zones:northamerica-northeast1-b"]', matrix.rust, github.run_id, github.run_attempt)) || 'ubuntu-24.04' }}
     needs: [prepare-checks, code-quality]
     strategy:
       matrix:
@@ -125,6 +117,11 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v6
+      # --------------------------------------------------------------------------------
+      # GitHub-hosted runners have about 14 GB free; the upstream runners have 100 GB.
+      - name: Free disk space
+        if: github.repository_owner != 'tracel-ai'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
       # --------------------------------------------------------------------------------
       - name: Install Rust
         uses: tracel-ai/github-actions/install-rust@v11
@@ -143,16 +140,8 @@ jobs:
         run: xtask test --ci
 
   linux-miri-tests:
-    runs-on: [
-      '@id:cubecl-linux-miri-tests-${{ matrix.rust }}-${{ github.run_id }}-${{ github.run_attempt }}',
-      '@image-family:ubuntu-2404-lts-amd64',
-      '@image-project:ubuntu-os-cloud',
-      '@disk-size:100',
-      '@keep-alive:false',
-      '@machine-type:n2-standard-16',
-      '@os:linux',
-      '@zones:northamerica-northeast1-b'
-      ]
+    # The self-hosted runner labels exist only for tracel-ai. Forks use a GitHub-hosted runner.
+    runs-on: ${{ github.repository_owner == 'tracel-ai' && fromJSON(format('["@id:cubecl-linux-miri-tests-{0}-{1}-{2}","@image-family:ubuntu-2404-lts-amd64","@image-project:ubuntu-os-cloud","@disk-size:100","@keep-alive:false","@machine-type:n2-standard-16","@os:linux","@zones:northamerica-northeast1-b"]', matrix.rust, github.run_id, github.run_attempt)) || 'ubuntu-24.04' }}
     needs: [prepare-checks, code-quality]
     strategy:
       matrix:
@@ -165,6 +154,11 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v6
+      # --------------------------------------------------------------------------------
+      # GitHub-hosted runners have about 14 GB free; the upstream runners have 100 GB.
+      - name: Free disk space
+        if: github.repository_owner != 'tracel-ai'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
       # --------------------------------------------------------------------------------
       - name: Install Rust
         uses: tracel-ai/github-actions/install-rust@v11

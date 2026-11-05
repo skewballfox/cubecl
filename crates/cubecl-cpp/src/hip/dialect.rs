@@ -8,7 +8,9 @@ macro_rules! hip_op {
         }
     };
 }
-use cubecl_core::ir::dialect::synchronization::{SyncOp, SyncScope};
+use cubecl_core::ir::dialect::synchronization::{GridSyncOp, SyncOp, SyncScope};
+
+use crate::{shared::signature::op_includes, target::Hip};
 pub(super) use hip_op;
 
 macro_rules! hip_op_with_out {
@@ -47,4 +49,11 @@ __builtin_amdgcn_wave_barrier();\n"
         SyncScope::Unit => "",
     }
     .into()
+});
+
+op_includes!(Hip, [GridSyncOp] => "hip/hip_cooperative_groups.h");
+
+// The runtime launches a kernel with a grid sync cooperatively, which this barrier needs.
+hip_op!(GridSyncOp, |_, _| {
+    "cooperative_groups::this_grid().sync();\n".into()
 });

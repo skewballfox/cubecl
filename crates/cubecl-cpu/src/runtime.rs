@@ -7,7 +7,7 @@ use cubecl_core::{
     ir::{
         AddressType, DeviceIdentity, DeviceProperties, ElemType, FloatKind, HardwareProperties,
         IntKind, MemoryDeviceProperties, TargetProperties, Type, UIntKind, VectorSize,
-        features::{AtomicUsage, Features, TypeUsage},
+        features::{AtomicUsage, Features, GridSync, GridSyncEmulation, TypeUsage},
     },
     server::ServerUtilities,
     zspace::{Shape, Strides},
@@ -215,6 +215,10 @@ impl DeviceService for CpuServer {
         let mut device_props = DeviceProperties::new(
             Features {
                 unaligned_io: true,
+                // Launches on a stream run in order, so a split is a barrier.
+                grid_sync: GridSync::Emulated(GridSyncEmulation::Split.into()),
+                // The storage is host memory, so a host view writes it in place.
+                host_visible_storage: true,
                 ..Default::default()
             },
             mem_properties.clone(),

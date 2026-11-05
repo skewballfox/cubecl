@@ -4,6 +4,7 @@ use super::{
     poll::WgpuPoll,
     timings::{QueryProfiler, TimestampQuerySetBudget, TimestampSampling},
 };
+use crate::compute::completion::WgpuSignal;
 use crate::compute::copies::WgpuCopies;
 use crate::compute::device_poison::PoisonWatch;
 use crate::{
@@ -20,7 +21,10 @@ use cubecl_common::{
 };
 use cubecl_core::{
     CubeCount, MemoryConfiguration,
-    server::{BufferBinding, DeviceCaptures, IoError, ProfileError, ProfilingToken, ServerError},
+    server::{
+        BufferBinding, DeviceCaptures, IoError, MarkSubmit, ProfileError, ProfilingToken,
+        ServerError,
+    },
     zspace::Shape,
 };
 use cubecl_environment::backtrace::BackTrace;
@@ -103,6 +107,9 @@ pub struct WgpuStream {
     /// Kept alive here until the next `flush` ties their release to the submission's completion.
     /// See [`ScheduleTask::Execute::pins`](crate::schedule::ScheduleTask).
     shared_bindings: SharedMemoryBindings,
+    /// Marks on work that is not submitted yet. The next submission completes
+    /// them (see [`mark`](Self::mark)).
+    pending_marks: Vec<Arc<WgpuSignal>>,
     /// Reusable per-launch info uniforms (kernel shapes/strides/scalars), keyed
     /// by the exact info words they were built from — same scheme as the CUDA
     /// and HIP servers. A hit reuses the already-uploaded uniform buffer, so a
@@ -155,7 +162,8 @@ impl RelocatableStream for WgpuStream {
     }
 
     fn relocate(&mut self, reason: RelocationReason, failures: &mut ErrorGraph) {
-        let mut copier = WgpuCopies::new(self.device.clone(), self.queue.clone());
+        let mut copier =
+            WgpuCopies::new(self.device.clone(), self.queue.clone(), self.poison.clone());
         self.memory.relocate(&mut copier, reason, failures);
     }
 
@@ -204,7 +212,7 @@ impl WgpuStream {
             }
         });
 
-        let poll = WgpuPoll::new(device.clone());
+        let poll = WgpuPoll::new(device.clone(), queue.clone(), poison.clone());
 
         let memory = mem_manager::main_memory(
             &device,
@@ -235,6 +243,7 @@ impl WgpuStream {
             submission_load: SubmissionLoad::default(),
             pending_write_count: 0,
             shared_bindings: SharedMemoryBindings::default(),
+            pending_marks: Vec::new(),
             // Tighter entry cap than the default policy: the uniforms pool is
             // bucketed exclusive pages with a 32 KiB minimum, so every cached
             // entry pins a whole page (512 × 32 KiB ≈ 16 MiB worst case) —
@@ -429,6 +438,7 @@ impl WgpuStream {
         for entry in staging_info.iter() {
             if let Some((staging, _binding, _size)) = entry {
                 let (sender, receiver) = cubecl_environment::future::channel::bounded(1);
+                self.poison.wake_on_loss(&sender);
                 staging
                     .buffer
                     .slice(..)
@@ -503,6 +513,7 @@ impl WgpuStream {
             true => Timings::Device(Box::new(QueryProfiler::new(
                 &self.queue,
                 &self.device,
+                &self.poison,
                 budget.clone(),
                 *sampling,
             ))),
@@ -526,8 +537,15 @@ impl WgpuStream {
                 self.flush(stream_id)?;
                 // Waits like system timing's sync, for the reason `drains_before_window` gives:
                 // work still running when the window's first pass starts is timed as its own.
-                if let Err(err) = self.device.poll(wgpu::PollType::wait_indefinitely()) {
-                    log::warn!("waiting for the work ahead of a profiled window: {err}");
+                match self
+                    .poison
+                    .wait_unless_lost(&self.device, &self.queue, None)
+                {
+                    Ok(()) => {}
+                    Err(err) if self.poison.is_poisoned() => return Err(err),
+                    Err(err) => {
+                        log::warn!("waiting for the work ahead of a profiled window: {err}");
+                    }
                 }
             }
             Timings::Device(_) | Timings::Unclaimed { .. } => self.flush(stream_id)?,
@@ -614,7 +632,9 @@ impl WgpuStream {
                                 // sets return to the pool here, and a pass that reuses one
                                 // before the resolve runs would overwrite the window's ends.
                                 if let Err(err) =
-                                    self.device.poll(wgpu::PollType::wait_indefinitely())
+                                    self.poison
+                                        .wait_unless_lost(&self.device, &self.queue, None)
+                                    && !self.poison.is_poisoned()
                                 {
                                     log::warn!("waiting for a profiled window to complete: {err}");
                                 }
@@ -622,7 +642,7 @@ impl WgpuStream {
                             self.queue.submit([readback.commands]);
                             readback.map_buffer
                         });
-                        timing.stop_profile(map_buffer, poll)
+                        timing.stop_profile(map_buffer, poll, &self.poison)
                     }
                     Err(err) => {
                         // Dropped rather than mapped: the flush this window
@@ -668,6 +688,7 @@ impl WgpuStream {
 
         Box::pin(async move {
             let (sender, receiver) = cubecl_environment::future::channel::bounded::<()>(1);
+            poison.wake_on_loss(&sender);
             queue.on_submitted_work_done(move || {
                 // Signal that we're done.
                 let _ = sender.try_send(());
@@ -733,6 +754,12 @@ impl WgpuStream {
         let Some(host_ptr) = resource.host_ptr else {
             return false;
         };
+        // A lost device frees its memory, mapping and all, while the buffers
+        // that name it live on. The queue path reports the loss; a copy through
+        // the mapping would write freed memory.
+        if self.poison.is_poisoned() {
+            return false;
+        }
         // The copy below is unchecked; the queue path validates.
         if data.len() as u64 > resource.size {
             return false;
@@ -826,10 +853,11 @@ impl WgpuStream {
 
             // Wait for the GPU to finish processing these writes before continuing.
             #[cfg(not(target_family = "wasm"))]
-            if let Err(e) = self.device.poll(wgpu::PollType::Wait {
-                submission_index: Some(index),
-                timeout: None,
-            }) {
+            if let Err(e) = self
+                .poison
+                .wait_unless_lost(&self.device, &self.queue, Some(index))
+                && !self.poison.is_poisoned()
+            {
                 log::warn!("wgpu: write flush poll failed ({e})");
             }
 
@@ -866,9 +894,49 @@ impl WgpuStream {
         Ok(())
     }
 
+    /// The loss of the device, if it is lost: a lost device has freed its
+    /// memory, so nothing may write through a mapping any more.
+    pub(crate) fn check_poison(&self) -> Result<(), ServerError> {
+        self.poison.check()
+    }
+
+    /// A signal for the point after the last task queued on this stream.
+    ///
+    /// [`MarkSubmit::Now`] submits the queued work. [`MarkSubmit::Deferred`]
+    /// leaves it for the next submission, unless nothing is queued: then the
+    /// point is already on the queue.
+    pub(crate) fn mark(&mut self, submit: MarkSubmit) -> Result<Arc<WgpuSignal>, ServerError> {
+        self.reject_while_recording("mark")?;
+        let signal = WgpuSignal::new(self.poison.clone());
+        self.pending_marks.push(signal.clone());
+        if submit == MarkSubmit::Now || self.tasks_count == 0 {
+            self.submit();
+        }
+        Ok(signal)
+    }
+
+    /// Complete the pending marks when the queue completes what it has been
+    /// given so far. Call it after each submission.
+    fn complete_marks(&mut self) {
+        if self.pending_marks.is_empty() {
+            return;
+        }
+        let marks = core::mem::take(&mut self.pending_marks);
+        // The callback runs from a device poll, so keep the polling active
+        // until it has run.
+        let poll = self.poll.start_polling();
+        self.queue.on_submitted_work_done(move || {
+            for mark in marks {
+                mark.complete();
+            }
+            core::mem::drop(poll);
+        });
+    }
+
     fn submit_tasks(&mut self) {
         if self.tasks_count == 0 {
             self.shared_bindings.clear();
+            self.complete_marks();
             return;
         }
 
@@ -888,6 +956,7 @@ impl WgpuStream {
 
         // This will _first_ fire off all pending write_buffer work.
         let index = self.queue.submit([tasks_encoder.finish()]);
+        self.complete_marks();
 
         // Release cross-stream input pins.
         if !self.shared_bindings.is_empty() {
@@ -897,8 +966,13 @@ impl WgpuStream {
             });
         }
 
-        self.submission_load
-            .regulate(&self.device, self.tasks_count, index);
+        self.submission_load.regulate(
+            &self.poison,
+            &self.device,
+            &self.queue,
+            self.tasks_count,
+            index,
+        );
 
         // The main pool's pages are cleaned up by the server before it
         // reserves, and only while no stream records.
@@ -1160,6 +1234,8 @@ impl WgpuStream {
 
 #[cfg(not(target_family = "wasm"))]
 mod __submission_load {
+    use crate::compute::device_poison::PoisonWatch;
+
     #[derive(Default, Debug)]
     pub enum SubmissionLoad {
         Init {
@@ -1173,7 +1249,9 @@ mod __submission_load {
     impl SubmissionLoad {
         pub fn regulate(
             &mut self,
+            poison: &PoisonWatch,
             device: &wgpu::Device,
+            queue: &wgpu::Queue,
             tasks_count: usize,
             mut index: wgpu::SubmissionIndex,
         ) {
@@ -1194,13 +1272,10 @@ mod __submission_load {
 
                     if *tasks_count_submitted >= MAX_TOTAL_TASKS {
                         core::mem::swap(last_index, &mut index);
-                        if let Err(e) = device.poll(wgpu::PollType::Wait {
-                            submission_index: Some(index),
-                            timeout: None,
-                        }) {
-                            log::warn!(
-                                "wgpu: requested wait timed out before the submission was completed during sync. ({e})"
-                            )
+                        if let Err(e) = poison.wait_unless_lost(device, queue, Some(index))
+                            && !poison.is_poisoned()
+                        {
+                            log::warn!("wgpu: waiting on a throttled submission failed ({e})")
                         }
                         *tasks_count_submitted = 0;
                     }
@@ -1218,13 +1293,17 @@ mod __submission_load {
 
 #[cfg(target_family = "wasm")]
 mod __submission_load_wasm {
+    use crate::compute::device_poison::PoisonWatch;
+
     #[derive(Default, Debug)]
     pub struct SubmissionLoad;
 
     impl SubmissionLoad {
         pub fn regulate(
             &mut self,
+            _poison: &PoisonWatch,
             _device: &wgpu::Device,
+            _queue: &wgpu::Queue,
             _tasks_count: usize,
             _index: wgpu::SubmissionIndex,
         ) {

@@ -6,8 +6,12 @@ use cubecl_common::{bytes::Bytes, profile::ProfileDuration};
 use cubecl_core::{
     MemoryConfiguration,
     ir::MemoryDeviceProperties,
-    server::{BufferBinding, CopyDescriptor, IoError, ProfileError, ProfilingToken, ServerError},
+    server::{
+        BufferBinding, CompletionSignal, CopyDescriptor, IoError, ProfileError, ProfilingToken,
+        ServerError,
+    },
 };
+use cubecl_environment::future::DynFut;
 use cubecl_environment::stream::StreamId;
 use cubecl_server::memory_management::relocation::{
     HostCopies, RelocatableStream, RelocationNeed, RelocationReason,
@@ -23,7 +27,10 @@ use cubecl_server::{
     stream::StreamMemory,
     timestamp_profiler::TimestampProfiler,
 };
-use std::sync::{Arc, atomic::AtomicU64};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 pub struct CpuStream {
     pub(crate) memory_management: MemoryManagement<BytesStorage>,
@@ -82,6 +89,44 @@ impl RelocatableStream for CpuStream {
 
     fn cleanup_memory(&mut self, failures: &mut ErrorGraph) {
         self.memory_management.cleanup(Cleanup::Explicit, failures);
+    }
+}
+
+/// Block until `counter` reaches `step`.
+fn wait_for_step(counter: &AtomicU64, step: u64) {
+    // Spin briefly, then yield between polls: the client is not pinned,
+    // and a pure spin parked on a worker's logical CPU keeps that worker
+    // off it until the next timer tick (~3 ms unit-start stalls).
+    const SPINS_BEFORE_YIELD: u32 = 1_000;
+    let mut spins = 0u32;
+    while counter.load(Ordering::Acquire) < step {
+        spins += 1;
+        if spins < SPINS_BEFORE_YIELD {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// A point on a CPU stream: the step its counter reaches when every task
+/// enqueued before the point has run.
+#[derive(Debug)]
+struct CpuSignal {
+    counter: Arc<CachePadded<AtomicU64>>,
+    step: u64,
+}
+
+impl CompletionSignal for CpuSignal {
+    fn is_done(&self) -> bool {
+        self.counter.load(Ordering::Acquire) >= self.step
+    }
+
+    fn wait(self: Arc<Self>) -> DynFut<Result<(), ServerError>> {
+        Box::pin(async move {
+            wait_for_step(&self.counter, self.step);
+            Ok(())
+        })
     }
 }
 
@@ -180,23 +225,17 @@ impl CpuStream {
     /// scheduler aligning streams. Whatever is queued stays queued, for the
     /// flush of the stream that owns it.
     pub fn submit(&mut self) {
-        // Spin briefly, then yield between polls: the client is not pinned,
-        // and a pure spin parked on a worker's logical CPU keeps that worker
-        // off it until the next timer tick (~3 ms unit-start stalls).
-        const SPINS_BEFORE_YIELD: u32 = 1_000;
-        let mut spins = 0u32;
-        while self
-            .atomic_counter
-            .load(std::sync::atomic::Ordering::Acquire)
-            != self.next_counter_step
-        {
-            spins += 1;
-            if spins < SPINS_BEFORE_YIELD {
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-            }
-        }
+        wait_for_step(&self.atomic_counter, self.next_counter_step);
+    }
+
+    /// A signal for the point after the last task enqueued on this stream.
+    /// Tasks run in the order of their steps, so the point is reached when the
+    /// counter reaches the step of the next task.
+    pub fn mark(&self) -> Arc<dyn CompletionSignal> {
+        Arc::new(CpuSignal {
+            counter: self.atomic_counter.clone(),
+            step: self.next_counter_step,
+        })
     }
 
     /// Wait for the queued work. A launch failure is not the flush's to

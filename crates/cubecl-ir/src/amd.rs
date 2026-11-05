@@ -36,6 +36,8 @@ pub enum AMDArchitecture {
     GFX103,
     // gfx1010 through gfx1013 (RDNA1): wave32, but no WMMA, which arrives with RDNA3
     GFX101,
+    // gfx900 through gfx90c (GCN5, Vega): wave64, no matrix cores
+    GFX90,
     // CDNA
     GFX908,
     GFX90A,
@@ -64,7 +66,10 @@ impl AMDArchitecture {
             | AMDArchitecture::GFX103
             | AMDArchitecture::GFX11
             | AMDArchitecture::GFX12 => Some(32),
-            AMDArchitecture::GFX908 | AMDArchitecture::GFX90A | AMDArchitecture::GFX94 => Some(64),
+            AMDArchitecture::GFX90
+            | AMDArchitecture::GFX908
+            | AMDArchitecture::GFX90A
+            | AMDArchitecture::GFX94 => Some(64),
             AMDArchitecture::Other => None,
         }
     }
@@ -83,6 +88,8 @@ impl AMDArchitecture {
             Ok(AMDArchitecture::GFX908)
         } else if norm == "gfx90a" {
             Ok(AMDArchitecture::GFX90A)
+        } else if norm.starts_with("gfx90") {
+            Ok(AMDArchitecture::GFX90)
         } else if norm.starts_with("gfx94") {
             Ok(AMDArchitecture::GFX94)
         } else {

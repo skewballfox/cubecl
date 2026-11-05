@@ -1,0 +1,12 @@
+error[E0133]: call to unsafe function `launch_persistent_exclusive` is unsafe and requires unsafe block
+  --> tests/error/exclusive_launch_needs_unsafe.rs:11:5
+   |
+11 | /     cooperative_kernel::launch_persistent_exclusive(
+12 | |         client,
+13 | |         PersistentCount::Fill,
+14 | |         CubeDim::new_1d(1),
+15 | |         output,
+16 | |     );
+   | |_____^ call to unsafe function
+   |
+   = note: consult the function's documentation for information on how to avoid undefined behavior

@@ -1,0 +1,7 @@
+error: `grid_sync_emulation` and `shared_after_grid_sync` need `cooperative`
+ --> tests/error/persistent_keys_need_cooperative.rs:4:1
+  |
+4 | #[cube(launch, persistent, grid_sync_emulation = "spin")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `cube` (in Nightly builds, run with -Z macro-backtrace for more info)

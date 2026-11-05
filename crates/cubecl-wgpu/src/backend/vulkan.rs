@@ -206,6 +206,24 @@ fn request_device(
     }
 }
 
+/// The memory a storage buffer takes on a device with unified memory: the host
+/// maps it, and writes to it need no flush.
+const UNIFIED_MEMORY: MemoryPropertyFlags = MemoryPropertyFlags::from_raw(
+    MemoryPropertyFlags::DEVICE_LOCAL.as_raw()
+        | MemoryPropertyFlags::HOST_VISIBLE.as_raw()
+        | MemoryPropertyFlags::HOST_COHERENT.as_raw(),
+);
+
+/// Whether storage buffers go to unified memory on a device of this type: an
+/// integrated GPU, or a CPU device such as lavapipe. On a discrete GPU,
+/// host-visible memory is the BAR window, often only 256 MiB.
+fn uses_unified_memory(device_type: vk::PhysicalDeviceType) -> bool {
+    matches!(
+        device_type,
+        vk::PhysicalDeviceType::INTEGRATED_GPU | vk::PhysicalDeviceType::CPU
+    )
+}
+
 pub(crate) fn create_storage_buffer(
     wgpu_device: &wgpu::Device,
     desc: &wgpu::BufferDescriptor,
@@ -244,17 +262,9 @@ pub(crate) fn create_storage_buffer(
             .map(|(i, _)| i)
     };
 
-    // On a discrete GPU, host-visible memory is the BAR window, often only 256 MiB.
-    let integrated = unsafe { instance.get_physical_device_properties(phys_device) }.device_type
-        == vk::PhysicalDeviceType::INTEGRATED_GPU;
-    let unified_type = integrated
-        .then(|| {
-            find_type(
-                MemoryPropertyFlags::DEVICE_LOCAL
-                    | MemoryPropertyFlags::HOST_VISIBLE
-                    | MemoryPropertyFlags::HOST_COHERENT,
-            )
-        })
+    let device_type = unsafe { instance.get_physical_device_properties(phys_device) }.device_type;
+    let unified_type = uses_unified_memory(device_type)
+        .then(|| find_type(UNIFIED_MEMORY))
         .flatten();
 
     let memory_type_idx = unified_type
@@ -415,6 +425,17 @@ fn register_features(
     comp_options.vulkan.supports_dp4a = extended_feat
         .shader_integer_dot_product
         .is_some_and(|it| it.shader_integer_dot_product == TRUE);
+
+    // The storage buffers of `create_storage_buffer` are host-visible when the
+    // device has unified memory, which a host view writes in place.
+    let memory_props = unsafe {
+        ash.raw_instance()
+            .get_physical_device_memory_properties(adapter.raw_physical_device())
+    };
+    props.features.host_visible_storage = uses_unified_memory(properties.device_type)
+        && memory_props.memory_types[..memory_props.memory_type_count as usize]
+            .iter()
+            .any(|ty| ty.property_flags.contains(UNIFIED_MEMORY));
 
     props.features.plane.insert(Plane::Sync);
     // SPIR-V spells the device scope on the barrier itself: `OpControlBarrier` with a

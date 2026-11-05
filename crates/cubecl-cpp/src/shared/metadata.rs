@@ -1,5 +1,5 @@
 use cubecl_core::ir::{
-    CanMaterialize, Pure,
+    CanMaterialize, PropagatesUniformity, Pure,
     attributes::{FuncInterface, IndexAttr},
     dialect::general::{BufferLenOp, ReadScalarOp, ShapeOp, StrideOp},
     ident,
@@ -55,6 +55,12 @@ pub struct CppReadDynamicMetaOp {
     pub offset: Value,
     pub dim: Value,
 }
+
+// Scalars and metadata are equal for every unit of a launch, so the results are as uniform as
+// the info struct they read, and the dimension for dynamic metadata.
+PropagatesUniformity!(CppReadScalarOp);
+PropagatesUniformity!(CppReadStaticMetaOp);
+PropagatesUniformity!(CppReadDynamicMetaOp);
 
 shared_op_with_out!(CppReadScalarOp, |op, ctx| {
     let ty = op.ty(ctx).get_type(ctx).deref(ctx);
